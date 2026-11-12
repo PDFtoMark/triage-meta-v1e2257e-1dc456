@@ -1,0 +1,19 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#![cfg(test)]
+mod aliases;
+mod base_settings;
+mod config;
+mod dataclasses;
+mod extra;
+mod field;
+mod model_validate;
+mod root_model;
+mod schema_aliases;
+mod strictness;
+pub(crate) mod util;

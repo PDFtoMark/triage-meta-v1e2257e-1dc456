@@ -1,0 +1,22 @@
+[package]
+name = "pyrefly_wasm"
+version = "0.0.0"
+authors = ["Meta"]
+edition = "2024"
+repository = "https://github.com/facebook/pyrefly"
+license = "MIT"
+
+[lib]
+path = "lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dupe = "0.9.1"
+pyrefly = { path = "../pyrefly" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.154"
+starlark_map = "0.14.2"
+zstd = { version = "0.13" }
+
+[lints]
+rust = { unexpected_cfgs = { check-cfg = ["cfg(fbcode_build)"], level = "warn" } }

@@ -1,0 +1,345 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use dupe::Dupe;
+use pyrefly_python::module_name::ModuleName;
+use ruff_python_ast::name::Name;
+
+/// These are names that are exported from the stdlib, but which take on
+/// a more keyword-like quality. E.g. `x: TypeAlias = ...` meaningfully
+/// changes the sense of the binding.
+#[derive(Debug, Clone, Dupe, Copy, PartialEq, Eq)]
+pub enum SpecialExport {
+    ClassMethod,
+    StaticMethod,
+    AbstractClassMethod,
+    TypeAlias,
+    TypeAliasType,
+    TypeVar,
+    IntVar,
+    Flag,
+    Index,
+    ParamSpec,
+    TypeVarTuple,
+    Annotated,
+    Literal,
+    Enum,
+    StrEnum,
+    IntEnum,
+    TypedDict,
+    CollectionsNamedTuple,
+    TypingNamedTuple,
+    AssertType,
+    RevealType,
+    NewType,
+    Union,
+    Optional,
+    Cast,
+    Super,
+    Exit,
+    Quit,
+    OsExit,
+    Len,
+    Any,
+    All,
+    Range,
+    Bool,
+    BuiltinsType,
+    BuiltinsObject,
+    TypingType,
+    NoTypeCheck,
+    NotImplemented,
+    NotImplementedError,
+    Overload,
+    Override,
+    AbstractMethod,
+    Generic,
+    Protocol,
+    PydanticConfigDict,
+    PydanticFieldValidator,
+    PydanticModelValidator,
+    PydanticToCamel,
+    PydanticToPascal,
+    PydanticToSnake,
+    HasAttr,
+    GetAttr,
+    SetAttr,
+    Callable,
+    BuiltinsDict,
+    TypingDict,
+    BuiltinsList,
+    TypingList,
+    BuiltinsTuple,
+    TypingTuple,
+    BuiltinsInt,
+    BuiltinsStr,
+    BuiltinsBytes,
+    BuiltinsBytearray,
+    BuiltinsSet,
+    BuiltinsFrozenset,
+    BuiltinsFloat,
+    Deprecated,
+    Final,
+    ClassVar,
+    TypingMapping,
+    TypeForm,
+    TypeShapeDslFunction,
+    MapIntTuples,
+    NamedInts,
+    StaticJaxtyping,
+    Shaped,
+    ShapeVars,
+    ProxyMethod,
+    Sentinel,
+    BuiltinsSentinel,
+    AttrsLegacyAttrib,
+    AttrsNextGenField,
+    AttrsNothing,
+    FunctoolsWraps,
+    FunctoolsUpdateWrapper,
+}
+
+impl SpecialExport {
+    pub fn new(name: &Name) -> Option<Self> {
+        match name.as_str() {
+            "TypeAlias" => Some(Self::TypeAlias),
+            "classmethod" => Some(Self::ClassMethod),
+            "staticmethod" => Some(Self::StaticMethod),
+            "abstractclassmethod" => Some(Self::AbstractClassMethod),
+            "TypeVar" => Some(Self::TypeVar),
+            "IntVar" => Some(Self::IntVar),
+            "Flag" => Some(Self::Flag),
+            "Index" => Some(Self::Index),
+            "ParamSpec" => Some(Self::ParamSpec),
+            "TypeVarTuple" => Some(Self::TypeVarTuple),
+            "Annotated" => Some(Self::Annotated),
+            "Shaped" => Some(Self::Shaped),
+            "shape_vars" => Some(Self::ShapeVars),
+            "Literal" => Some(Self::Literal),
+            "Enum" => Some(Self::Enum),
+            "StrEnum" => Some(Self::StrEnum),
+            "IntEnum" => Some(Self::IntEnum),
+            "TypedDict" => Some(Self::TypedDict),
+            "namedtuple" => Some(Self::CollectionsNamedTuple),
+            "NamedTuple" => Some(Self::TypingNamedTuple),
+            "assert_type" => Some(Self::AssertType),
+            "reveal_type" => Some(Self::RevealType),
+            "NewType" => Some(Self::NewType),
+            "Union" => Some(Self::Union),
+            "Optional" => Some(Self::Optional),
+            "Generic" => Some(Self::Generic),
+            "Protocol" => Some(Self::Protocol),
+            "cast" => Some(Self::Cast),
+            "super" => Some(Self::Super),
+            "exit" => Some(Self::Exit),
+            "quit" => Some(Self::Quit),
+            "_exit" => Some(Self::OsExit),
+            "len" => Some(Self::Len),
+            "any" => Some(Self::Any),
+            "all" => Some(Self::All),
+            "range" => Some(Self::Range),
+            "bool" => Some(Self::Bool),
+            "type" => Some(Self::BuiltinsType),
+            "Type" => Some(Self::TypingType),
+            "no_type_check" => Some(Self::NoTypeCheck),
+            "NotImplemented" => Some(Self::NotImplemented),
+            "NotImplementedError" => Some(Self::NotImplementedError),
+            "overload" => Some(Self::Overload),
+            "override" => Some(Self::Override),
+            "abstractmethod" => Some(Self::AbstractMethod),
+            "ConfigDict" => Some(Self::PydanticConfigDict),
+            "field_validator" => Some(Self::PydanticFieldValidator),
+            "model_validator" => Some(Self::PydanticModelValidator),
+            "to_camel" => Some(Self::PydanticToCamel),
+            "to_pascal" => Some(Self::PydanticToPascal),
+            "to_snake" => Some(Self::PydanticToSnake),
+            "hasattr" => Some(Self::HasAttr),
+            "getattr" => Some(Self::GetAttr),
+            "setattr" => Some(Self::SetAttr),
+            "object" => Some(Self::BuiltinsObject),
+            "TypeAliasType" => Some(Self::TypeAliasType),
+            "Callable" => Some(Self::Callable),
+            "dict" => Some(Self::BuiltinsDict),
+            "Dict" => Some(Self::TypingDict),
+            "list" => Some(Self::BuiltinsList),
+            "List" => Some(Self::TypingList),
+            "tuple" => Some(Self::BuiltinsTuple),
+            "Tuple" => Some(Self::TypingTuple),
+            "int" => Some(Self::BuiltinsInt),
+            "str" => Some(Self::BuiltinsStr),
+            "bytes" => Some(Self::BuiltinsBytes),
+            "bytearray" => Some(Self::BuiltinsBytearray),
+            "set" => Some(Self::BuiltinsSet),
+            "frozenset" => Some(Self::BuiltinsFrozenset),
+            "float" => Some(Self::BuiltinsFloat),
+            "deprecated" => Some(Self::Deprecated),
+            "Final" => Some(Self::Final),
+            "ClassVar" => Some(Self::ClassVar),
+            "Mapping" => Some(Self::TypingMapping),
+            "TypeForm" => Some(Self::TypeForm),
+            "shape_transform" | "type_shape_dsl_function" => Some(Self::TypeShapeDslFunction),
+            "MapIntTuples" => Some(Self::MapIntTuples),
+            "NamedInts" => Some(Self::NamedInts),
+            "static_jaxtyping" => Some(Self::StaticJaxtyping),
+            "ProxyMethod" => Some(Self::ProxyMethod),
+            "Sentinel" => Some(Self::Sentinel),
+            "sentinel" => Some(Self::BuiltinsSentinel),
+            "attr" | "attrib" | "ib" => Some(Self::AttrsLegacyAttrib),
+            "field" => Some(Self::AttrsNextGenField),
+            "NOTHING" => Some(Self::AttrsNothing),
+            "wraps" => Some(Self::FunctoolsWraps),
+            "update_wrapper" => Some(Self::FunctoolsUpdateWrapper),
+            _ => None,
+        }
+    }
+
+    pub fn defined_in(self, m: ModuleName) -> bool {
+        match self {
+            Self::IntVar | Self::Flag | Self::Index | Self::MapIntTuples | Self::NamedInts => {
+                matches!(m.as_str(), "shape_extensions")
+            }
+            Self::TypeVar => matches!(
+                m.as_str(),
+                "typing" | "typing_extensions" | "shape_extensions"
+            ),
+            Self::TypeVarTuple => {
+                matches!(m.as_str(), "typing" | "typing_extensions")
+            }
+            Self::TypeAlias
+            | Self::ParamSpec
+            | Self::Annotated
+            | Self::Literal
+            | Self::TypedDict
+            | Self::TypingNamedTuple
+            | Self::NewType
+            | Self::Union
+            | Self::Optional
+            | Self::AssertType
+            | Self::RevealType
+            | Self::TypeAliasType
+            | Self::NoTypeCheck
+            | Self::Overload
+            | Self::Override
+            | Self::Cast
+            | Self::Generic
+            | Self::Protocol
+            | Self::TypingType
+            | Self::TypingDict
+            | Self::TypingList
+            | Self::TypingTuple
+            | Self::Final
+            | Self::ClassVar
+            | Self::TypingMapping
+            | Self::TypeForm => {
+                matches!(m.as_str(), "typing" | "typing_extensions")
+            }
+            Self::CollectionsNamedTuple => matches!(m.as_str(), "collections"),
+            Self::FunctoolsWraps | Self::FunctoolsUpdateWrapper => m == ModuleName::functools(),
+            Self::Enum | Self::StrEnum | Self::IntEnum => matches!(m.as_str(), "enum"),
+            Self::Super
+            | Self::Len
+            | Self::Any
+            | Self::All
+            | Self::Range
+            | Self::Quit
+            | Self::Bool
+            | Self::BuiltinsType
+            | Self::BuiltinsObject
+            | Self::HasAttr
+            | Self::GetAttr
+            | Self::SetAttr
+            | Self::ClassMethod
+            | Self::StaticMethod
+            | Self::BuiltinsDict
+            | Self::BuiltinsList
+            | Self::NotImplemented
+            | Self::NotImplementedError
+            | Self::BuiltinsInt
+            | Self::BuiltinsStr
+            | Self::BuiltinsBytes
+            | Self::BuiltinsBytearray
+            | Self::BuiltinsSet
+            | Self::BuiltinsFrozenset
+            | Self::BuiltinsFloat
+            | Self::BuiltinsTuple => {
+                matches!(m.as_str(), "builtins")
+            }
+            Self::Exit => matches!(m.as_str(), "sys" | "builtins"),
+            Self::OsExit => matches!(m.as_str(), "os"),
+            Self::AbstractMethod | Self::AbstractClassMethod => matches!(m.as_str(), "abc"),
+            Self::PydanticConfigDict => matches!(m.as_str(), "pydantic" | "pydantic.config"),
+            Self::PydanticFieldValidator | Self::PydanticModelValidator => {
+                matches!(m.as_str(), "pydantic" | "pydantic.functional_validators")
+            }
+            Self::PydanticToCamel | Self::PydanticToPascal | Self::PydanticToSnake => {
+                m == ModuleName::pydantic_alias_generators()
+            }
+            Self::Callable => matches!(
+                m.as_str(),
+                "typing" | "typing_extensions" | "collections.abc"
+            ),
+            Self::Deprecated => matches!(m.as_str(), "warnings" | "typing_extensions"),
+            Self::TypeShapeDslFunction => matches!(m.as_str(), "shape_extensions"),
+            Self::StaticJaxtyping => matches!(m.as_str(), "shape_extensions"),
+            Self::Shaped => matches!(m.as_str(), "shape_extensions"),
+            Self::ShapeVars => matches!(m.as_str(), "shape_extensions"),
+            Self::ProxyMethod => matches!(m.as_str(), "shape_extensions"),
+            Self::Sentinel => matches!(m.as_str(), "typing_extensions"),
+            // `builtins.sentinel` (3.15+) and its `typing_extensions.sentinel`
+            // backport are the same lowercase PEP 661 constructor.
+            Self::BuiltinsSentinel => matches!(m.as_str(), "builtins" | "typing_extensions"),
+            Self::AttrsLegacyAttrib | Self::AttrsNextGenField | Self::AttrsNothing => {
+                matches!(m.as_str(), "attr" | "attrs")
+            }
+        }
+    }
+
+    /// Returns true if subscripting this export produces a type expression,
+    /// even in a value context (e.g. `list["A | B"]`).
+    pub fn is_static_type_subscript(self) -> bool {
+        matches!(
+            self,
+            Self::Union
+                | Self::Optional
+                | Self::Annotated
+                | Self::Shaped
+                | Self::Callable
+                | Self::BuiltinsDict
+                | Self::TypingDict
+                | Self::BuiltinsList
+                | Self::TypingList
+                | Self::BuiltinsTuple
+                | Self::TypingTuple
+                | Self::BuiltinsType
+                | Self::TypingType
+                | Self::BuiltinsSet
+                | Self::BuiltinsFrozenset
+                | Self::TypingMapping
+                | Self::TypeForm
+        )
+    }
+
+    /// Returns true if this is a builtin type that has a single positional
+    /// slot in pattern matching that binds the entire narrowed value.
+    /// These types are: bool, bytearray, bytes, dict, float, frozenset, int, list, set, str, and tuple
+    pub fn is_single_positional_slot_builtin(self) -> bool {
+        matches!(
+            self,
+            Self::Bool
+                | Self::BuiltinsBytearray
+                | Self::BuiltinsBytes
+                | Self::BuiltinsDict
+                | Self::BuiltinsFloat
+                | Self::BuiltinsFrozenset
+                | Self::BuiltinsInt
+                | Self::BuiltinsList
+                | Self::BuiltinsSet
+                | Self::BuiltinsStr
+                | Self::BuiltinsTuple
+        )
+    }
+}

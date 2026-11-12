@@ -1,0 +1,1394 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::fs;
+
+use lsp_types::Uri;
+use pyrefly_lsp_test::IndexingMode;
+use pyrefly_lsp_test::LspArgs;
+use pyrefly_lsp_test::object_model::InitializeSettings;
+use pyrefly_lsp_test::object_model::LspInteraction;
+use pyrefly_lsp_test::object_model::LspInteractionArgs;
+use pyrefly_lsp_test::object_model::TestTelemetry;
+use serde_json::json;
+use tempfile::TempDir;
+
+use crate::test::lsp::lsp_interaction::util::get_test_files_root;
+use crate::test::lsp::lsp_interaction::util::wait_for_disk_invalidation;
+
+// https://github.com/meta/pyrefly/issues/5485
+#[test]
+fn test_references_to_class_member_after_defining_file_shifts() {
+    let root = TempDir::with_prefix("pyrefly_references_class_member_shift").unwrap();
+    let lib = "class Tools:\n    @staticmethod\n    def helper():\n        return 1\n";
+    fs::write(root.path().join("lib.py"), lib).unwrap();
+    fs::write(
+        root.path().join("user.py"),
+        r#"from lib import Tools
+
+Tools.helper()
+f = lambda: Tools.helper()
+
+class C:
+    x = Tools.helper()
+"#,
+    )
+    .unwrap();
+    let user_uri = Uri::from_file_path(root.path().join("user.py"))
+        .unwrap()
+        .to_string();
+    let user_references = json!([
+        {
+            "range": {"start":{"line":2,"character":6},"end":{"line":2,"character":12}},
+            "uri": user_uri
+        },
+        {
+            "range": {"start":{"line":3,"character":18},"end":{"line":3,"character":24}},
+            "uri": user_uri
+        },
+        {
+            "range": {"start":{"line":6,"character":14},"end":{"line":6,"character":20}},
+            "uri": user_uri
+        },
+    ]);
+
+    let telemetry = TestTelemetry::new();
+    let telemetry_events = telemetry.subscribe();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        telemetry: Box::new(telemetry),
+        ..Default::default()
+    });
+    interaction.set_root(root.path().to_path_buf());
+    interaction.initialize(Default::default()).unwrap();
+    interaction.client.did_open("lib.py");
+    interaction.client.did_open("user.py");
+    interaction
+        .client
+        .references("lib.py", 2, 9, false)
+        .expect_response(user_references.clone())
+        .unwrap();
+
+    // `user.py` imports the disk copy of `lib.py`, so save the edit as an editor does.
+    let shifted_lib = lib.replacen("\n", "\n\n", 1);
+    fs::write(root.path().join("lib.py"), &shifted_lib).unwrap();
+    interaction.client.did_change("lib.py", &shifted_lib);
+    interaction.client.did_save("lib.py");
+    wait_for_disk_invalidation(&telemetry_events);
+    interaction
+        .client
+        .references("lib.py", 3, 9, false)
+        .expect_response(user_references.clone())
+        .unwrap();
+
+    // A class above `Tools` changes the `ClassDefIndex` that the index of `user.py` stores.
+    let reindexed_lib = format!("class Other: ...\n{shifted_lib}");
+    fs::write(root.path().join("lib.py"), &reindexed_lib).unwrap();
+    interaction.client.did_change("lib.py", &reindexed_lib);
+    interaction.client.did_save("lib.py");
+    wait_for_disk_invalidation(&telemetry_events);
+    interaction
+        .client
+        .references("lib.py", 4, 9, false)
+        .expect_response(user_references)
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+// https://github.com/meta/pyrefly/issues/5485
+#[test]
+fn test_references_to_parent_method_after_defining_file_shifts() {
+    let root = TempDir::with_prefix("pyrefly_references_parent_method_shift").unwrap();
+    let base = "class Base:\n    def method(self):\n        pass\n";
+    fs::write(root.path().join("base.py"), base).unwrap();
+    fs::write(
+        root.path().join("child.py"),
+        r#"from base import Base
+
+
+class Child(Base):
+    def method(self):
+        pass
+"#,
+    )
+    .unwrap();
+    let child_uri = Uri::from_file_path(root.path().join("child.py"))
+        .unwrap()
+        .to_string();
+    let child_override = json!([
+        {
+            "range": {"start":{"line":4,"character":8},"end":{"line":4,"character":14}},
+            "uri": child_uri
+        },
+    ]);
+
+    let telemetry = TestTelemetry::new();
+    let telemetry_events = telemetry.subscribe();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        telemetry: Box::new(telemetry),
+        ..Default::default()
+    });
+    interaction.set_root(root.path().to_path_buf());
+    interaction.initialize(Default::default()).unwrap();
+    interaction.client.did_open("base.py");
+    interaction.client.did_open("child.py");
+    interaction
+        .client
+        .references("base.py", 1, 9, false)
+        .expect_response(child_override.clone())
+        .unwrap();
+
+    // `child.py` imports the disk copy of `base.py`, so save the edit as an editor does.
+    let shifted_base = base.replacen("\n", "\n\n", 1);
+    fs::write(root.path().join("base.py"), &shifted_base).unwrap();
+    interaction.client.did_change("base.py", &shifted_base);
+    interaction.client.did_save("base.py");
+    wait_for_disk_invalidation(&telemetry_events);
+    interaction
+        .client
+        .references("base.py", 2, 9, false)
+        .expect_response(child_override)
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_parameter_references_in_unopened_file() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("rename_kwargs_across_files");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let defs = root_path.join("defs.py");
+    let uses = root_path.join("uses.py");
+    interaction.client.did_open("defs.py");
+
+    interaction
+        .client
+        .references("defs.py", 6, 16, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":13,"character":31},"end":{"line":13,"character":38}},
+                "uri": Uri::from_file_path(&uses).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"line":6,"character":23}},
+                "uri": Uri::from_file_path(&defs).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":14},"end":{"line":7,"character":21}},
+                "uri": Uri::from_file_path(&defs).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_for_usage_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let foo = root_path.join("foo.py");
+    let bar = root_path.join("bar.py");
+    let various_imports = root_path.join("various_imports.py");
+    let with_synthetic_bindings = root_path.join("with_synthetic_bindings.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("bar.py", 10, 1, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"line":6,"character":19}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"line":8,"character":3}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":4},"end":{"line":9,"character":7}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"line":5,"character":19}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":26},"end":{"line":5,"character":29}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"character":19,"line":5}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":4},"end":{"character":7,"line":10}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_finds_references_outside_config_when_workspace_larger_than_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("config_with_workspace_larger");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let core = root_path.join("module_dir/core.py");
+    let usage = root_path.join("module_dir/usage.py");
+
+    interaction.client.did_open("module_dir/core.py");
+    interaction.client.did_open("module_dir/usage.py");
+    interaction.client.did_open("outside_usage.py");
+
+    interaction
+        .client
+        .references("module_dir/core.py", 6, 7, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":12,"line":6}},
+                "uri": Uri::from_file_path(core.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":17},"end":{"character":23,"line":5}},
+                "uri": Uri::from_file_path(usage.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":0},"end":{"character":6,"line":7}},
+                "uri": Uri::from_file_path(usage.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"character":6,"line":8}},
+                "uri": Uri::from_file_path(usage.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_workspace_smaller_than_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("config_with_workspace_smaller");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let core = root_path.join("core.py");
+    let usage_in_config = root_path.join("usage_in_config.py");
+    let usage_outside_workspace = root_path.join("subdir/usage_outside_workspace.py");
+
+    interaction.client.did_open("core.py");
+    interaction.client.did_open("usage_in_config.py");
+
+    interaction
+        .client
+        .references("core.py", 6, 7, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":5,"character":17},"end":{"character":22,"line":5}},
+                "uri": Uri::from_file_path(usage_outside_workspace.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":0},"end":{"character":5,"line":7}},
+                "uri": Uri::from_file_path(usage_outside_workspace.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"character":5,"line":8}},
+                "uri": Uri::from_file_path(usage_outside_workspace.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":11,"line":6}},
+                "uri": Uri::from_file_path(core.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":17},"end":{"character":22,"line":5}},
+                "uri": Uri::from_file_path(usage_in_config.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":0},"end":{"character":5,"line":7}},
+                "uri": Uri::from_file_path(usage_in_config.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"character":5,"line":8}},
+                "uri": Uri::from_file_path(usage_in_config.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_cross_file_no_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("basic");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let bar = root_path.join("bar.py");
+    let foo = root_path.join("foo.py");
+    let foo_relative = root_path.join("foo_relative.py");
+
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("bar.py", 10, 1, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"character":19,"line":6}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":17},"end":{"character":20,"line":6}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_include_declaration_respects_false() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("basic");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let bar = root_path.join("bar.py");
+    let foo = root_path.join("foo.py");
+    let foo_relative = root_path.join("foo_relative.py");
+
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("bar.py", 10, 1, false)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"character":19,"line":6}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":17},"end":{"character":20,"line":6}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_cross_file_no_config_nested() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("nested_test").to_path_buf();
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let bar = root_path.join("models/bar.py");
+    let foo = root_path.join("services/foo.py");
+    let foo_relative = root_path.join("utils/foo_relative.py");
+
+    interaction.client.did_open("models/bar.py");
+
+    interaction
+        .client
+        .references("models/bar.py", 10, 1, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":23},"end":{"character":26,"line":6}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":14,"line":9},"start":{"character":11,"line":9}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":25},"end":{"character":28,"line":6}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo_relative.clone()).unwrap().to_string()
+            },            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_cross_file_with_marker_file() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("marker_file_no_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let bar = root_path.join("bar.py");
+    let foo = root_path.join("foo.py");
+
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("bar.py", 10, 1, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"character":19,"line":6}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":3,"line":8},"start":{"character":0,"line":8}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":7,"line":9},"start":{"character":4,"line":9}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range":{"end":{"character":9,"line":6},"start":{"character":6,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_for_definition_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let foo = root_path.join("foo.py");
+    let bar = root_path.join("bar.py");
+    let various_imports = root_path.join("various_imports.py");
+    let with_synthetic_bindings = root_path.join("with_synthetic_bindings.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("bar.py", 6, 7, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"line":6, "character":19}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"line":8,"character":3}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":4},"end":{"line":9,"character":7}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"line":5,"character":19}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":26},"end":{"line":5,"character":29}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"character":19,"line":5}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":4},"end":{"character":7,"line":10}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_for_import_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let foo = root_path.join("foo.py");
+    let bar = root_path.join("bar.py");
+    let various_imports = root_path.join("various_imports.py");
+    let with_synthetic_bindings = root_path.join("with_synthetic_bindings.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("foo.py", 6, 17, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"line":6, "character":19}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"line":8,"character":3}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":4},"end":{"line":9,"character":7}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"line":5,"character":19}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":26},"end":{"line":5,"character":29}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"character":19,"line":5}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":4},"end":{"character":7,"line":10}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_for_aliased_import_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let various_imports = root_path.join("various_imports.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    interaction
+        .client
+        .references("various_imports.py", 7, 0, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":5,"character":23},"end":{"line":5,"character":24}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":0},"end":{"line":7,"character":1}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_from_third_party_source_with_stub() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("references_third_party");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let library = root_path.join("venv/lib/python3.12/site-packages/third_party_lib.py");
+    let user_code = root_path.join("user.py");
+
+    interaction.client.did_open("user.py");
+    interaction
+        .client
+        .did_open("venv/lib/python3.12/site-packages/third_party_lib.py");
+
+    interaction
+        .client
+        .references(
+            "venv/lib/python3.12/site-packages/third_party_lib.py",
+            0,
+            6,
+            true,
+        )
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":2,"character":11},"end":{"line":2,"character":16}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":2,"character":23},"end":{"line":2,"character":28}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":3,"character":12},"end":{"line":3,"character":17}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":0,"character":6},"end":{"line":0,"character":11}},
+                "uri": Uri::from_file_path(&library).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction
+        .client
+        .references(
+            "venv/lib/python3.12/site-packages/third_party_lib.py",
+            1,
+            8,
+            true,
+        )
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":4,"character":6},"end":{"line":4,"character":13}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":1,"character":8},"end":{"line":1,"character":15}},
+                "uri": Uri::from_file_path(&library).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_from_third_party_source_with_stubs_package() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("references_stubs_package");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let library = root_path.join("venv/lib/python3.12/site-packages/mylib/__init__.py");
+    let user_code = root_path.join("user.py");
+
+    interaction.client.did_open("user.py");
+    interaction
+        .client
+        .did_open("venv/lib/python3.12/site-packages/mylib/__init__.py");
+
+    // `user.py` is checked against the separate `mylib-stubs` package.
+    interaction
+        .client
+        .references(
+            "venv/lib/python3.12/site-packages/mylib/__init__.py",
+            0,
+            4,
+            true,
+        )
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":0,"character":18},"end":{"line":0,"character":22}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":2,"character":0},"end":{"line":2,"character":4}},
+                "uri": Uri::from_file_path(&user_code).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":0,"character":4},"end":{"line":0,"character":8}},
+                "uri": Uri::from_file_path(&library).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_after_file_modification_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let foo = root_path.join("foo.py");
+    let bar = root_path.join("bar.py");
+    let various_imports = root_path.join("various_imports.py");
+    let with_synthetic_bindings = root_path.join("with_synthetic_bindings.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    let modified_contents = format!("\n\n{}", std::fs::read_to_string(bar.clone()).unwrap());
+    interaction.client.did_change("bar.py", &modified_contents);
+
+    interaction
+        .client
+        .references("foo.py", 6, 17, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"character":9,"line":6}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":0},"end":{"character":3,"line":10}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":16},"end":{"line":6, "character":19}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":0},"end":{"line":8,"character":3}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":4},"end":{"line":9,"character":7}},
+                "uri": Uri::from_file_path(foo.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"line":5,"character":19}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":26},"end":{"line":5,"character":29}},
+                "uri": Uri::from_file_path(various_imports.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":16},"end":{"character":19,"line":5}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":10,"character":4},"end":{"character":7,"line":10}},
+                "uri": Uri::from_file_path(with_synthetic_bindings.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_after_file_modification_with_line_offset_with_config() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("tests_requiring_config");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let bar = root_path.join("bar.py");
+
+    interaction.client.did_open("foo.py");
+    interaction.client.did_open("various_imports.py");
+    interaction.client.did_open("with_synthetic_bindings.py");
+    interaction.client.did_open("bar.py");
+
+    let modified_contents = format!("\n\n{}", std::fs::read_to_string(bar.clone()).unwrap());
+    interaction.client.did_change("bar.py", &modified_contents);
+
+    interaction
+        .client
+        .references("bar.py", 8, 7, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":8,"character":6},"end":{"character":9,"line":8}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":12,"character":0},"end":{"character":3,"line":12}},
+                "uri": Uri::from_file_path(bar.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_references_cross_file_method_inheritance() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("references_cross_file_method_inheritance");
+    let scope_uri = Uri::from_file_path(root_path.clone()).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let base_py = root_path.join("base.py");
+    let child_py = root_path.join("child.py");
+    let child_of_child_py = root_path.join("child_of_child.py");
+    let usage_py = root_path.join("usage.py");
+
+    interaction.client.did_open("base.py");
+
+    // Find references for Base.method (line 7, character 8 in base.py)
+    interaction
+        .client
+        .references("base.py", 7, 8, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":9,"character":8},"end":{"line":9,"character":14}},
+                "uri": Uri::from_file_path(child_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":14,"character":6},"end":{"line":14,"character":12}},
+                "uri": Uri::from_file_path(child_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":8},"end":{"line":9,"character":14}},
+                "uri": Uri::from_file_path(child_of_child_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":14,"character":6},"end":{"line":14,"character":12}},
+                "uri": Uri::from_file_path(child_of_child_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":2},"end":{"line":8,"character":8}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":8},"end":{"line":7,"character":14}},
+                "uri": Uri::from_file_path(base_py.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+// Test for __init__ priority
+// When only __init__ is overridden (not __new__), __init__ handles the constructor call
+#[test]
+fn test_references_for_init_priority() {
+    let root = get_test_files_root();
+    let root_path = root
+        .path()
+        .join("constructor_priority_references/init_priority");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let person_py = root_path.join("person.py");
+    let usage_py = root_path.join("usage.py");
+
+    interaction.client.did_open("person.py");
+    interaction.client.did_open("usage.py");
+
+    // Find references for Person.__init__
+    interaction
+        .client
+        .references("person.py", 9, 12, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":9,"character":8},"end":{"line":9,"character":16}},
+                "uri": Uri::from_file_path(person_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":5},"end":{"line":7,"character":11}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":5},"end":{"line":8,"character":11}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+// Test for __new__ priority
+// When __new__ is overridden, it takes priority over __init__ for constructor calls
+#[test]
+fn test_references_for_new_priority() {
+    let root = get_test_files_root();
+    let root_path = root
+        .path()
+        .join("constructor_priority_references/new_priority");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let singleton_py = root_path.join("singleton.py");
+    let usage_py = root_path.join("usage.py");
+
+    interaction.client.did_open("singleton.py");
+
+    // Find references for Singleton.__new__ (line 8, character 12 in singleton.py)
+    interaction
+        .client
+        .references("singleton.py", 7, 12, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":7,"character":5},"end":{"line":7,"character":14}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":5},"end":{"line":8,"character":14}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":8},"end":{"line":7,"character":15}},
+                "uri": Uri::from_file_path(singleton_py.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+// Test for metaclass __call__ priority
+// When a metaclass defines __call__, it takes priority over __new__ and __init__
+#[test]
+fn test_references_for_metaclass_call_priority() {
+    let root = get_test_files_root();
+    let root_path = root
+        .path()
+        .join("constructor_priority_references/metaclass_priority");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let singleton_meta_py = root_path.join("singleton_meta.py");
+    let usage_py = root_path.join("usage.py");
+
+    interaction.client.did_open("singleton_meta.py");
+    interaction.client.did_open("usage.py");
+
+    // Find references for SingletonMeta.__call__
+    interaction
+        .client
+        .references("singleton_meta.py", 7, 12, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":7,"character":8},"end":{"line":7,"character":16}},
+                "uri": Uri::from_file_path(singleton_meta_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":7,"character":5},"end":{"line":7,"character":14}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":8,"character":5},"end":{"line":8,"character":14}},
+                "uri": Uri::from_file_path(usage_py.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+/// Regression test for https://github.com/facebook/pyrefly/issues/3237:
+/// `textDocument/references` should find cross-file references even when the
+/// target module starts with a docstring and the on-disk files use CRLF line
+/// endings while the editor sends LF-normalized content via `did_open`.
+#[test]
+fn test_references_cross_file_with_module_docstring() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("references_docstring");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let a = root_path.join("a.py");
+    let b = root_path.join("b.py");
+    let services = root_path.join("services.py");
+
+    // The source fixtures use LF (to satisfy linters). Convert them to CRLF
+    // on disk in the temp directory so we can simulate an editor that
+    // normalizes CRLF→LF when opening files via `did_open`.
+    for path in [&a, &b, &services] {
+        let raw = std::fs::read_to_string(path).unwrap();
+        let lf_content = raw.replace("\r\n", "\n");
+        let crlf_content = lf_content.replace('\n', "\r\n");
+        std::fs::write(path, &crlf_content).unwrap();
+    }
+
+    for (name, path) in [("a.py", &a), ("b.py", &b), ("services.py", &services)] {
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        let normalized = on_disk.replace("\r\n", "\n");
+        let uri = Uri::from_file_path(path).unwrap();
+        interaction.client.did_open_uri(&uri, "python", normalized);
+        assert!(
+            on_disk.contains("\r\n"),
+            "{name} should have CRLF line endings on disk"
+        );
+    }
+
+    // Class A defined in a.py (which starts with a docstring) should find
+    // cross-file references from services.py just like B.
+    interaction
+        .client
+        .references("a.py", 8, 6, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":8,"character":6},"end":{"line":8,"character":7}},
+                "uri": Uri::from_file_path(a.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":5,"character":14},"end":{"line":5,"character":15}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":13},"end":{"line":9,"character":14}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":9,"character":19},"end":{"line":9,"character":20}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    // Class B should also find cross-file refs.
+    interaction
+        .client
+        .references("b.py", 6, 6, true)
+        .expect_response(json!([
+            {
+                "range": {"start":{"line":6,"character":6},"end":{"line":6,"character":7}},
+                "uri": Uri::from_file_path(b.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":6,"character":14},"end":{"line":6,"character":15}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":13,"character":13},"end":{"line":13,"character":14}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+            {
+                "range": {"start":{"line":13,"character":19},"end":{"line":13,"character":20}},
+                "uri": Uri::from_file_path(services.clone()).unwrap().to_string()
+            },
+        ]))
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}

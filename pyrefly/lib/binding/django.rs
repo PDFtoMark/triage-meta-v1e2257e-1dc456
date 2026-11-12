@@ -1,0 +1,113 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use ruff_python_ast::Expr;
+use ruff_python_ast::Stmt;
+use ruff_python_ast::name::Name;
+use ruff_text_size::TextRange;
+use starlark_map::small_map::SmallMap;
+
+use crate::binding::binding::ClassFieldDefinition;
+use crate::binding::binding::ExprOrBinding;
+use crate::binding::bindings::BindingsBuilder;
+use crate::binding::bindings::InitializedInClass;
+
+const PRIMARY_KEY: Name = Name::new_static("primary_key");
+const FOREIGN_KEY: Name = Name::new_static("ForeignKey");
+const ONE_TO_ONE_FIELD: Name = Name::new_static("OneToOneField");
+const MANY_TO_MANY_FIELD: Name = Name::new_static("ManyToManyField");
+const CHOICES: Name = Name::new_static("choices");
+
+/// Read explicit method-copy flags once, before class statements are consumed.
+pub fn collect_django_queryset_only(body: &[Stmt]) -> SmallMap<Name, bool> {
+    let mut flags = SmallMap::new();
+    for stmt in body {
+        if let Stmt::Assign(assign) = stmt
+            && let Expr::BooleanLiteral(value) = assign.value.as_ref()
+        {
+            for target in &assign.targets {
+                if let Expr::Attribute(attr) = target
+                    && attr.attr.as_str() == "queryset_only"
+                    && let Expr::Name(method) = attr.value.as_ref()
+                {
+                    flags.insert(method.id.clone(), value.value);
+                }
+            }
+        }
+    }
+    flags
+}
+
+/// Django-specific field information detected during binding phase.
+#[derive(Clone, Debug, Default)]
+pub struct DjangoFieldInfo {
+    /// The name of the field that has primary_key=True, if any.
+    pub primary_key_field: Option<Name>,
+    /// Names of ForeignKey and OneToOneField fields.
+    pub foreign_key_like_fields: Vec<Name>,
+    /// Names of fields that may create reverse relationships.
+    pub relation_fields: Vec<Name>,
+    /// Names of fields with choices=...
+    pub fields_with_choices: Vec<Name>,
+}
+
+impl<'a> BindingsBuilder<'a> {
+    /// Extract Django field information from class body field definitions.
+    /// Scans all fields assigned in the class body for Django-specific patterns
+    /// (primary_key, ForeignKey, choices).
+    pub fn extract_django_fields_from_class_body(
+        &self,
+        field_definitions: &SmallMap<Name, (ClassFieldDefinition, TextRange, InitializedInClass)>,
+    ) -> DjangoFieldInfo {
+        let mut primary_key_field = None;
+        let mut foreign_key_like_fields = Vec::new();
+        let mut relation_fields = Vec::new();
+        let mut fields_with_choices = Vec::new();
+        for (name, (definition, _range, _initialized)) in field_definitions.iter() {
+            if let ClassFieldDefinition::AssignedInBody { value, .. } = definition
+                && let ExprOrBinding::Expr(e) = value.as_ref()
+                && let Some(call) = e.as_call_expr()
+            {
+                if let Some(constructor_name) = match &*call.func {
+                    Expr::Name(name) => Some(name.id()),
+                    Expr::Attribute(attr) => Some(attr.attr.id()),
+                    _ => None,
+                } {
+                    if *constructor_name == FOREIGN_KEY || *constructor_name == ONE_TO_ONE_FIELD {
+                        foreign_key_like_fields.push(name.clone());
+                        relation_fields.push(name.clone());
+                    } else if *constructor_name == MANY_TO_MANY_FIELD {
+                        relation_fields.push(name.clone());
+                    }
+                }
+
+                for keyword in &call.arguments.keywords {
+                    let Some(arg_name) = &keyword.arg else {
+                        continue;
+                    };
+                    let arg_name = arg_name.id();
+                    if *arg_name == PRIMARY_KEY {
+                        // Detect if a field has `primary_key=True` set.
+                        if let Expr::BooleanLiteral(bl) = &keyword.value
+                            && bl.value
+                        {
+                            primary_key_field = Some(name.clone());
+                        }
+                    } else if *arg_name == CHOICES {
+                        fields_with_choices.push(name.clone());
+                    }
+                }
+            }
+        }
+        DjangoFieldInfo {
+            primary_key_field,
+            foreign_key_like_fields,
+            relation_fields,
+            fields_with_choices,
+        }
+    }
+}

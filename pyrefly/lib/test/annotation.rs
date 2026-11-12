@@ -1,0 +1,468 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use pyrefly_python::sys_info::PythonVersion;
+
+use crate::test::util::TestEnv;
+use crate::testcase;
+
+testcase!(
+    test_class_scope_quoted_annotation_bypasses_shadowing,
+    r#"
+from typing import assert_type
+class D:
+    def int(self) -> None:
+        ...
+    x: "int" = 0  # E: Expected a type form
+assert_type(D.x, int)  # E: assert_type(Unknown, int) failed
+"#,
+);
+
+testcase!(
+    test_raw_string_type_annotation,
+    r#"
+def f(x: r"int") -> R"str":  # E: Raw string literals are not allowed in type expressions  # E: Raw string literals are not allowed in type expressions
+    y: r"bool" = True  # E: Raw string literals are not allowed in type expressions
+    return ""
+"#,
+);
+
+testcase!(
+    test_union_operator_with_bare_string_literal,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import assert_type, Any, TypeVar, Generic, Literal, Callable, LiteralString
+T = TypeVar("T")
+class C(Generic[T]): ...
+bad1: int | "str" = "foo"  # E: `|` union syntax does not work with string literals
+bad2: int | "str" | T = "foo"  # E: `|` union syntax does not work with string literals  # E: Type variable `T` is not in scope
+bad3: "str" | int = "foo"  # E: `|` union syntax does not work with string literals
+bad4: "str" | int | T = "foo"  # E: `|` union syntax does not work with string literals  # E: Type variable `T` is not in scope
+bad5: C | "str" = "foo"  # E: `|` union syntax does not work with string literals
+bad6: "str" | None = "foo"  # E: `|` union syntax does not work with string literals
+bad7: None | "str" = "foo"  # E: `|` union syntax does not work with string literals
+bad8: "str" | Any = "foo"  # E: `|` union syntax does not work with string literals
+bad9: Any | "str" = "foo"  # E: `|` union syntax does not work with string literals
+ok1: T | "str" = "foo"  # E: Type variable `T` is not in scope
+ok2: "str" | T = "foo"  # E: Type variable `T` is not in scope
+ok3 = list["str" | T]
+ok4 = (int) | (str)
+ok5: "str" | C[int] = "foo"
+ok6: C[int] | "str" = "foo"
+ok7: "str" | Literal[1] = "foo"
+ok8: "str" | Callable[[int], str] = "foo"
+ok9: "str" | LiteralString = "foo"
+"#,
+);
+
+testcase!(
+    test_union_of_plain_type_and_complex_forward_ref,
+    r#"
+bad1: int | "list[str]" = []  # E: `|` union syntax does not work with string literals
+bad2: "list[str]" | int = []  # E: `|` union syntax does not work with string literals
+    "#,
+);
+
+testcase!(
+    test_union_of_forward_refs,
+    r#"
+bad: "int" | "list[str]" = 1  # E: `|` union syntax does not work with string literals
+    "#,
+);
+
+testcase!(
+    test_union_forward_ref_with_special_classes,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import TypedDict, NamedTuple, Protocol
+
+class TD(TypedDict):
+    x: int
+
+class NT(NamedTuple):
+    x: int
+
+class P(Protocol):
+    def f(self) -> None: ...
+
+bad1: "str" | TD = "foo"  # E: `|` union syntax does not work with string literals
+bad2: "str" | NT = NT(x=1)  # E: `|` union syntax does not work with string literals
+bad3: "str" | P = "foo"  # E: `|` union syntax does not work with string literals
+"#,
+);
+
+testcase!(
+    test_union_forward_ref_with_none,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from dataclasses import dataclass
+
+def test() -> "Foo" | None:  # E: `|` union syntax does not work with string literals
+    return Foo(bar=1)
+
+@dataclass
+class Foo:
+    bar: int
+"#,
+);
+
+testcase!(
+    bug = "list[int] (types.GenericAlias) errors at runtime but List[int] (typing._GenericAlias) does not; pyrefly can't distinguish them",
+    test_union_forward_ref_with_builtin_generics,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import List, Dict, Type, Any
+ok_but_runtime_error1: "str" | list[int] = "foo"
+ok_but_runtime_error2: "str" | dict[str, int] = "foo"
+ok_but_runtime_error3: "str" | tuple[int, ...] = "foo"
+ok_but_runtime_error4: "str" | type[int] = "foo"
+ok1: "str" | List[int] = "foo"
+ok2: "str" | Dict[str, int] = "foo"
+ok3: "str" | Type[Any] = "foo"
+"#,
+);
+
+// Test that the error is NOT raised for Python 3.14+
+// In Python 3.14+, annotations are not evaluated at runtime by default (PEP 649)
+testcase!(
+    test_union_type_with_bare_string_literal_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+ok1: int | "str" = "foo"
+ok2: "str" | int = "foo"
+"#,
+);
+
+// Test that the error is NOT raised when `from __future__ import annotations` is used
+// With future annotations, annotations are not evaluated at runtime
+testcase!(
+    test_union_type_with_bare_string_literal_future_annotations,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from __future__ import annotations
+ok1: int | "str" = "foo"
+ok2: "str" | int = "foo"
+"#,
+);
+
+// A legacy type alias value is evaluated where it appears, even when annotations are postponed.
+testcase!(
+    test_union_type_with_bare_string_literal_in_alias_future_annotations,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from __future__ import annotations
+from typing import TypeAlias
+X: TypeAlias = int | "str"  # E: `|` union syntax does not work with string literals
+"#,
+);
+
+// Test legacy type alias with forward reference string literal
+testcase!(
+    test_union_operator_with_legacy_type_alias,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import TypeAlias
+
+class C[T]: pass
+
+IntAlias1 = C[int]
+IntAlias2: TypeAlias = C[int]
+IntAlias3 = int
+IntAlias4: TypeAlias = int
+
+ok1: IntAlias1 | "str" = "foo"
+ok2: IntAlias2 | "str" = "foo"
+bad1: IntAlias3 | "str" = "foo"  # E: `|` union syntax does not work with string literals
+bad2: IntAlias4 | "str" = "foo"  # E: `|` union syntax does not work with string literals
+"#,
+);
+
+// Test scoped type alias with forward reference string literal
+// TypeAliasType is a plain type, so this is a runtime error
+testcase!(
+    test_union_operator_with_scoped_type_alias,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+class C[T]: pass
+type IntAlias = C[int]
+bad: IntAlias | "str" = "foo"  # E: `|` union syntax does not work with string literals
+"#,
+);
+
+testcase!(
+    test_unquoted_forward_reference_before_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from dataclasses import dataclass
+from typing import Optional, Union
+
+@dataclass
+class Leaf:
+    value: int
+
+@dataclass
+class Node:
+    left: Optional[Tree]  # E: `Tree` is uninitialized
+    right: Optional[Tree]  # E: `Tree` is uninitialized
+
+type Tree = Union[Leaf, Node]
+"#,
+);
+
+testcase!(
+    test_unquoted_class_self_reference_before_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+class C:
+    c: list[C]  # E: `C` is uninitialized
+"#,
+);
+
+testcase!(
+    test_unquoted_forward_reference_in_type_parameters_before_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+class Bound[T: list[A]]: ...
+class Constrained[T: (list[A], bytes)]: ...
+class Default[T = list[A]]: ...
+class A: ...
+"#,
+);
+
+// Postponed annotations do not postpone other type expressions, which run where they appear.
+testcase!(
+    bug = "Lookups through legacy tparam interception miss unquoted forward refs",
+    test_unquoted_forward_reference_in_eager_type_expression,
+    r#"
+from __future__ import annotations
+from typing import Optional, TypeVar, cast
+X = Optional[A]  # should be an error
+class B(list[A]): ...  # should be an error
+T = TypeVar("T", bound=list[A])  # E: `A` is uninitialized
+y = cast(list[A], 1)  # E: `A` is uninitialized
+class A: ...
+"#,
+);
+
+testcase!(
+    bug = "Function annotations routed through legacy tparam lookup miss unquoted forward refs",
+    test_unquoted_function_annotation_forward_reference_before_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+def f(x: Alias) -> Alias:
+    return x
+
+type Alias = int
+"#,
+);
+
+testcase!(
+    test_unquoted_forward_reference_ok_py314,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+from dataclasses import dataclass
+from typing import Optional, Union
+
+@dataclass
+class Leaf:
+    value: int
+
+@dataclass
+class Node:
+    left: Optional[Tree]
+    right: Optional[Tree]
+
+type Tree = Union[Leaf, Node]
+"#,
+);
+
+testcase!(
+    test_unquoted_forward_reference_ok_future_annotations,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Union
+
+@dataclass
+class Leaf:
+    value: int
+
+@dataclass
+class Node:
+    left: Optional[Tree]
+    right: Optional[Tree]
+
+type Tree = Union[Leaf, Node]
+"#,
+);
+
+testcase!(
+    test_nested_class_forward_reference_in_enclosing_class_annotation,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from __future__ import annotations
+from typing import assert_type
+
+class Formatter:
+    a: _Section
+    class _Section: ...
+    b: _Section
+
+def check(formatter: Formatter) -> None:
+    assert_type(formatter.a, Formatter._Section)
+    assert_type(formatter.b, Formatter._Section)
+"#,
+);
+
+testcase!(
+    test_nested_class_runtime_reference_before_declaration_is_error,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+class Formatter:
+    a = _Section  # E: Could not find name `_Section`
+    class _Section: ...
+"#,
+);
+
+testcase!(
+    test_annotation_only_class_field_is_not_a_forward_reference,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from __future__ import annotations
+
+class C:
+    x: x  # E: Could not find name `x`
+    A: B  # E: Could not find name `B`
+    B: A  # E: Could not find name `A`
+"#,
+);
+
+fn env_3_13_with_stub() -> TestEnv {
+    let mut env = TestEnv::new_with_version(PythonVersion::new(3, 13, 0));
+    env.add_with_path("foo", "foo.pyi", "x: int | 'str'");
+    env
+}
+
+testcase!(
+    test_union_forward_ref_ok_in_stub,
+    env_3_13_with_stub(),
+    "import foo",
+);
+testcase!(
+    test_call_expressions_in_type_forms,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import TypeVar, Union, assert_type, cast
+
+class Base: ...
+def make_type() -> type[Base]: ...
+
+base = Base()
+class DynamicBase(type(base)): ...
+
+LegacyBound = TypeVar("LegacyBound", bound=make_type())  # E: Function call cannot be used in annotations
+LegacyConstraints = TypeVar("LegacyConstraints", make_type(), Base)  # E: Function call cannot be used in annotations
+LegacyDefault = TypeVar("LegacyDefault", default=make_type())  # E: Function call cannot be used in annotations
+
+def pep_bound[T: make_type()](x: T) -> T: ...  # E: Function call cannot be used in annotations
+def pep_default[T = make_type()](x: T) -> T: ...  # E: Function call cannot be used in annotations
+
+def return_union() -> Union[bool, make_type()]: ...  # E: Function call cannot be used in annotations
+def return_bitor() -> bool | make_type(): ...  # E: Function call cannot be used in annotations
+def return_tuple() -> tuple[int, make_type()]: ...  # E: Function call cannot be used in annotations
+def return_generic() -> list[make_type()]: ...  # E: Function call cannot be used in annotations
+
+def use(value: Base) -> None:
+    cast(make_type(), object())  # E: Function call cannot be used in annotations
+    cast(list[make_type()], object())  # E: Function call cannot be used in annotations
+    assert_type(value, make_type())  # E: Function call cannot be used in annotations
+"#,
+);
+
+testcase!(
+    test_type_call_in_annotations,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+import types
+from typing import TypeVar, Union, cast
+
+class MyClass: ...
+instance = MyClass()
+
+def not_impl_param(x: type(NotImplemented)) -> None: ...  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+def not_impl_union_param(x: Union[bool, type(NotImplemented)]) -> None: ...  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+def not_impl_return() -> type(NotImplemented): ...  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+def not_impl_union_return() -> Union[bool, type(NotImplemented)]: ...  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+def not_impl_bitor_return() -> bool | type(NotImplemented): ...  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+var_not_impl: type(NotImplemented)  # E: Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?
+
+T = TypeVar("T", int, type(None))  # E: Function call cannot be used in annotations. Did you mean `None`?
+var_none: type(None)  # E: Function call cannot be used in annotations. Did you mean `None`?
+var_ellipsis: type(Ellipsis)  # E: Function call cannot be used in annotations. Did you mean `types.EllipsisType`?
+var_dots: type(...)  # E: Function call cannot be used in annotations. Did you mean `types.EllipsisType`?
+var_module: type(types)  # E: Function call cannot be used in annotations. Did you mean `types.ModuleType`?
+
+var_cls: type(MyClass)  # E: Function call cannot be used in annotations. Did you mean `type[MyClass]`?
+def cls_return() -> list[type(MyClass)]: ...  # E: Function call cannot be used in annotations. Did you mean `type[MyClass]`?
+def cls_cast(x: object) -> None:
+    cast(type(MyClass), x)  # E: Function call cannot be used in annotations. Did you mean `type[MyClass]`?
+
+var_instance: type(instance)  # E: Function call cannot be used in annotations
+self_ref: type(self_ref) = 1  # E: Function call cannot be used in annotations  # E: Circular reference to `self_ref` in annotation
+"#,
+);
+
+testcase!(
+    test_annotated_metadata_is_not_checked,
+    r#"
+from typing import Annotated, Callable
+
+def validator(func: Callable[[int], object]) -> object: ...
+def needs_int(x: int) -> object: ...
+
+a: Annotated[str, needs_int("oops")]
+b: Annotated[str, [e for e in 1]]
+c: Annotated[str, validator(lambda v: v.missing)]
+d: Annotated[str, undefined_name]  # E: Could not find name `undefined_name`
+
+class C:
+    e: Annotated[str, [e for e in 1]]
+    f: Annotated[str, undefined_in_class]  # E: Could not find name `undefined_in_class`
+"#,
+);
+
+testcase!(
+    test_annotated_metadata_postponed_class_body_forward_reference,
+    r#"
+from __future__ import annotations
+from typing import Annotated
+
+def validator(f: object) -> object: ...
+
+class C:
+    a: Annotated[int, validator(later)]
+
+    @staticmethod
+    def later(v: str) -> int: ...
+"#,
+);
+
+testcase!(
+    test_annotated_metadata_runtime_class_body_forward_reference,
+    r#"
+from typing import Annotated
+
+def validator(f: object) -> object: ...
+
+class C:
+    a: Annotated[int, validator(later)]  # E: Could not find name `later`
+
+    @staticmethod
+    def later(v: str) -> int: ...
+"#,
+);

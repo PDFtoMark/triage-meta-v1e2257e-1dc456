@@ -1,0 +1,849 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::sync::Arc;
+
+use dupe::Dupe;
+use pyrefly_types::callable::Callable;
+use pyrefly_types::dimension::Int;
+use pyrefly_types::dimension::gradual_size;
+use pyrefly_types::function::Function;
+use pyrefly_util::display::commas_iter;
+use pyrefly_util::display::count;
+use pyrefly_util::prelude::SliceExt;
+use ruff_python_ast::name::Name;
+use ruff_text_size::TextRange;
+
+use crate::alt::answers::LookupAnswer;
+use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::class::targs_cursor::TArgsCursor;
+use crate::config::error_kind::ErrorKind;
+use crate::error::collector::ErrorCollector;
+use crate::error::context::TypeCheckContext;
+use crate::error::context::TypeCheckKind;
+use crate::solver::shape::type_as_intvar_solution;
+use crate::solver::solver::QuantifiedHandle;
+use crate::types::callable::Param;
+use crate::types::callable::ParamList;
+use crate::types::callable::Required;
+use crate::types::class::Class;
+use crate::types::class::ClassType;
+use crate::types::literal::Lit;
+use crate::types::quantified::AnchorIndex;
+use crate::types::quantified::Quantified;
+use crate::types::quantified::QuantifiedIdentity;
+use crate::types::quantified::QuantifiedKind;
+use crate::types::quantified::QuantifiedOrigin;
+use crate::types::tuple::Tuple;
+use crate::types::type_var::PreInferenceVariance;
+use crate::types::type_var::Restriction;
+use crate::types::typed_dict::TypedDict;
+use crate::types::types::Forall;
+use crate::types::types::Forallable;
+use crate::types::types::Substitution;
+use crate::types::types::TArgs;
+use crate::types::types::TParams;
+use crate::types::types::Type;
+
+/// Format a generic entity for implicit-any error messages, e.g.
+/// `` class `Foo[T, *Ts]` `` (or `` class `Foo` `` when there are no tparams).
+fn format_generic_entity(noun: &str, name: &Name, tparams: &TParams) -> String {
+    if tparams.is_empty() {
+        format!("{noun} `{name}`")
+    } else {
+        format!(
+            "{noun} `{name}[{}]`",
+            commas_iter(|| tparams.iter().map(|t| t.display_name_with_prefix()))
+        )
+    }
+}
+
+impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    /// Silently promotes a Class to a ClassType, using default type arguments. It is up to the
+    /// caller to ensure they are not calling this method on a TypedDict class, which should be
+    /// promoted to TypedDict instead of ClassType.
+    pub fn promote_nontypeddict_silently_to_classtype(&self, cls: &Class) -> ClassType {
+        ClassType::new(
+            cls.dupe(),
+            self.get_class_tparams(cls)
+                .map_or_else(TArgs::default, |tparams| {
+                    self.create_default_targs(tparams.dupe(), None)
+                }),
+        )
+    }
+
+    /// Specialize a non-TypedDict class and return the underlying `ClassType`.
+    ///
+    /// This is for callers that wrap the class in another type form but still need
+    /// ordinary class type-argument validation and substitution.
+    pub(crate) fn specialize_nontypeddict_to_classtype(
+        &self,
+        cls: &Class,
+        targs: Vec<Type>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> ClassType {
+        let targs = match self.get_class_tparams(cls) {
+            Some(tparams) => {
+                self.create_targs(cls.name(), tparams.dupe(), targs, range, true, errors)
+            }
+            None => self.reject_targs_without_tparams(cls.name(), &targs, range, errors),
+        };
+        ClassType::new(cls.dupe(), targs)
+    }
+
+    fn specialize_impl(
+        &self,
+        cls: &Class,
+        targs: Vec<Type>,
+        range: TextRange,
+        validate_restriction: bool,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let metadata = self.get_metadata_for_class(cls);
+        let tparams = self.get_class_tparams(cls).dupe();
+
+        // We didn't find any type parameters for this class, but it may have ones we don't know about if:
+        // - the class inherits from Any, or
+        // - the class inherits from Generic[...] or Protocol [...]. We probably dropped the type
+        //   arguments because we found an error in them.
+        let has_unknown_tparams = tparams.as_ref().is_none_or(|tparams| tparams.is_empty())
+            && (metadata.has_base_any() || metadata.has_generic_base_class());
+
+        let targs = if !targs.is_empty() && has_unknown_tparams {
+            // Accept any number of arguments (by ignoring them).
+            TArgs::default()
+        } else {
+            match tparams {
+                Some(tparams) => self.create_targs(
+                    cls.name(),
+                    tparams.dupe(),
+                    targs,
+                    range,
+                    validate_restriction,
+                    errors,
+                ),
+                None => self.reject_targs_without_tparams(cls.name(), &targs, range, errors),
+            }
+        };
+        self.type_of_instance(cls, targs)
+    }
+
+    /// Given a class or typed dictionary and some (explicit) type arguments, construct a `Type`
+    /// that represents the type of an instance of the class or typed dictionary with those `targs`.
+    ///
+    /// Note how this differs from `promote` and `instantiate`:
+    /// specialize(list, [int]) == list[int]
+    /// promote(list) == list[Any]
+    /// instantiate(list) == list[T]
+    pub fn specialize(
+        &self,
+        cls: &Class,
+        targs: Vec<Type>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.specialize_impl(cls, targs, range, true, errors)
+    }
+
+    pub fn specialize_in_base_class(
+        &self,
+        cls: &Class,
+        targs: Vec<Type>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.specialize_impl(cls, targs, range, false, errors)
+    }
+
+    fn specialize_forall_impl(
+        &self,
+        forall: Forall<Forallable>,
+        targs: Vec<Type>,
+        range: TextRange,
+        validate_restriction: bool,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let targs = self.create_targs(
+            &forall.body.name(),
+            forall.tparams.dupe(),
+            targs,
+            range,
+            validate_restriction,
+            errors,
+        );
+        forall.apply_targs(targs)
+    }
+
+    pub fn specialize_forall(
+        &self,
+        forall: Forall<Forallable>,
+        targs: Vec<Type>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.specialize_forall_impl(forall, targs, range, true, errors)
+    }
+
+    pub fn specialize_forall_in_base_class(
+        &self,
+        forall: Forall<Forallable>,
+        targs: Vec<Type>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.specialize_forall_impl(forall, targs, range, false, errors)
+    }
+
+    /// Given a class or typed dictionary, create a `Type` that represents to an instance annotated
+    /// with the class or typed dictionary's bare name. This will either have empty type arguments if the
+    /// class or typed dictionary is not generic, or type arguments populated with gradual types if
+    /// it is (e.g. applying an annotation of `list` to a variable means
+    /// `list[Any]`).
+    ///
+    /// We require a range because depending on the configuration we may raise
+    /// a type error when a generic class or typed dictionary is promoted using gradual types.
+    ///
+    /// Note how this differs from `specialize` and `instantiate`:
+    /// specialize(list, [int]) == list[int]
+    /// promote(list) == list[Any]
+    /// instantiate(list) == list[T]
+    pub fn promote(&self, cls: &Class, range: TextRange, errors: &ErrorCollector) -> Type {
+        self.promote_impl(cls, range, errors, None)
+    }
+
+    /// Promote a bare generic class while omitting the implicit-Any diagnostic for one parameter.
+    pub(crate) fn promote_ignoring_implicit_any_for(
+        &self,
+        cls: &Class,
+        range: TextRange,
+        errors: &ErrorCollector,
+        ignored: &Quantified,
+    ) -> Type {
+        self.promote_impl(cls, range, errors, Some(ignored))
+    }
+
+    fn promote_impl(
+        &self,
+        cls: &Class,
+        range: TextRange,
+        errors: &ErrorCollector,
+        ignored_implicit_any: Option<&Quantified>,
+    ) -> Type {
+        let Some(tparams) = self.get_class_tparams(cls).map(Dupe::dupe) else {
+            return self.type_of_instance(cls, TArgs::default());
+        };
+        let tparams_for_error = tparams.dupe();
+        let targs = self.create_default_targs(
+            tparams,
+            Some(&|tparam: &Quantified| {
+                if ignored_implicit_any != Some(tparam) {
+                    Self::add_implicit_any_error(
+                        errors,
+                        range,
+                        format_generic_entity("class", cls.name(), &tparams_for_error),
+                        Some(tparam.name().as_str()),
+                    );
+                }
+            }),
+        );
+        self.type_of_instance(cls, targs)
+    }
+
+    pub fn promote_forall(
+        &self,
+        forall: Forall<Forallable>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let tparams = forall.tparams.dupe();
+        let tparams_for_error = tparams.dupe();
+        let alias_name = forall.body.name();
+        let targs = self.create_default_targs(
+            tparams,
+            Some(&|tparam: &Quantified| {
+                Self::add_implicit_any_error(
+                    errors,
+                    range,
+                    format_generic_entity("type alias", &alias_name, &tparams_for_error),
+                    Some(tparam.name().as_str()),
+                );
+            }),
+        );
+        forall.apply_targs(targs)
+    }
+
+    /// Version of `promote` that does not potentially raise errors.
+    /// Should only be used for unusual scenarios.
+    pub fn promote_silently(&self, cls: &Class) -> Type {
+        let targs = self
+            .get_class_tparams(cls)
+            .map_or_else(TArgs::default, |tparams| {
+                self.create_default_targs(tparams.dupe(), None)
+            });
+        self.type_of_instance(cls, targs)
+    }
+
+    fn targs_of_tparams(&self, class: &Class) -> TArgs {
+        self.get_class_tparams(class)
+            .map_or_else(TArgs::default, |tparams| {
+                TArgs::new(
+                    tparams.dupe(),
+                    tparams
+                        .iter()
+                        .map(|q| q.clone().to_type(self.heap))
+                        .collect(),
+                )
+            })
+    }
+
+    /// Given a class or typed dictionary, create a `Type` that represents a generic instance of
+    /// the class or typed dictionary.
+    ///
+    /// Note how this differs from `specialize` and `promote`:
+    /// specialize(list, [int]) == list[int]
+    /// promote(list) == list[Any]
+    /// instantiate(list) == list[T]
+    pub fn instantiate(&self, cls: &Class) -> Type {
+        self.type_of_instance(cls, self.targs_of_tparams(cls))
+    }
+
+    pub fn instantiate_type_var_tuple(&self) -> (TParams, Type) {
+        // Synthetic quantified with no user-visible source location. The anchor is
+        // TextRange::default() as a sentinel for "no source position". Alpha-equivalence
+        // in TypeEqCtx handles pairing with other synthetic quantifieds correctly.
+        let identity = QuantifiedIdentity::new(
+            self.module().name(),
+            AnchorIndex::first(TextRange::default()),
+            QuantifiedOrigin::synthetic(),
+        );
+        let quantified = Quantified::new(
+            identity,
+            Name::new_static("Ts"),
+            QuantifiedKind::TypeVarTuple,
+            None,
+            Restriction::Unrestricted,
+            PreInferenceVariance::Covariant,
+        );
+        let tparams = TParams::new(vec![quantified.clone()]);
+        let tuple_ty = self.heap.mk_tuple(Tuple::unpacked(
+            Vec::new(),
+            self.heap.mk_quantified(quantified),
+            Vec::new(),
+        ));
+        (tparams, tuple_ty)
+    }
+
+    pub fn instantiate_unbounded_tuple(&self) -> (TParams, Type) {
+        // Synthetic quantified with no user-visible source location. The anchor is
+        // TextRange::default() as a sentinel for "no source position". Alpha-equivalence
+        // in TypeEqCtx handles pairing with other synthetic quantifieds correctly.
+        let identity = QuantifiedIdentity::new(
+            self.module().name(),
+            AnchorIndex::new(TextRange::default(), 1),
+            QuantifiedOrigin::synthetic(),
+        );
+        let quantified = Quantified::new(
+            identity,
+            Name::new_static("T"),
+            QuantifiedKind::TypeVar,
+            None,
+            Restriction::Unrestricted,
+            PreInferenceVariance::Covariant,
+        );
+        let tparams = TParams::new(vec![quantified.clone()]);
+        let tuple_ty = self.heap.mk_tuple(Tuple::Unbounded(Box::new(
+            self.heap.mk_quantified(quantified),
+        )));
+        (tparams, tuple_ty)
+    }
+
+    /// Gets this Class as a ClassType with its tparams as the arguments. For non-TypedDict
+    /// classes, this is the type of an instance of this class. Unless you specifically need the
+    /// ClassType inside the Type and know you don't have a TypedDict, you should instead use
+    /// AnswersSolver::instantiate() to get an instance type.
+    pub fn as_class_type_unchecked(&self, class: &Class) -> ClassType {
+        ClassType::new(class.dupe(), self.targs_of_tparams(class))
+    }
+
+    /// Gets this Class as a TypedDict with its tparams as the arguments.
+    pub fn as_typed_dict_unchecked(&self, class: &Class) -> TypedDict {
+        let targs = self.targs_of_tparams(class);
+        TypedDict::new(class.clone(), targs)
+    }
+
+    /// Instantiates a class or typed dictionary with fresh variables for its type parameters.
+    pub fn instantiate_fresh_class(&self, cls: &Class) -> (QuantifiedHandle, Type) {
+        let ty = self.instantiate(cls);
+        match self.get_class_tparams(cls) {
+            Some(tparams) => self.solver().fresh_quantified(tparams, ty, self.uniques),
+            None => (QuantifiedHandle::empty(), ty),
+        }
+    }
+
+    pub fn instantiate_fresh_forall(&self, forall: Forall<Forallable>) -> (QuantifiedHandle, Type) {
+        self.solver()
+            .fresh_quantified(&forall.tparams, forall.body.as_type(), self.uniques)
+    }
+
+    pub fn instantiate_fresh_function(
+        &self,
+        tparams: &TParams,
+        func: Function,
+    ) -> (QuantifiedHandle, Function) {
+        let (qs, t) =
+            self.solver()
+                .fresh_quantified(tparams, self.heap.mk_function(func), self.uniques);
+        match t {
+            Type::Function(func) => (qs, *func),
+            // We passed a Function to fresh_quantified(), so we know we get a Function back out.
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn instantiate_fresh_callable(
+        &self,
+        tparams: &TParams,
+        c: Callable,
+    ) -> (QuantifiedHandle, Callable) {
+        let (qs, t) =
+            self.solver()
+                .fresh_quantified(tparams, self.heap.mk_callable_from(c), self.uniques);
+        match t {
+            Type::Callable(c) => (qs, *c),
+            // We passed a Function to fresh_quantified(), so we know we get a Function back out.
+            _ => unreachable!(),
+        }
+    }
+
+    /// Creates default type arguments for a class, falling back to Any for type parameters without defaults.
+    fn create_default_targs(
+        &self,
+        tparams: Arc<TParams>,
+        on_fallback_to_gradual: Option<&dyn Fn(&Quantified)>,
+    ) -> TArgs {
+        if tparams.is_empty() {
+            TArgs::default()
+        } else {
+            let tys = tparams
+                .iter()
+                .map(|x| {
+                    // TODO(grievejia): This is actually not a 100% accurate way of detecting graudal fallbacks:
+                    // it will trigger when the tparam doesn't have a default, but won't trigger if
+                    // - The tparam has a default, but that default is another type var without a default.
+                    // - The tparam has a default, but part of that default type requires another fallback (e.g. the
+                    //   default is `list[Foo]`, where `Foo` is a generic class whose tparam doesn't have a default).
+                    //
+                    // To make it 100% accurate, we actually need to hook the callback into `as_graudal_type()`. It's doable
+                    // but could add a lot of complexities so let's keep it as an exercise in the future.
+                    if let Some(f) = on_fallback_to_gradual
+                        && x.default().is_none()
+                    {
+                        f(x);
+                    }
+                    x.as_gradual_type()
+                })
+                .collect();
+            TArgs::new(tparams, tys)
+        }
+    }
+
+    fn type_of_instance(&self, cls: &Class, targs: TArgs) -> Type {
+        let metadata = self.get_metadata_for_class(cls);
+        if metadata.is_typed_dict() {
+            self.heap.mk_typed_dict(TypedDict::new(cls.dupe(), targs))
+        } else {
+            self.heap.mk_class_type(ClassType::new(cls.dupe(), targs))
+        }
+    }
+
+    /// Type arguments applied to something with no type parameters. There is
+    /// nothing to substitute, so the only question is whether the caller passed
+    /// arguments that cannot go anywhere.
+    fn reject_targs_without_tparams(
+        &self,
+        name: &Name,
+        targs: &[Type],
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> TArgs {
+        if !targs.is_empty() {
+            self.error(
+                errors,
+                range,
+                ErrorKind::BadSpecialization,
+                format!(
+                    "Expected {} for `{}`, got {}",
+                    count(0, "type argument"),
+                    name,
+                    targs.len()
+                ),
+            );
+        }
+        TArgs::default()
+    }
+
+    fn create_targs(
+        &self,
+        name: &Name,
+        tparams: Arc<TParams>,
+        targs: Vec<Type>,
+        range: TextRange,
+        validate_restriction: bool,
+        errors: &ErrorCollector,
+    ) -> TArgs {
+        let nparams = tparams.len();
+        let mut targs_cursor = TArgsCursor::new(targs);
+        let mut checked_targs = Vec::new();
+        for (param_idx, param) in tparams.iter().enumerate() {
+            if let Some(arg) = targs_cursor.peek() {
+                // Get next type argument
+                match param.kind() {
+                    QuantifiedKind::TypeVarTuple => {
+                        checked_targs.push(self.create_next_typevartuple_arg(
+                            targs_cursor.consume_for_typevartuple_arg(param_idx, &tparams),
+                            range,
+                            errors,
+                        ));
+                    }
+                    QuantifiedKind::ParamSpec if nparams == 1 && !arg.is_kind_param_spec() => {
+                        // If the only type param is a ParamSpec and the type argument
+                        // is not a parameter expression, then treat the entire type argument list
+                        // as a parameter list
+                        checked_targs.push(
+                            self.create_paramspec_value(targs_cursor.consume_for_paramspec_value()),
+                        );
+                    }
+                    QuantifiedKind::ParamSpec => {
+                        checked_targs.push(self.create_next_paramspec_arg(
+                            targs_cursor.consume_for_paramspec_arg(),
+                            range,
+                            errors,
+                        ));
+                    }
+                    QuantifiedKind::TypeVar => {
+                        checked_targs.push(self.create_next_typevar_arg(
+                            param,
+                            targs_cursor.consume_for_typevar_arg(),
+                            range,
+                            validate_restriction,
+                            errors,
+                        ));
+                    }
+                    QuantifiedKind::IntVar => {
+                        checked_targs.push(self.create_next_intvar_arg(
+                            param,
+                            targs_cursor.consume_for_typevar_arg(),
+                            range,
+                            errors,
+                        ));
+                    }
+                }
+            } else {
+                // We've run out of arguments, and we have type parameters left to consume.
+                self.consume_remaining_tparams(
+                    name,
+                    &tparams,
+                    param_idx,
+                    &mut checked_targs,
+                    targs_cursor.nargs(),
+                    range,
+                    errors,
+                );
+                break;
+            }
+        }
+        if targs_cursor.nargs_unconsumed(targs_cursor.nargs()) > 0 {
+            self.error(
+                errors,
+                range,
+                ErrorKind::BadSpecialization,
+                format!(
+                    "Expected {} for `{}`, got {}",
+                    count(nparams, "type argument"),
+                    name,
+                    targs_cursor.nargs()
+                ),
+            );
+        }
+        TArgs::new(tparams, checked_targs)
+    }
+
+    fn create_next_typevartuple_arg(
+        &self,
+        args: &[Type],
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let mut prefix = Vec::new();
+        let mut middle = Vec::new();
+        let mut suffix = Vec::new();
+        for arg in args {
+            match arg {
+                Type::Unpack(inner) if let Type::Tuple(Tuple::Concrete(elts)) = &**inner => {
+                    if middle.is_empty() {
+                        prefix.extend_from_slice(elts);
+                    } else {
+                        suffix.extend_from_slice(elts);
+                    }
+                }
+                Type::Unpack(t) => {
+                    if !suffix.is_empty() {
+                        middle.push(self.heap.mk_unbounded_tuple(self.unions(suffix)));
+                        suffix = Vec::new();
+                    } else {
+                        middle.push((**t).clone())
+                    }
+                }
+                arg => {
+                    let arg = if arg.is_kind_type_var_tuple() {
+                        self.error(
+                            errors,
+                            range,
+                            ErrorKind::InvalidTypeVarTuple,
+                            "`TypeVarTuple` must be unpacked".to_owned(),
+                        )
+                    } else {
+                        arg.clone()
+                    };
+                    if middle.is_empty() {
+                        prefix.push(arg);
+                    } else {
+                        suffix.push(arg);
+                    }
+                }
+            }
+        }
+        match middle.as_slice() {
+            [] => self.heap.mk_concrete_tuple(prefix),
+            [middle] => self.heap.mk_unpacked_tuple(prefix, middle.clone(), suffix),
+            // We can't precisely model unpacking two unbounded iterables, so we'll keep any
+            // concrete prefix and suffix elements and merge everything in between into an unbounded tuple
+            _ => {
+                let middle_types: Vec<Type> = middle
+                    .iter()
+                    .map(|t| {
+                        self.unwrap_iterable(t)
+                            .unwrap_or(self.heap.mk_class_type(self.stdlib.object().clone()))
+                    })
+                    .collect();
+                self.heap.mk_unpacked_tuple(
+                    prefix,
+                    self.heap.mk_unbounded_tuple(self.unions(middle_types)),
+                    suffix,
+                )
+            }
+        }
+    }
+
+    fn create_paramspec_value(&self, targs: &[Type]) -> Type {
+        let params: Vec<Param> = targs.map(|t| Param::PosOnly(None, t.clone(), Required::Required));
+        self.heap.mk_param_spec_value(ParamList::new(params))
+    }
+
+    fn create_next_paramspec_arg(
+        &self,
+        arg: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        if arg.is_kind_param_spec() {
+            arg.clone()
+        } else if arg.is_any() {
+            // Any is the universal type that is compatible with any ParamSpec.
+            // Convert it to Ellipsis, which is the gradual type for ParamSpec.
+            Type::Ellipsis
+        } else {
+            self.error(
+                errors,
+                range,
+                ErrorKind::InvalidParamSpec,
+                format!(
+                    "Expected a valid ParamSpec expression, got `{}`",
+                    self.for_display(arg.clone())
+                ),
+            );
+            Type::Ellipsis
+        }
+    }
+
+    fn create_next_typevar_arg(
+        &self,
+        param: &Quantified,
+        arg: &Type,
+        range: TextRange,
+        validate_restriction: bool,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match arg {
+            Type::Unpack(_) => self.error(
+                errors,
+                range,
+                ErrorKind::BadUnpacking,
+                format!(
+                    "Unpacked argument cannot be used for type parameter {}",
+                    param.name()
+                ),
+            ),
+            _ => {
+                if arg.is_kind_type_var_tuple() {
+                    self.error(
+                        errors,
+                        range,
+                        ErrorKind::InvalidTypeVarTuple,
+                        "`TypeVarTuple` must be unpacked".to_owned(),
+                    )
+                } else if matches!(arg, Type::Ellipsis) {
+                    self.error(
+                        errors,
+                        range,
+                        ErrorKind::InvalidAnnotation,
+                        "`...` cannot be used for type parameter".to_owned(),
+                    )
+                } else if arg.is_kind_param_spec() {
+                    self.error(
+                        errors,
+                        range,
+                        ErrorKind::InvalidParamSpec,
+                        "`ParamSpec` cannot be used for type parameter".to_owned(),
+                    )
+                } else {
+                    let restriction = param.restriction();
+                    // Match the cheap `arg` literal shape before materializing the
+                    // parameter's upper bound, so only an integer literal argument
+                    // pays for computing the bound.
+                    let arg =
+                        if let Type::Literal(lit) = arg
+                            && let Lit::Int(i) = &lit.value
+                            && matches!(param.upper_bound(self.stdlib, self.heap), Type::Int(_))
+                        {
+                            Type::Int(i.as_i64().map(Int::Literal).unwrap_or_else(|| {
+                                Int::Symbolic(Box::new(Type::Literal(lit.clone())))
+                            }))
+                        } else {
+                            arg.clone()
+                        };
+                    if validate_restriction && restriction.is_restricted() {
+                        let tcc = &|| {
+                            TypeCheckContext::of_kind(TypeCheckKind::TypeVarSpecialization(
+                                param.name().clone(),
+                            ))
+                        };
+                        // In a legacy type alias, one old-style TypeVar can be specialized with
+                        // another, which we handle by checking their upper bounds against each other.
+                        let arg_for_check = {
+                            let arg = arg.clone();
+                            arg.transform(&mut |x| match x {
+                                Type::TypeVar(tv) => {
+                                    *x = tv.upper_bound(self.stdlib, self.heap);
+                                }
+                                Type::TypeLevelDslCall(call) => {
+                                    *x = call.type_for_generic_bound_check()
+                                }
+                                _ => {}
+                            })
+                        };
+                        self.check_type(
+                            &arg_for_check,
+                            &param.upper_bound(self.stdlib, self.heap),
+                            range,
+                            errors,
+                            tcc,
+                        );
+                    }
+                    arg
+                }
+            }
+        }
+    }
+
+    fn create_next_intvar_arg(
+        &self,
+        param: &Quantified,
+        arg: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match arg {
+            Type::Unpack(_) => {
+                // Shape argument parsing normally rejects this first; keep the
+                // targ-level recovery path for callers that bypass that parser.
+                self.error(
+                    errors,
+                    range,
+                    ErrorKind::BadUnpacking,
+                    format!(
+                        "Unpacked argument cannot be used for type parameter {}",
+                        param.name()
+                    ),
+                );
+                gradual_size()
+            }
+            _ => type_as_intvar_solution(arg).unwrap_or_else(|| {
+                // Shape argument parsing normally rejects concrete source errors
+                // first; this is the class-targ recovery path for invalid values
+                // that reach specialization directly.
+                self.error(
+                    errors,
+                    range,
+                    ErrorKind::BadSpecialization,
+                    format!(
+                        "Expected a valid Int expression for type parameter `{}`, got `{}`",
+                        param.name(),
+                        self.for_display(arg.clone())
+                    ),
+                );
+                gradual_size()
+            }),
+        }
+    }
+
+    /// Consume all remaining type parameters after we've run out of arguments.
+    fn consume_remaining_tparams(
+        &self,
+        name: &Name,
+        tparams: &TParams,
+        param_idx: usize,
+        checked_targs: &mut Vec<Type>,
+        nargs: usize,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) {
+        let all_remaining_params_can_be_empty = tparams
+            .iter()
+            .skip(param_idx)
+            .all(|x| x.is_type_var_tuple() || x.default().is_some());
+        if !all_remaining_params_can_be_empty {
+            self.error(
+                errors,
+                range,
+                ErrorKind::BadSpecialization,
+                format!(
+                    "Expected {} for `{}`, got {}",
+                    count(tparams.len(), "type argument"),
+                    name,
+                    nargs,
+                ),
+            );
+        }
+        for x in tparams.iter().skip(param_idx) {
+            // A TypeVarTuple with no remaining args captures zero types when
+            // the specialization is otherwise valid. In error recovery (not
+            // enough args for non-defaulted params), keep the gradual type
+            // to avoid cascading errors.
+            let targ = if all_remaining_params_can_be_empty && x.is_type_var_tuple() {
+                self.heap.mk_concrete_tuple(Vec::new())
+            } else if let Some(default) = x.default() {
+                // A default may refer to the parameters declared before it.
+                Substitution::for_prefix(tparams, checked_targs).substitute_into(default.clone())
+            } else {
+                x.as_gradual_type()
+            };
+            checked_targs.push(targ);
+        }
+    }
+}

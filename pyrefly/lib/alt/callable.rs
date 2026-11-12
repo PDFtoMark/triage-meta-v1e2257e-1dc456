@@ -1,0 +1,2797 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::collections::HashMap;
+use std::mem;
+
+use itertools::Itertools;
+use pyrefly_python::dunder;
+use pyrefly_types::dimension::Int;
+use pyrefly_types::dimension::ShapeError;
+use pyrefly_types::function::FunctionKind;
+use pyrefly_types::literal::Lit;
+use pyrefly_types::literal::LitStyle;
+use pyrefly_types::simplify::simplify_tuples;
+use pyrefly_types::tuple::Tuple;
+use pyrefly_types::typed_dict::ExtraItems;
+use pyrefly_types::types::TArgs;
+use pyrefly_types::types::TParams;
+use pyrefly_util::display::count;
+use pyrefly_util::display::pluralize;
+use pyrefly_util::owner::Owner;
+use pyrefly_util::prelude::SliceExt;
+use pyrefly_util::prelude::VecExt;
+use pyrefly_util::visit::Visit;
+use pyrefly_util::visit::VisitMut;
+use ruff_python_ast::Expr;
+use ruff_python_ast::Identifier;
+use ruff_python_ast::Keyword;
+use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use starlark_map::ordered_map::OrderedMap;
+use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
+
+use crate::alt::answers::LookupAnswer;
+use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::answers_solver::TypeCheckOptions;
+use crate::alt::expr::ArgumentCache;
+use crate::alt::expr::ExprOptions;
+use crate::alt::expr::TypeOrExpr;
+use crate::alt::map_int_tuples::MapIntTuplesPatternArgument;
+use crate::alt::map_int_tuples::map_int_tuples_parameter_pattern;
+use crate::alt::shape_extension::NamedIntsCapture;
+use crate::alt::shape_extension::capture_named_ints_source;
+use crate::alt::shape_extension::extend_shape_extension_vars_from_targs;
+use crate::alt::shape_extension::shape_extension_vars;
+use crate::alt::solve::Iterable;
+use crate::alt::unwrap::HintRef;
+use crate::alt::unwrap::MAX_HINT_WIDTH;
+use crate::config::error_kind::ErrorKind;
+use crate::error::collector::ErrorCollector;
+use crate::error::context::ErrorContext;
+use crate::error::context::TypeCheckContext;
+use crate::error::context::TypeCheckKind;
+use crate::error::display::function_suffix;
+use crate::solver::solver::ArgumentKey;
+use crate::solver::solver::ArgumentSide;
+use crate::solver::solver::CallBoundary;
+use crate::solver::solver::CallContext;
+use crate::solver::solver::OverloadTable;
+use crate::solver::solver::QuantifiedHandle;
+use crate::solver::solver::SubsetError;
+use crate::solver::solver::TypeVarSpecializationError;
+use crate::types::callable::Callable;
+use crate::types::callable::Param;
+use crate::types::callable::ParamList;
+use crate::types::callable::Params;
+use crate::types::callable::Required;
+use crate::types::quantified::Quantified;
+use crate::types::types::AnyStyle;
+use crate::types::types::BoundMethodType;
+use crate::types::types::Type;
+use crate::types::types::Var;
+
+const MIN_FLATTEN_CALL_DEPTH: u32 = 2;
+
+fn is_non_empty_container_literal(x: &Expr) -> bool {
+    match x {
+        Expr::Dict(x) => !x.items.is_empty(),
+        Expr::List(x) => !x.elts.is_empty(),
+        Expr::Set(x) => !x.elts.is_empty(),
+        _ => false,
+    }
+}
+
+/// Does `x` nest `depth` repetitions of a call taking a *non-empty* dict/list/set literal argument.
+fn nests_calls_to_depth(x: &Expr, depth: u32) -> bool {
+    nests_calls_to_depth_with(x, depth, is_non_empty_container_literal)
+}
+
+fn nests_calls_to_depth_with(x: &Expr, depth: u32, container: fn(&Expr) -> bool) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    let mut found = matches!(x, Expr::Call(c)
+        if c.arguments.iter_source_order().any(|a|
+            container(a.value())
+                && nests_calls_to_depth_with(a.value(), depth - 1, container)));
+    if !found {
+        x.recurse(&mut |child: &Expr| {
+            found = found || nests_calls_to_depth_with(child, depth, container)
+        });
+    }
+    found
+}
+
+/// Structure to turn TypeOrExprs into Types.
+/// This is used to avoid re-inferring types for arguments multiple times.
+///
+/// Implemented by keeping an `Owner` to hand out references to `Type`.
+pub struct CallWithTypes(Owner<Type>);
+
+/// A call argument retains its expression when contextual checking is needed.
+/// Prepared values share inference only within their owning constructor invocation.
+#[derive(Clone, Copy, Debug)]
+pub enum CallValue<'a> {
+    Plain(TypeOrExpr<'a>),
+    Prepared(&'a Expr, &'a ArgumentCache),
+}
+
+impl Ranged for CallValue<'_> {
+    fn range(&self) -> TextRange {
+        self.as_type_or_expr().range()
+    }
+}
+
+impl<'a> CallValue<'a> {
+    /// Views the argument without its cache; use `infer` to retain inference reuse.
+    pub(crate) fn as_type_or_expr(self) -> TypeOrExpr<'a> {
+        match self {
+            Self::Plain(value) => value,
+            Self::Prepared(expr, _) => TypeOrExpr::Expr(expr),
+        }
+    }
+
+    fn argument_cache(self) -> Option<&'a ArgumentCache> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Prepared(_, cache) => Some(cache),
+        }
+    }
+
+    pub fn infer<Ans: LookupAnswer>(
+        self,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match self {
+            Self::Plain(value) => value.infer(solver, errors),
+            Self::Prepared(expr, cache) => solver
+                .expr_with_argument_cache(expr, ExprOptions::infer(errors, None), Some(cache))
+                .into_ty(),
+        }
+    }
+
+    /// Infers with contextual typing while retaining any invocation-local argument cache.
+    pub fn infer_with_hint<Ans: LookupAnswer>(
+        self,
+        solver: &AnswersSolver<Ans>,
+        hint: Option<HintRef>,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match self.as_type_or_expr() {
+            TypeOrExpr::Type(ty, _) => ty.clone(),
+            TypeOrExpr::Expr(expr) => solver
+                .expr_with_argument_cache(
+                    expr,
+                    ExprOptions::infer(errors, hint),
+                    self.argument_cache(),
+                )
+                .into_ty(),
+        }
+    }
+
+    fn transform<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+        owner: &'a Owner<Type>,
+        transformation: impl Fn(&Type) -> Type,
+    ) -> (Self, bool) {
+        let ty = self.infer(solver, errors);
+        let transformed = transformation(&ty);
+        let changed = ty != transformed;
+        (
+            Self::Plain(TypeOrExpr::Type(owner.push(transformed), self.range())),
+            changed,
+        )
+    }
+}
+
+/// Owns argument caches for contextual attempts made by one constructor invocation.
+/// The arena stays off the call stack and is allocated only for eligible arguments.
+pub struct ConstructorArguments(Option<OnceCell<Box<Owner<ArgumentCache>>>>);
+
+/// Lambda and comprehension bindings must be checked again under each parameter context.
+pub(crate) fn contains_argument_bindings(expr: &Expr) -> bool {
+    if matches!(
+        expr,
+        Expr::Lambda(_)
+            | Expr::ListComp(_)
+            | Expr::SetComp(_)
+            | Expr::DictComp(_)
+            | Expr::Generator(_)
+    ) {
+        return true;
+    }
+    let mut found = false;
+    expr.recurse(&mut |child: &Expr| found = found || contains_argument_bindings(child));
+    found
+}
+
+impl ConstructorArguments {
+    pub fn new(hint: Option<HintRef>) -> Self {
+        Self(hint.map(|_| OnceCell::new()))
+    }
+
+    /// Retains expressions and shares only closed inference of nested calls.
+    pub fn prepare<'a, 'b: 'a>(
+        &'a self,
+        args: &'a [CallArg<'b>],
+        keywords: &'a [CallKeyword<'b>],
+    ) -> (Cow<'a, [CallArg<'a>]>, Cow<'a, [CallKeyword<'a>]>) {
+        let Some(caches) = &self.0 else {
+            return (Cow::Borrowed(args), Cow::Borrowed(keywords));
+        };
+        let prepare = |value| match value {
+            CallValue::Plain(TypeOrExpr::Expr(expr @ Expr::Call(_)))
+                if !contains_argument_bindings(expr) =>
+            {
+                let caches = caches.get_or_init(|| Box::new(Owner::new()));
+                Some(CallValue::Prepared(
+                    expr,
+                    caches.push(ArgumentCache::default()),
+                ))
+            }
+            _ => None,
+        };
+        let mut args: Cow<'a, [CallArg<'a>]> = Cow::Borrowed(args);
+        for i in 0..args.len() {
+            let prepared = match &args[i] {
+                CallArg::Arg(value) => prepare(*value).map(CallArg::Arg),
+                CallArg::Star(value, range) => {
+                    prepare(*value).map(|value| CallArg::Star(value, *range))
+                }
+            };
+            if let Some(prepared) = prepared {
+                args.to_mut()[i] = prepared;
+            }
+        }
+        let mut keywords: Cow<'a, [CallKeyword<'a>]> = Cow::Borrowed(keywords);
+        for i in 0..keywords.len() {
+            if let Some(prepared) = prepare(keywords[i].value) {
+                keywords.to_mut()[i].value = prepared;
+            }
+        }
+        (args, keywords)
+    }
+}
+
+impl CallWithTypes {
+    pub fn new() -> Self {
+        Self(Owner::new())
+    }
+
+    fn call_value<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        value: CallValue<'b>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> CallValue<'a> {
+        match value {
+            CallValue::Plain(value) => CallValue::Plain(self.type_or_expr(value, solver, errors)),
+            // Only calls are prepared, so flattening cannot discard a lambda or literal hint.
+            CallValue::Prepared(expr, _) => CallValue::Plain(TypeOrExpr::Type(
+                self.0.push(value.infer(solver, errors)),
+                expr.range(),
+            )),
+        }
+    }
+
+    pub fn type_or_expr<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: TypeOrExpr<'b>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> TypeOrExpr<'a> {
+        match x {
+            TypeOrExpr::Expr(Expr::Lambda(_)) => x,
+            TypeOrExpr::Expr(e @ (Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))
+                if solver.preserves_contextual_comprehensions()
+                    && !nests_calls_to_depth_with(e, MIN_FLATTEN_CALL_DEPTH, |arg| {
+                        is_non_empty_container_literal(arg)
+                            || matches!(
+                                arg,
+                                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+                            )
+                    }) =>
+            {
+                x
+            }
+            TypeOrExpr::Expr(e @ (Expr::Dict(_) | Expr::List(_) | Expr::Set(_)))
+                if !nests_calls_to_depth(e, MIN_FLATTEN_CALL_DEPTH) =>
+            {
+                // Hack: keep mutable builtin containers as expressions, since they often need to be
+                // contextually typed against the function's parameter types, unless nesting depth
+                // reaches or exceeds `MIN_FLATTEN_CALL_DEPTH` to avoid exponential blowup.
+                x
+            }
+            TypeOrExpr::Expr(e) => {
+                let t = x.infer(solver, errors);
+                TypeOrExpr::Type(self.0.push(t), e.range())
+            }
+            TypeOrExpr::Type(t, r) => TypeOrExpr::Type(t, r),
+        }
+    }
+
+    pub fn call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: &CallArg<'b>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> CallArg<'a> {
+        match x {
+            CallArg::Arg(x) => CallArg::Arg(self.call_value(*x, solver, errors)),
+            CallArg::Star(x, r) => CallArg::Star(self.call_value(*x, solver, errors), *r),
+        }
+    }
+
+    pub fn call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: &CallKeyword<'b>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> CallKeyword<'a> {
+        CallKeyword {
+            range: x.range,
+            arg: x.arg,
+            value: self.call_value(x.value, solver, errors),
+        }
+    }
+
+    pub fn vec_call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        xs: &[CallArg<'b>],
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> Vec<CallArg<'a>> {
+        xs.map(|x| self.call_arg(x, solver, errors))
+    }
+
+    pub fn vec_call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        xs: &[CallKeyword<'b>],
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> Vec<CallKeyword<'a>> {
+        xs.map(|x| self.call_keyword(x, solver, errors))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CallKeyword<'a> {
+    pub range: TextRange,
+    pub arg: Option<&'a Identifier>,
+    pub value: CallValue<'a>,
+}
+
+impl Ranged for CallKeyword<'_> {
+    fn range(&self) -> TextRange {
+        self.range
+    }
+}
+
+impl<'a> CallKeyword<'a> {
+    pub fn new(x: &'a Keyword) -> Self {
+        Self {
+            range: x.range,
+            arg: x.arg.as_ref(),
+            value: CallValue::Plain(TypeOrExpr::Expr(&x.value)),
+        }
+    }
+
+    pub fn materialize<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+        owner: &'a Owner<Type>,
+    ) -> (Self, bool) {
+        let transformation = |ty: &Type| {
+            if self.arg.is_none() && ty.is_any() {
+                // See test::overload::test_kwargs_materialization - we need to turn this
+                // into Mapping[str, Any] to correctly materialize the `**kwargs` type.
+                solver
+                    .heap
+                    .mk_class_type(solver.stdlib.mapping(
+                        solver.heap.mk_class_type(solver.stdlib.str().clone()),
+                        ty.clone(),
+                    ))
+                    .materialize()
+            } else {
+                ty.materialize()
+            }
+        };
+        let (materialized, changed) = self.value.transform(solver, errors, owner, transformation);
+        (
+            Self {
+                range: self.range,
+                arg: self.arg,
+                value: materialized,
+            },
+            changed,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum CallArg<'a> {
+    Arg(CallValue<'a>),
+    Star(CallValue<'a>, TextRange),
+}
+
+struct ForwardedOverloadCall<'a, 'b> {
+    params: &'a Params,
+    has_self: bool,
+    args: &'a [CallArg<'b>],
+    keywords: &'a [CallKeyword<'b>],
+    arguments_range: TextRange,
+}
+
+/// An error discovered while resolving or finalizing a call candidate's return type.
+///
+/// These errors do not make an otherwise valid candidate ineligible during overload or
+/// contextual-hint selection. Each candidate carries its own errors through selection, and only
+/// the selected candidate's errors are reported. Type-level DSL evaluation is currently the only
+/// fallible return-type operation, but other fallible return finalization belongs in this channel.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReturnTypeResolutionError {
+    TypeLevelDsl(ShapeError),
+}
+
+impl Ranged for CallArg<'_> {
+    fn range(&self) -> TextRange {
+        match self {
+            Self::Arg(x) => x.range(),
+            Self::Star(_, r) => *r,
+        }
+    }
+}
+
+impl<'a> CallArg<'a> {
+    pub fn arg(x: TypeOrExpr<'a>) -> Self {
+        Self::Arg(CallValue::Plain(x))
+    }
+
+    pub fn expr(x: &'a Expr) -> Self {
+        Self::arg(TypeOrExpr::Expr(x))
+    }
+
+    pub fn ty(ty: &'a Type, range: TextRange) -> Self {
+        Self::arg(TypeOrExpr::Type(ty, range))
+    }
+
+    pub fn expr_maybe_starred(x: &'a Expr) -> Self {
+        match x {
+            Expr::Starred(inner) => {
+                Self::Star(CallValue::Plain(TypeOrExpr::Expr(&inner.value)), x.range())
+            }
+            _ => Self::expr(x),
+        }
+    }
+
+    pub fn materialize<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+        owner: &'a Owner<Type>,
+    ) -> (Self, bool) {
+        match self {
+            Self::Arg(value) => {
+                let (materialized, changed) =
+                    value.transform(solver, errors, owner, |ty| ty.materialize());
+                (Self::Arg(materialized), changed)
+            }
+            Self::Star(value, range) => {
+                let (materialized, changed) = value.transform(solver, errors, owner, |ty| {
+                    if ty.is_any() {
+                        // See test::overload::test_varargs_materialization - we need to turn this
+                        // into Iterable[Any] to correctly materialize the `*args` type.
+                        solver
+                            .heap
+                            .mk_class_type(solver.stdlib.iterable(ty.clone()))
+                            .materialize()
+                    } else {
+                        ty.materialize()
+                    }
+                });
+                (Self::Star(materialized, *range), changed)
+            }
+        }
+    }
+
+    // Splat arguments might be fixed-length tuples, which are handled precisely, or have unknown
+    // length. This function evaluates splat args to determine how many params should be consumed,
+    // but does not evaluate other expressions, which might be contextually typed.
+    fn pre_eval<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        arg_errors: &ErrorCollector,
+    ) -> CallArgPreEval<'_> {
+        match self {
+            Self::Arg(CallValue::Plain(TypeOrExpr::Type(ty, _))) => CallArgPreEval::Type(ty, false),
+            Self::Arg(CallValue::Plain(TypeOrExpr::Expr(e))) => {
+                CallArgPreEval::Expr(e, None, false)
+            }
+            Self::Arg(CallValue::Prepared(e, cache)) => CallArgPreEval::Expr(e, Some(cache), false),
+            Self::Star(e, _range) => {
+                // Special-case list/set/tuple literals with statically known element count.
+                // Only do this if there are no starred elements inside the literal.
+                if let TypeOrExpr::Expr(expr) = e.as_type_or_expr() {
+                    let literal_elts: Option<&[Expr]> = match expr {
+                        Expr::List(list_expr) => Some(&list_expr.elts),
+                        Expr::Set(set_expr) => Some(&set_expr.elts),
+                        Expr::Tuple(tuple_expr) => Some(&tuple_expr.elts),
+                        _ => None,
+                    };
+                    if let Some(elts) = literal_elts {
+                        let has_starred = elts.iter().any(|elt| matches!(elt, Expr::Starred(_)));
+                        if !has_starred {
+                            let tys: Vec<Type> = elts
+                                .iter()
+                                .map(|elt| solver.expr_infer(elt, arg_errors))
+                                .collect();
+                            return CallArgPreEval::Fixed(tys, 0);
+                        }
+                    }
+                    // Unpacking a dict literal yields one key per item. Only do this if there
+                    // are no `**` items, which add an unknown number of keys.
+                    if let Expr::Dict(dict_expr) = expr
+                        && let Some(items) = dict_expr
+                            .items
+                            .iter()
+                            .map(|item| Some((item.key.as_ref()?, &item.value)))
+                            .collect::<Option<Vec<_>>>()
+                    {
+                        let tys = items
+                            .into_iter()
+                            .map(|(key, value)| {
+                                let key_ty = solver.expr_infer(key, arg_errors);
+                                solver.expr_infer(value, arg_errors);
+                                key_ty
+                            })
+                            .collect();
+                        return CallArgPreEval::Fixed(tys, 0);
+                    }
+                }
+                let ty = e.infer(solver, arg_errors);
+                solver.maybe_error_any_argument_type(&ty, *_range, arg_errors);
+                let iterables = solver.iterate(&ty, *_range, arg_errors, None);
+                // If we have a union of iterables, use a fixed length only if every iterable is
+                // fixed and has the same length. Otherwise, use star.
+                let mut fixed_lens = Vec::new();
+                for x in iterables.iter() {
+                    match x {
+                        Iterable::FixedLen(xs) => fixed_lens.push(xs.len()),
+                        Iterable::OfType(_)
+                        | Iterable::Unpacked { .. }
+                        | Iterable::OfTypeVarTuple(_) => {}
+                    }
+                }
+                if !fixed_lens.is_empty()
+                    && fixed_lens.len() == iterables.len()
+                    && fixed_lens.iter().all(|len| *len == fixed_lens[0])
+                {
+                    let mut fixed_tys = vec![Vec::new(); fixed_lens[0]];
+                    for x in iterables {
+                        if let Iterable::FixedLen(xs) = x {
+                            for (i, ty) in xs.into_iter().enumerate() {
+                                fixed_tys[i].push(ty);
+                            }
+                        }
+                    }
+                    let tys = fixed_tys.into_map(|tys| solver.unions(tys));
+                    CallArgPreEval::Fixed(tys, 0)
+                } else {
+                    // A lone unpacked tuple has fixed ends at known positions, so keep
+                    // its shape. A union of iterables has no single shape to keep.
+                    let (prefix, middle, suffix) = if let [
+                        Iterable::Unpacked {
+                            prefix,
+                            middle,
+                            suffix,
+                        },
+                    ] = iterables.as_slice()
+                    {
+                        (prefix.clone(), middle.clone(), suffix.clone())
+                    } else {
+                        (Vec::new(), solver.get_produced_type(iterables), Vec::new())
+                    };
+                    CallArgPreEval::Star {
+                        prefix,
+                        middle,
+                        suffix,
+                        consumed: 0,
+                        matched_count: 0,
+                        done: false,
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Pre-evaluated args are iterable. Type/Expr/Star variants iterate once (tracked via bool field),
+// Fixed variant iterates over the vec (tracked via usize field).
+#[derive(Clone, Debug)]
+enum CallArgPreEval<'a> {
+    Type(&'a Type, bool),
+    Expr(&'a Expr, Option<&'a ArgumentCache>, bool),
+    Star {
+        prefix: Vec<Type>,
+        middle: Type,
+        suffix: Vec<Type>,
+        consumed: usize,
+        matched_count: usize,
+        done: bool,
+    },
+    Fixed(Vec<Type>, usize),
+}
+
+impl CallArgPreEval<'_> {
+    fn step(&self) -> bool {
+        match self {
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => !*done,
+            Self::Fixed(tys, i) => *i < tys.len(),
+        }
+    }
+
+    fn is_star(&self) -> bool {
+        matches!(self, Self::Star { .. })
+    }
+
+    /// The type a splat offers a parameter: an exact prefix element, or a union past
+    /// the prefix. `absorb_all` unions the whole remainder, for a variadic parameter.
+    fn star_element<Ans: LookupAnswer>(
+        solver: &AnswersSolver<Ans>,
+        prefix: &[Type],
+        middle: &Type,
+        suffix: &[Type],
+        consumed: usize,
+        absorb_all: bool,
+    ) -> Type {
+        if !absorb_all && let Some(ty) = prefix.get(consumed) {
+            return ty.clone();
+        }
+        let rest = if absorb_all { consumed } else { prefix.len() };
+        let mut tys = prefix[rest..].to_vec();
+        tys.push(middle.clone());
+        tys.extend(suffix.iter().cloned());
+        solver.unions(tys)
+    }
+
+    fn inferred_type<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        arg_errors: &ErrorCollector,
+    ) -> Type {
+        match self {
+            Self::Type(ty, _) => (*ty).clone(),
+            Self::Expr(expr, cache, _) => solver
+                .expr_with_argument_cache(expr, ExprOptions::infer(arg_errors, None), *cache)
+                .into_ty(),
+            Self::Star {
+                prefix,
+                middle,
+                suffix,
+                consumed,
+                ..
+            } => Self::star_element(solver, prefix, middle, suffix, *consumed, false),
+            Self::Fixed(tys, idx) => tys[*idx].clone(),
+        }
+    }
+
+    /// Advance past one matched parameter without changing how its argument is interpreted.
+    fn advance_after_match(&mut self, vararg: bool) {
+        match self {
+            Self::Type(_, done) | Self::Expr(_, _, done) => *done = true,
+            Self::Star {
+                prefix,
+                consumed,
+                matched_count,
+                done,
+                ..
+            } => {
+                if !vararg {
+                    if *consumed < prefix.len() {
+                        // A prefix element is consumed once matched; the variadic tail remains on
+                        // offer to every later parameter.
+                        *consumed += 1;
+                    }
+                    *matched_count += 1;
+                }
+                *done = vararg;
+            }
+            Self::Fixed(_, index) => *index += 1,
+        }
+    }
+
+    /// Check the argument against a parameter hint and return the inferred argument type.
+    fn post_check<Ans: LookupAnswer>(
+        &mut self,
+        solver: &AnswersSolver<Ans>,
+        callable_name: Option<&FunctionKind>,
+        hint: &Type,
+        param_name: Option<&Name>,
+        vararg: bool,
+        is_self_arg: bool,
+        range: TextRange,
+        arg_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+        call_context: &CallContext<'_>,
+    ) -> Option<Type> {
+        let tcc = &|| {
+            TypeCheckContext::of_kind(if vararg {
+                TypeCheckKind::CallVarArgs(false, param_name.cloned(), callable_name.cloned())
+            } else {
+                TypeCheckKind::CallArgument(param_name.cloned(), callable_name.cloned())
+            })
+            .with_context(context.map(|ctx| ctx()))
+        };
+        // A shape-extension map at a parameter root carries an ordinary `Sequence` view, but its
+        // source must be recovered from the argument before that view is checked.
+        if let Some(pattern) = map_int_tuples_parameter_pattern(hint) {
+            let argument = match self {
+                Self::Type(ty, _) => MapIntTuplesPatternArgument::Type((*ty).clone()),
+                Self::Expr(expr, _, _) => MapIntTuplesPatternArgument::Expr(expr),
+                Self::Star {
+                    prefix,
+                    middle,
+                    suffix,
+                    consumed,
+                    ..
+                } => {
+                    let ty = Self::star_element(solver, prefix, middle, suffix, *consumed, vararg);
+                    MapIntTuplesPatternArgument::Type(ty)
+                }
+                Self::Fixed(tys, index) => MapIntTuplesPatternArgument::Type(tys[*index].clone()),
+            };
+            self.advance_after_match(vararg);
+            let arg_ty = solver.check_map_int_tuples_parameter_pattern(
+                pattern,
+                argument,
+                range,
+                arg_errors,
+                call_errors,
+                tcc,
+                call_context,
+                context,
+            );
+            solver.maybe_error_any_argument_type(&arg_ty, range, arg_errors);
+            return Some(arg_ty);
+        }
+        match self {
+            Self::Type(ty, _) => {
+                let ty = (*ty).clone();
+                self.advance_after_match(vararg);
+                let fresh_call_errors = solver.error_collector();
+                let res = solver.check_type_with_options(
+                    &ty,
+                    hint,
+                    range,
+                    TypeCheckOptions::new(&fresh_call_errors, tcc).with_call_context(call_context),
+                );
+                // A protocol class may bind its own classmethods even though it cannot be passed
+                // explicitly as an argument.
+                if !(is_self_arg
+                    && matches!(res, Some(SubsetError::TypeOfProtocolNeedsConcreteClass(_))))
+                {
+                    call_errors.extend(fresh_call_errors);
+                }
+                solver.maybe_error_any_argument_type(&ty, range, arg_errors);
+                Some(ty)
+            }
+            Self::Expr(x, cache, _) => {
+                let x = *x;
+                let cache = *cache;
+                self.advance_after_match(vararg);
+                // PEP 747: when the parameter type is TypeForm, evaluate
+                // string literal arguments as forward-reference type forms.
+                if matches!(hint, Type::TypeForm(_))
+                    && let Some(ty) = solver.try_string_literal_as_typeform(
+                        x,
+                        hint,
+                        range,
+                        call_errors,
+                        tcc,
+                        call_context,
+                    )
+                {
+                    solver.maybe_error_any_argument_type(&ty, range, arg_errors);
+                    return Some(ty);
+                }
+                let ty = solver
+                    .expr_with_argument_cache(
+                        x,
+                        ExprOptions::check(hint, arg_errors, call_errors, tcc, Some(call_context)),
+                        cache,
+                    )
+                    .into_ty();
+                solver.maybe_error_any_argument_type(&ty, range, arg_errors);
+                Some(ty)
+            }
+            Self::Star {
+                prefix,
+                middle,
+                suffix,
+                consumed,
+                ..
+            } => {
+                let ty = Self::star_element(solver, prefix, middle, suffix, *consumed, vararg);
+                self.advance_after_match(vararg);
+                solver.check_type_with_options(
+                    &ty,
+                    hint,
+                    range,
+                    TypeCheckOptions::new(call_errors, tcc).with_call_context(call_context),
+                );
+                Some(ty)
+            }
+            Self::Fixed(tys, index) => {
+                let arg_ty = tys[*index].clone();
+                // Every element of a fixed-length splat is reported at the range of the whole
+                // argument, so report the argument once, on its first element, with the element
+                // styles merged. Reporting each element separately puts two error kinds at one
+                // range when the elements have different `Any` styles.
+                let merged_any = (*index == 0)
+                    .then(|| {
+                        tys.iter().fold(None, |acc: Option<Type>, ty| match acc {
+                            None => matches!(ty, Type::Any(_)).then(|| ty.clone()),
+                            Some(acc) => Type::merge_any_operands(&acc, ty),
+                        })
+                    })
+                    .flatten();
+                self.advance_after_match(vararg);
+                solver.check_type_with_options(
+                    &arg_ty,
+                    hint,
+                    range,
+                    TypeCheckOptions::new(call_errors, tcc).with_call_context(call_context),
+                );
+                if let Some(merged_any) = merged_any {
+                    solver.maybe_error_any_argument_type(&merged_any, range, arg_errors);
+                }
+                Some(arg_ty)
+            }
+        }
+    }
+
+    // Step the argument or mark it as done similar to `post_infer`, but without checking the type
+    // Intended for arguments matched to unpack-annotated *args, which are typechecked separately later
+    fn post_skip(&mut self) {
+        match self {
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => {
+                *done = true;
+            }
+            Self::Fixed(_, i) => {
+                *i += 1;
+            }
+        }
+    }
+
+    // Similar to post_skip but it skips to the end of any fixed length arguments.
+    fn mark_done(&mut self) {
+        match self {
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => {
+                *done = true;
+            }
+            Self::Fixed(tys, i) => {
+                *i = tys.len();
+            }
+        }
+    }
+
+    fn post_infer<Ans: LookupAnswer>(
+        &mut self,
+        solver: &AnswersSolver<Ans>,
+        arg_errors: &ErrorCollector,
+    ) {
+        match self {
+            Self::Expr(x, cache, _) => {
+                solver.expr_with_argument_cache(x, ExprOptions::infer(arg_errors, None), *cache);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The parameter an argument was matched against.
+#[derive(Debug, Clone)]
+pub struct MatchedParam {
+    pub ty: Type,
+    pub name: Option<Name>,
+}
+
+impl MatchedParam {
+    fn new(ty: Type, name: Option<Name>) -> Self {
+        Self { ty, name }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgMap {
+    pub arg_to_param: HashMap<ArgumentKey, MatchedParam>,
+    /// Required parameters that were left unmatched
+    pub unmatched_params: SmallSet<Option<Name>>,
+}
+
+impl ArgMap {
+    pub fn new() -> Self {
+        Self {
+            arg_to_param: HashMap::new(),
+            unmatched_params: SmallSet::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        argument: ArgumentKey,
+        ty: Type,
+        name: Option<Name>,
+    ) -> Option<MatchedParam> {
+        self.arg_to_param
+            .insert(argument, MatchedParam::new(ty, name))
+    }
+}
+
+/// Helps track matching of arguments against positional parameters in AnswersSolver::callable_infer_params.
+#[derive(PartialEq, Eq)]
+enum PosParamKind {
+    PositionalOnly,
+    Positional,
+    Unpacked,
+    Variadic,
+}
+
+/// Helps track matching of arguments against positional parameters in AnswersSolver::callable_infer_params.
+struct PosParam<'a> {
+    ty: &'a Type,
+    name: Option<&'a Name>,
+    kind: PosParamKind,
+}
+
+impl<'a> PosParam<'a> {
+    fn new(p: &'a Param) -> Option<Self> {
+        match p {
+            Param::PosOnly(name, ty, _required) => Some(Self {
+                ty,
+                name: name.as_ref(),
+                kind: PosParamKind::PositionalOnly,
+            }),
+            Param::Pos(name, ty, _required) => Some(Self {
+                ty,
+                name: Some(name),
+                kind: PosParamKind::Positional,
+            }),
+            Param::Varargs(name, Type::Unpack(ty)) => Some(Self {
+                ty: &**ty,
+                name: name.as_ref(),
+                kind: PosParamKind::Unpacked,
+            }),
+            Param::Varargs(name, ty) => Some(Self {
+                ty,
+                name: name.as_ref(),
+                kind: PosParamKind::Variadic,
+            }),
+            Param::KwOnly(..) | Param::Kwargs(..) => None,
+        }
+    }
+}
+
+/// The origin of a name that has been encountered in a function call
+#[derive(Clone, Debug)]
+enum NameOrigin<'a> {
+    /// Named parameter
+    Param,
+    /// An unpacked kwargs parameter, e.g., `**kwargs: Unpack[TD]` where `TD` is a TypedDict`.
+    /// In this example, the encountered name would be the name of a `TD` field, and the origin
+    /// would be the param name "kwargs".
+    UnpackedKwargs(Option<&'a Name>),
+}
+
+/// Where a value that may land on an unmatched keyword parameter came from.
+enum SplatSource {
+    /// The value type of a splatted mapping, e.g. `f(**d)` where `d: dict[str, int]`.
+    MappingValue,
+    /// The extra items of a splatted TypedDict, which by definition exclude its declared
+    /// field names. `open` distinguishes items implied by the TypedDict being open from ones
+    /// declared with `extra_items`, which are reported under different error kinds.
+    ExtraItems {
+        open: bool,
+        declared_keys: SmallSet<Name>,
+    },
+}
+
+impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    fn captured_named_int(&self, ty: &Type) -> Option<Int> {
+        Int::from_type(ty).or_else(|| {
+            (ty.is_any()
+                || self.is_subset_eq(ty, &self.heap.mk_class_type(self.stdlib.int().clone())))
+            .then_some(Int::Int)
+        })
+    }
+
+    /// Flag a call argument whose type is an implicit, error or explicit `Any`, each under its own
+    /// error kind. The error goes into `arg_errors` rather than `call_errors`, because
+    /// `arg_errors` is not used to decide which overload or hint matches.
+    fn maybe_error_any_argument_type(
+        &self,
+        ty: &Type,
+        range: TextRange,
+        arg_errors: &ErrorCollector,
+    ) {
+        match ty {
+            Type::Any(AnyStyle::Implicit) => {
+                self.error(
+                    arg_errors,
+                    range,
+                    ErrorKind::UnknownArgumentType,
+                    "The type of this argument is unknown".to_owned(),
+                );
+            }
+            Type::Any(AnyStyle::Error | AnyStyle::MissingImport) => {
+                self.error_unknown_from_error(arg_errors, range, "The type of this argument")
+            }
+            Type::Any(AnyStyle::Explicit) => {
+                self.error_explicit_any_use(arg_errors, range, "The type of this argument")
+            }
+            _ if ty.contains_implicit_any() => {
+                self.error(
+                    arg_errors,
+                    range,
+                    ErrorKind::PartiallyUnknownType,
+                    "The type of this argument is partially unknown; it contains an implicit `Any`"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn is_param_spec_args(&self, x: &CallArg, q: &Quantified, errors: &ErrorCollector) -> bool {
+        match x {
+            CallArg::Star(x, _) => {
+                let mut ty = x.infer(self, errors);
+                self.expand_mut(&mut ty);
+                // This can either be `P.args` or `tuple[Any, ...]`
+                matches!(&ty, Type::Args(q2) if &**q2 == q)
+                    || self.is_subset_eq(&ty, &self.heap.mk_unbounded_tuple(self.heap.mk_never()))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_param_spec_kwargs(
+        &self,
+        x: &CallKeyword,
+        q: &Quantified,
+        errors: &ErrorCollector,
+    ) -> bool {
+        let mut ty = x.value.infer(self, errors);
+        self.expand_mut(&mut ty);
+        // This can either be `P.kwargs` or `dict[str, Any]`
+        matches!(&ty, Type::Kwargs(q2) if &**q2 == q)
+            || self.is_subset_eq(
+                &ty,
+                &self.heap.mk_class_type(self.stdlib.dict(
+                    self.heap.mk_class_type(self.stdlib.str().clone()),
+                    self.heap.mk_never(),
+                )),
+            )
+    }
+
+    /// Validate that a quantified ParamSpec forwarding pattern has the expected
+    /// `*P.args` / `**P.kwargs` as the last positional and keyword arguments.
+    /// Called when `var_to_rparams` returns `Err(q)` (the Var resolved to a
+    /// still-quantified ParamSpec `q`).
+    ///
+    /// `current_arg` is the arg that triggered ParamSpec expansion (first call
+    /// site only). When present, we check that it is `*P.args` — this catches
+    /// extra args *before* `*P.args`. We also always check that `args.last()`
+    /// is `*P.args` — this catches extra args *after* it and the case where
+    /// `*P.args` is missing entirely. On success, return the remaining
+    /// arguments after stripping the trailing `*P.args` / `**P.kwargs` pair.
+    fn paramspec_forwarding<'b>(
+        &self,
+        q: &Quantified,
+        current_arg: Option<&CallArg<'b>>,
+        args: &'b [CallArg<'b>],
+        keywords: &'b [CallKeyword<'b>],
+        arguments_range: TextRange,
+        arg_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+    ) -> Option<(&'b [CallArg<'b>], &'b [CallKeyword<'b>])> {
+        let current_ok = current_arg.is_none_or(|x| self.is_param_spec_args(x, q, arg_errors));
+        let last_ok = args
+            .last()
+            .is_some_and(|x| self.is_param_spec_args(x, q, arg_errors));
+        let args_ok = current_ok && last_ok;
+        let kwargs_ok = keywords
+            .last()
+            .is_some_and(|x| self.is_param_spec_kwargs(x, q, arg_errors));
+        if !args_ok || !kwargs_ok {
+            self.error_with_context(
+                call_errors,
+                arguments_range,
+                ErrorKind::InvalidParamSpec,
+                format!(
+                    "Expected *-unpacked {}.args and **-unpacked {}.kwargs",
+                    q.name(),
+                    q.name()
+                ),
+                context,
+            );
+            None
+        } else {
+            Some((&args[..args.len() - 1], &keywords[..keywords.len() - 1]))
+        }
+    }
+
+    // See comment on `callable_infer` about `arg_errors` and `call_errors`.
+    /// Match arguments against parameters, type-check each argument, and return
+    /// a map from each argument's position to the parameter type it was
+    /// matched against.
+    fn callable_infer_params(
+        &self,
+        callable_name: Option<&FunctionKind>,
+        params: &ParamList,
+        // A ParamSpec Var (if any) that comes at the end of the parameter list.
+        // See test::paramspec::test_paramspec_twice for an example of this.
+        mut paramspec: Option<Var>,
+        self_arg: Option<CallArg>,
+        self_qs: &mut Option<QuantifiedHandle>,
+        args: &[CallArg],
+        keywords: &[CallKeyword],
+        arguments_range: TextRange,
+        arg_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+        call_context: &CallContext<'_>,
+    ) -> ArgMap {
+        let mut argmap = ArgMap::new();
+        // We want to work mostly with references, but some things are taken from elsewhere,
+        // so have some owners to capture them.
+        let param_list_owner = Owner::new();
+        let name_owner = Owner::new();
+        let type_owner = Owner::new();
+
+        let error = |errors, range, kind, msg: String| {
+            self.error_with_context(
+                errors,
+                range,
+                kind,
+                format!(
+                    "{}{}",
+                    msg,
+                    function_suffix(callable_name, self.module().name())
+                ),
+                context,
+            )
+        };
+
+        fn collect_finite_string_literals(ty: &Type, names: &mut SmallSet<Name>) -> bool {
+            match ty {
+                Type::Literal(lit) if let Lit::Str(s) = &lit.value => {
+                    names.insert(Name::new(s));
+                    true
+                }
+                Type::Union(union) => union
+                    .members
+                    .iter()
+                    .all(|member| collect_finite_string_literals(member, names)),
+                _ => false,
+            }
+        }
+
+        let mut keyword_arg_names: SmallSet<Name> = keywords
+            .iter()
+            .filter_map(|kw| kw.arg.map(|id| id.id.clone()))
+            .collect();
+        for kw in keywords {
+            if kw.arg.is_some() {
+                continue;
+            }
+            match kw.value.as_type_or_expr() {
+                TypeOrExpr::Expr(Expr::Dict(dict)) => {
+                    for item in &dict.items {
+                        let Some(Expr::StringLiteral(lit)) = item.key.as_ref() else {
+                            continue;
+                        };
+                        keyword_arg_names.insert(Name::new(lit.value.to_str()));
+                    }
+                }
+                TypeOrExpr::Expr(expr) => {
+                    for (key, _) in self
+                        .expr_with_argument_cache(
+                            expr,
+                            ExprOptions::infer(arg_errors, None),
+                            kw.value.argument_cache(),
+                        )
+                        .key_facets_at(&[])
+                    {
+                        keyword_arg_names.insert(Name::new(key.as_str()));
+                    }
+                }
+                TypeOrExpr::Type(ty, _) => match ty {
+                    Type::TypedDict(typed_dict) | Type::PartialTypedDict(typed_dict) => {
+                        for (name, field) in self.typed_dict_fields(typed_dict) {
+                            if field.required {
+                                keyword_arg_names.insert(name);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some((key_ty, _)) = self.unwrap_mapping(ty) {
+                            let mut known_keys = SmallSet::new();
+                            if collect_finite_string_literals(&key_ty, &mut known_keys) {
+                                keyword_arg_names.extend(known_keys);
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        // Creates a reversed copy of the parameters that we iterate through from back to front,
+        // so that we can easily peek at and pop from the end.
+        let mut rparams = params.items().iter().rev().collect::<Vec<_>>();
+        let mut num_positional_params = 0;
+        let mut extra_positional_args = Vec::new();
+        // Map from seen parameter name to (Type, NameOrigin, definitely_seen).
+        // NotRequired fields of unpacked typed dicts are not definitely seen: the field may be
+        // absent at runtime, so something else may still supply the parameter. A later source
+        // that does definitely supply the name upgrades the entry.
+        let mut seen_names = SmallMap::new();
+        let mut extra_arg_pos = None;
+        let mut unpacked_vararg = None;
+        let mut unpacked_vararg_matched_args = Vec::new();
+        // Later arguments may provide the bounds needed to contextually type a lambda's parameters,
+        // or the inputs of a type-level DSL call in a callback parameter's signature.
+        let mut deferred_callbacks = Vec::new();
+
+        // Resolve a deferred ParamSpec Var into additional parameters.
+        // Returns `Err(q)` when the Var resolved to a quantified ParamSpec `q`
+        // (forwarding case), meaning the caller should validate that the
+        // remaining args are `*P.args` / `**P.kwargs` and stop matching.
+        let var_to_rparams = |var| -> Result<Vec<&Param>, Box<Quantified>> {
+            let ps = match self.solver().force_var(var) {
+                Type::ParamSpecValue(ps) => ps,
+                Type::Any(_) | Type::Ellipsis => ParamList::everything(),
+                Type::Concatenate(prefix, _) => {
+                    // TODO: handle second component of Type::Concatenate
+                    let ps = ParamList::everything();
+                    ps.prepend_types(&prefix).into_owned()
+                }
+                // The ParamSpec Var resolved to another quantified ParamSpec (e.g.,
+                // one generic helper forwarding `*args: P.args, **kwargs: P.kwargs`
+                // to another). There are no concrete parameters to contribute;
+                // the caller must validate the forwarding pattern.
+                Type::Quantified(q) if q.is_param_spec() => return Err(q),
+                t => {
+                    error(
+                        call_errors,
+                        arguments_range,
+                        ErrorKind::BadArgumentType,
+                        format!("Expected `{}` to be a ParamSpec value", self.for_display(t)),
+                    );
+                    ParamList::everything()
+                }
+            };
+            Ok(param_list_owner.push(ps).items().iter().rev().collect())
+        };
+        for (argument_index, (arg, is_self_arg)) in self_arg
+            .iter()
+            .map(|arg| (arg, true))
+            .chain(args.iter().map(|arg| (arg, false)))
+            .enumerate()
+        {
+            let argument = ArgumentKey::Positional(argument_index);
+            let call_context = &call_context.clone().with_argument(argument);
+            let mut arg_pre = arg.pre_eval(self, arg_errors);
+            while arg_pre.step() {
+                let param = if let Some(p) = rparams.last() {
+                    PosParam::new(p)
+                } else if let Some(var) = paramspec {
+                    // We've run out of parameters but haven't finished matching arguments. If we
+                    // have a ParamSpec Var, it may contribute more parameters; force it and tack
+                    // the result onto the parameter list.
+                    match var_to_rparams(var) {
+                        Ok(new_rparams) => rparams = new_rparams,
+                        Err(q) => {
+                            // Quantified ParamSpec forwarding: validate that the
+                            // current arg is `*P.args`, it is the last positional
+                            // arg, and the last keyword is `**P.kwargs`.
+                            let _ = self.paramspec_forwarding(
+                                &q,
+                                Some(arg),
+                                args,
+                                keywords,
+                                arguments_range,
+                                arg_errors,
+                                call_errors,
+                                context,
+                            );
+                            return argmap;
+                        }
+                    }
+                    paramspec = None;
+                    continue;
+                } else {
+                    None
+                };
+                match param {
+                    Some(PosParam {
+                        ty,
+                        name,
+                        kind: kind @ (PosParamKind::PositionalOnly | PosParamKind::Positional),
+                    }) => {
+                        // For unknown-length star args, stop consuming positional parameters
+                        // when we reach a one that has a corresponding keyword argument.
+                        // This is unsound, but prevents false positive "multiple values" errors.
+                        if arg_pre.is_star()
+                            && kind == PosParamKind::Positional
+                            && name.is_some_and(|n| keyword_arg_names.contains(n))
+                        {
+                            arg_pre.mark_done();
+                            break;
+                        }
+                        num_positional_params += 1;
+                        rparams.pop();
+                        if let Some(name) = name
+                            && kind == PosParamKind::Positional
+                        {
+                            // Remember names of positional parameters to detect duplicates.
+                            // We ignore positional-only parameters because they can't be passed in by name.
+                            seen_names.insert(name, (ty, NameOrigin::Param, true));
+                        }
+                        argmap.insert(argument, ty.clone(), name.cloned());
+                        if match arg_pre {
+                            CallArgPreEval::Expr(Expr::Lambda(_), _, _) => true,
+                            CallArgPreEval::Expr(..) | CallArgPreEval::Type(..) => {
+                                matches!(ty, Type::Callable(_))
+                                    && ty.any(|ty| matches!(ty, Type::TypeLevelDslCall(_)))
+                            }
+                            _ => false,
+                        } {
+                            deferred_callbacks.push((
+                                arg_pre.clone(),
+                                ty,
+                                name,
+                                arg.range(),
+                                argument,
+                            ));
+                            arg_pre.mark_done();
+                        } else {
+                            arg_pre.post_check(
+                                self,
+                                callable_name,
+                                ty,
+                                name,
+                                false,
+                                is_self_arg,
+                                arg.range(),
+                                arg_errors,
+                                call_errors,
+                                context,
+                                call_context,
+                            );
+                        }
+                    }
+                    Some(PosParam {
+                        ty,
+                        name,
+                        kind: PosParamKind::Unpacked,
+                    }) => {
+                        // Store args that get matched to an unpacked *args param
+                        // Matched args are typechecked separately later
+                        argmap.insert(argument, ty.clone(), name.cloned());
+                        unpacked_vararg = Some((name, ty));
+                        unpacked_vararg_matched_args.push((arg_pre.clone(), arg.range()));
+                        arg_pre.post_skip();
+                    }
+                    Some(PosParam {
+                        ty,
+                        name,
+                        kind: PosParamKind::Variadic,
+                    }) => {
+                        argmap.insert(argument, ty.clone(), name.cloned());
+                        arg_pre.post_check(
+                            self,
+                            callable_name,
+                            ty,
+                            name,
+                            true,
+                            is_self_arg,
+                            arg.range(),
+                            arg_errors,
+                            call_errors,
+                            context,
+                            call_context,
+                        );
+                    }
+                    None => {
+                        arg_pre.post_infer(self, arg_errors);
+                        // An unknown-length splat only guarantees an extra positional argument if
+                        // it still has more fixed elements (prefix + suffix) than the number
+                        // of non-variadic positional parameters it has already matched (fixes #5542).
+                        let extra_arg = match &arg_pre {
+                            CallArgPreEval::Star {
+                                prefix,
+                                suffix,
+                                matched_count,
+                                ..
+                            } => prefix.len() + suffix.len() > *matched_count,
+                            _ => true,
+                        };
+                        if extra_arg {
+                            extra_positional_args.push(arg.range());
+                            if extra_arg_pos.is_none() {
+                                extra_arg_pos = Some(arg.range());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            // `self_qs` contains type parameters referenced in the `self` type. Pyrefly follows
+            // mypy and pyright's lead in solving type parameters in `self` as soon as `self` is
+            // matched. That is:
+            //     class A:
+            //         def f[T](self: T, other: T): ...
+            //     A().f(0)  # T = A, passing 0 is an error
+            // Contrast this to how type parameters usually behave:
+            //     def f[T](x: T, other: T): ...
+            //     f(A(), 0)  # T = A | int
+            if let Some(self_qs) = self_qs.take() {
+                let specialization_errors =
+                    self.finish_quantified(self_qs, self.solver().config.infer_with_first_use);
+                if let Err(errors) = specialization_errors {
+                    self.add_specialization_errors(errors, arg.range(), call_errors, context);
+                }
+            }
+        }
+        let has_matched_unpacked_vararg = unpacked_vararg.is_some();
+        if let Some((unpacked_name, unpacked_param_ty)) = unpacked_vararg {
+            let map_pattern = map_int_tuples_parameter_pattern(unpacked_param_ty);
+            let mut prefix = Vec::new();
+            let mut middle = Vec::new();
+            let mut suffix = Vec::new();
+            for (arg, range) in unpacked_vararg_matched_args {
+                let ty = match arg {
+                    CallArgPreEval::Type(ty, _) => ty.clone(),
+                    CallArgPreEval::Expr(e, cache, _) => {
+                        let before = arg_errors.len_hard();
+                        let ty = self
+                            .expr_with_argument_cache(
+                                e,
+                                ExprOptions::infer(arg_errors, None),
+                                cache,
+                            )
+                            .into_ty();
+                        if map_pattern.is_some() && arg_errors.len_hard() > before {
+                            self.heap.mk_any_error()
+                        } else {
+                            ty
+                        }
+                    }
+                    CallArgPreEval::Fixed(tys, idx) => tys[idx].clone(),
+                    CallArgPreEval::Star {
+                        prefix: star_prefix,
+                        middle: star_middle,
+                        suffix: star_suffix,
+                        consumed,
+                        ..
+                    } => {
+                        let report_unknown = |ty: &Type| {
+                            if map_pattern.is_some() {
+                                self.maybe_error_any_argument_type(ty, range, arg_errors);
+                            }
+                        };
+                        // Only elements landing between two variadic portions lose
+                        // their position; the rest stay in the prefix or suffix.
+                        let unmatched_prefix = star_prefix
+                            .into_iter()
+                            .skip(consumed)
+                            .inspect(|ty| report_unknown(ty));
+                        if middle.is_empty() {
+                            prefix.extend(unmatched_prefix);
+                        } else {
+                            middle.extend(mem::take(&mut suffix));
+                            middle.extend(unmatched_prefix);
+                        }
+                        report_unknown(&star_middle);
+                        middle.push(star_middle);
+                        suffix.extend(star_suffix.into_iter().inspect(|ty| report_unknown(ty)));
+                        continue;
+                    }
+                };
+                if map_pattern.is_some() {
+                    self.maybe_error_any_argument_type(&ty, range, arg_errors);
+                }
+                if middle.is_empty() {
+                    prefix.push(ty)
+                } else {
+                    suffix.push(ty)
+                }
+            }
+            let unpacked_args_ty = match middle.len() {
+                0 => self.heap.mk_concrete_tuple(prefix),
+                1 => {
+                    // A TypeVarTuple element becomes `tuple[*Ts]`. Flatten that tuple into
+                    // the surrounding prefix and suffix before checking assignability.
+                    self.heap.mk_tuple(simplify_tuples(
+                        Tuple::unpacked(
+                            prefix,
+                            self.heap.mk_unbounded_tuple(middle.pop().unwrap()),
+                            suffix,
+                        ),
+                        self.heap,
+                    ))
+                }
+                _ => {
+                    let unpacked_variadic_args_count = middle
+                        .iter()
+                        .filter(|x| matches!(x, Type::ElementOfTypeVarTuple(_)))
+                        .count();
+                    if unpacked_variadic_args_count > 1 {
+                        error(
+                            arg_errors,
+                            arguments_range,
+                            ErrorKind::BadArgumentType,
+                            "Expected at most one unpacked variadic argument".to_owned(),
+                        );
+                    }
+                    self.heap.mk_unpacked_tuple(
+                        prefix,
+                        self.heap.mk_unbounded_tuple(self.unions(middle)),
+                        suffix,
+                    )
+                }
+            };
+            let check_context = || {
+                TypeCheckContext::of_kind(TypeCheckKind::CallVarArgs(
+                    true,
+                    unpacked_name.cloned(),
+                    callable_name.cloned(),
+                ))
+                .with_context(context.map(|ctx| ctx()))
+            };
+            if let Some(pattern) = map_pattern {
+                self.check_map_int_tuples_parameter_pattern(
+                    pattern,
+                    MapIntTuplesPatternArgument::Type(unpacked_args_ty),
+                    arguments_range,
+                    arg_errors,
+                    call_errors,
+                    &check_context,
+                    call_context,
+                    context,
+                );
+            } else {
+                // The args side is a tuple built from call arguments, while the parameter side is
+                // the raw type under `Unpack`. Wrap it so both sides have the same structure.
+                let unpacked_param_tuple =
+                    self.heap
+                        .mk_unpacked_tuple(Vec::new(), unpacked_param_ty.clone(), Vec::new());
+                if let Some(extension_source_context) =
+                    call_context.for_shape_extension_binding_source(unpacked_param_ty)
+                {
+                    self.check_type_with_options(
+                        &unpacked_args_ty,
+                        &unpacked_param_tuple,
+                        arguments_range,
+                        TypeCheckOptions::new(call_errors, &check_context)
+                            .with_call_context(&extension_source_context),
+                    );
+                } else {
+                    self.check_type_as_call_argument(
+                        &unpacked_args_ty,
+                        &unpacked_param_tuple,
+                        arguments_range,
+                        call_errors,
+                        &check_context,
+                    );
+                }
+            }
+        }
+        // Missing positional-only arguments, split by whether the corresponding parameters
+        // in the callable have names. E.g., functions declared with `def` have named posonly
+        // parameters and `typing.Callable`s have unnamed ones.
+        let mut missing_unnamed_posonly = 0;
+        let mut missing_named_posonly = SmallSet::new();
+        let mut kwparams = OrderedMap::new();
+        let mut kwargs = None;
+        let mut named_ints_capture = None;
+        // Parameters with default values that are not matched to call args.
+        let mut default_check = Vec::new();
+        loop {
+            let p = match rparams.pop() {
+                Some(p) => p,
+                None if let Some(var) = paramspec => {
+                    // We've reached the end of our regular parameter list. Now check if we have more parameters from a ParamSpec.
+                    match var_to_rparams(var) {
+                        Ok(new_rparams) => rparams = new_rparams,
+                        Err(q) => {
+                            // Quantified ParamSpec forwarding: no current
+                            // positional arg triggered expansion; check that
+                            // `*P.args` is the last positional arg and
+                            // `**P.kwargs` is the last keyword.
+                            let _ = self.paramspec_forwarding(
+                                &q,
+                                None,
+                                args,
+                                keywords,
+                                arguments_range,
+                                arg_errors,
+                                call_errors,
+                                context,
+                            );
+                            return argmap;
+                        }
+                    }
+                    paramspec = None;
+                    continue;
+                }
+                None => {
+                    break;
+                }
+            };
+            match p {
+                Param::PosOnly(name, ty, required) => match required {
+                    Required::Required => {
+                        if let Some(name) = name {
+                            missing_named_posonly.insert(name);
+                        } else {
+                            missing_unnamed_posonly += 1;
+                        }
+                    }
+                    Required::Optional(Some(default)) => {
+                        default_check.push((name.as_ref(), ty, default))
+                    }
+                    Required::Optional(None) => {}
+                },
+                Param::Varargs(name, Type::Unpack(unpacked)) => {
+                    if !has_matched_unpacked_vararg {
+                        if let Some(pattern) = map_int_tuples_parameter_pattern(unpacked) {
+                            self.check_map_int_tuples_parameter_pattern(
+                                pattern,
+                                MapIntTuplesPatternArgument::Type(
+                                    self.heap.mk_concrete_tuple(Vec::new()),
+                                ),
+                                arguments_range,
+                                arg_errors,
+                                call_errors,
+                                &|| {
+                                    TypeCheckContext::of_kind(TypeCheckKind::CallVarArgs(
+                                        true,
+                                        name.clone(),
+                                        callable_name.cloned(),
+                                    ))
+                                    .with_context(context.map(|ctx| ctx()))
+                                },
+                                call_context,
+                                context,
+                            );
+                        } else if let Some(extension_source_context) =
+                            call_context.for_shape_extension_binding_source(unpacked)
+                        {
+                            self.check_type_with_options(
+                                &self.heap.mk_concrete_tuple(Vec::new()),
+                                &self.heap.mk_unpacked_tuple(
+                                    Vec::new(),
+                                    unpacked.as_ref().clone(),
+                                    Vec::new(),
+                                ),
+                                arguments_range,
+                                TypeCheckOptions::new(call_errors, &|| {
+                                    TypeCheckContext::of_kind(TypeCheckKind::CallVarArgs(
+                                        true,
+                                        name.clone(),
+                                        callable_name.cloned(),
+                                    ))
+                                    .with_context(context.map(|ctx| ctx()))
+                                })
+                                .with_call_context(&extension_source_context),
+                            );
+                        } else {
+                            self.is_subset_eq(unpacked, &self.heap.mk_concrete_tuple(Vec::new()));
+                        }
+                    }
+                }
+                Param::Varargs(..) => {}
+                Param::Pos(name, ty, required) | Param::KwOnly(name, ty, required) => {
+                    kwparams.insert(name, (ty, NameOrigin::Param, required));
+                }
+                Param::Kwargs(name, ty) if let Some(typed_dict) = ty.unpacked_typed_dict() => {
+                    self.typed_dict_fields(typed_dict).into_iter().for_each(
+                        |(field_name, field)| {
+                            kwparams.insert(
+                                name_owner.push(field_name),
+                                (
+                                    type_owner.push(field.ty),
+                                    NameOrigin::UnpackedKwargs(name.as_ref()),
+                                    if field.required {
+                                        &Required::Required
+                                    } else {
+                                        &Required::Optional(None)
+                                    },
+                                ),
+                            );
+                        },
+                    );
+                    kwargs = match self.typed_dict_extra_items(typed_dict) {
+                        ExtraItems::Closed => None,
+                        ExtraItems::Extra(extra) => {
+                            Some((name.as_ref(), Some(type_owner.push(extra.ty))))
+                        }
+                        ExtraItems::Default => Some((name.as_ref(), None)),
+                    };
+                }
+                Param::Kwargs(name, ty) if let Some(source) = capture_named_ints_source(ty) => {
+                    named_ints_capture = Some(NamedIntsCapture::new(source));
+                    kwargs = Some((
+                        name.as_ref(),
+                        Some(type_owner.push(self.heap.mk_class_type(self.stdlib.int().clone()))),
+                    ));
+                }
+                Param::Kwargs(name, ty) => {
+                    kwargs = Some((name.as_ref(), Some(ty)));
+                }
+            }
+        }
+        let mut unexpected_keyword_error = |name: &Name, range| {
+            if missing_named_posonly.shift_remove(name) {
+                error(
+                    call_errors,
+                    range,
+                    ErrorKind::UnexpectedKeyword,
+                    format!("Expected argument `{name}` to be positional"),
+                );
+            } else {
+                error(
+                    call_errors,
+                    range,
+                    ErrorKind::UnexpectedKeyword,
+                    format!("Unexpected keyword argument `{name}`"),
+                );
+            }
+        };
+        let mut splat_kwargs: Vec<(Type, TextRange, SplatSource)> = Vec::new();
+        for (keyword_index, kw) in keywords.iter().enumerate() {
+            let argument = ArgumentKey::Keyword(keyword_index);
+            let call_context = &call_context.clone().with_argument(argument);
+            match kw.arg {
+                None => {
+                    let ty = kw.value.infer(self, arg_errors);
+                    self.maybe_error_any_argument_type(&ty, kw.range, arg_errors);
+                    if let Type::TypedDict(typed_dict) = ty {
+                        let fields = self.typed_dict_fields(&typed_dict);
+                        // A non-closed TypedDict may carry arbitrary unknown keys, which can
+                        // match the callee's kwargs or any of its unmatched keyword params. An
+                        // anonymous TypedDict comes from a dict display, whose keys are all known.
+                        let extra_items = self.typed_dict_extra_items(&typed_dict);
+                        let anonymous = typed_dict.is_anonymous();
+                        if let Some(capture) = &mut named_ints_capture {
+                            for (name, field) in fields.iter() {
+                                if !kwparams.contains_key(name)
+                                    && let Some(value) = self.captured_named_int(&field.ty)
+                                {
+                                    capture.insert(
+                                        name.clone(),
+                                        value,
+                                        anonymous || field.required,
+                                    );
+                                }
+                            }
+                            if !anonymous && !matches!(extra_items, ExtraItems::Closed) {
+                                capture.mark_open();
+                            }
+                        }
+                        if !anonymous && !matches!(extra_items, ExtraItems::Closed) {
+                            let open = matches!(extra_items, ExtraItems::Default);
+                            let extra_ty = extra_items.extra_item(self.stdlib).ty;
+                            match &kwargs {
+                                None => {
+                                    error(
+                                        call_errors,
+                                        kw.range,
+                                        if open {
+                                            ErrorKind::OpenUnpacking
+                                        } else {
+                                            ErrorKind::UnexpectedKeyword
+                                        },
+                                        format!(
+                                            "`{}` may contain extra items of type `{}`, which cannot be unpacked into a callable that accepts no extra keyword arguments",
+                                            typed_dict.name(),
+                                            self.for_display(extra_ty.clone()),
+                                        ),
+                                    );
+                                }
+                                Some((kwargs_name, Some(want))) => {
+                                    self.check_type_with_options(
+                                        &extra_ty,
+                                        want,
+                                        kw.range,
+                                        TypeCheckOptions::new(call_errors, &|| {
+                                            TypeCheckContext::of_kind(
+                                                TypeCheckKind::CallExtraItems(
+                                                    open,
+                                                    kwargs_name.cloned(),
+                                                    callable_name.cloned(),
+                                                ),
+                                            )
+                                            .with_context(context.map(|ctx| ctx()))
+                                        })
+                                        .with_call_context(call_context),
+                                    );
+                                }
+                                Some((_, None)) => {}
+                            }
+                            splat_kwargs.push((
+                                extra_ty,
+                                kw.range,
+                                SplatSource::ExtraItems {
+                                    open,
+                                    declared_keys: fields.keys().cloned().collect(),
+                                },
+                            ));
+                        }
+                        for (name, field) in fields {
+                            let name = name_owner.push(name);
+                            let mut hint = kwargs.as_ref().and_then(|(_, ty)| *ty);
+                            if let Some((ty, _, definitely_seen)) = seen_names.get_mut(name) {
+                                // For Required fields, the conflict is guaranteed, so report
+                                // BadKeywordArgument. For NotRequired fields, the conflict is
+                                // only potential (field may be absent at runtime), so report
+                                // PotentialBadKeywordArgument instead. This allows users to
+                                // opt-in to the stricter check while avoiding false positives
+                                // in basic mode. Keys of an anonymous TypedDict come from a
+                                // dict display, so they are always present.
+                                let definitely_present = field.required || anonymous;
+                                let error_kind = if definitely_present && *definitely_seen {
+                                    ErrorKind::BadKeywordArgument
+                                } else {
+                                    ErrorKind::PotentialBadKeywordArgument
+                                };
+                                error(
+                                    call_errors,
+                                    kw.range,
+                                    error_kind,
+                                    format!("Multiple values for argument `{name}`"),
+                                );
+                                *definitely_seen |= definitely_present;
+                                hint = Some(*ty);
+                            } else if let Some((ty, origin, _)) = kwparams.get(name) {
+                                seen_names.insert(
+                                    name,
+                                    (*ty, origin.clone(), field.required || anonymous),
+                                );
+                                hint = Some(*ty)
+                            } else if kwargs.is_none() {
+                                unexpected_keyword_error(name, kw.range);
+                            }
+                            if let Some(want) = &hint {
+                                self.check_type_with_options(
+                                    &field.ty,
+                                    want,
+                                    kw.range,
+                                    TypeCheckOptions::new(call_errors, &|| {
+                                        TypeCheckContext::of_kind(TypeCheckKind::CallArgument(
+                                            Some(name.clone()),
+                                            callable_name.cloned(),
+                                        ))
+                                        .with_context(context.map(|ctx| ctx()))
+                                    })
+                                    .with_call_context(call_context),
+                                );
+                            }
+                        }
+                    } else {
+                        match self.unwrap_mapping(&ty) {
+                            Some((key, value)) => {
+                                if self.is_subset_eq(
+                                    &key,
+                                    &self.heap.mk_class_type(self.stdlib.str().clone()),
+                                ) {
+                                    if let Some((name, Some(want))) = kwargs.as_ref() {
+                                        self.check_type_with_options(
+                                            &value,
+                                            want,
+                                            kw.range,
+                                            TypeCheckOptions::new(call_errors, &|| {
+                                                TypeCheckContext::of_kind(
+                                                    TypeCheckKind::CallKwArgs(
+                                                        None,
+                                                        name.cloned(),
+                                                        callable_name.cloned(),
+                                                    ),
+                                                )
+                                                .with_context(context.map(|ctx| ctx()))
+                                            })
+                                            .with_call_context(call_context),
+                                        );
+                                    };
+                                    splat_kwargs.push((value, kw.range, SplatSource::MappingValue));
+                                    if let Some(capture) = &mut named_ints_capture {
+                                        capture.mark_open();
+                                    }
+                                } else {
+                                    error(
+                                        call_errors,
+                                        kw.value.range(),
+                                        ErrorKind::BadUnpacking,
+                                        format!(
+                                            "Expected argument after ** to have `str` keys, got: {}",
+                                            self.for_display(key)
+                                        ),
+                                    );
+                                }
+                            }
+                            None => {
+                                error(
+                                    call_errors,
+                                    kw.value.range(),
+                                    ErrorKind::BadUnpacking,
+                                    format!(
+                                        "Expected argument after ** to be a mapping, got: {}",
+                                        self.for_display(ty)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(id) => {
+                    let mut hint = kwargs.as_ref().and_then(|(name, ty)| {
+                        ty.map(|ty| (NameOrigin::UnpackedKwargs(*name), ty))
+                    });
+                    let mut has_matching_param = false;
+                    if let Some((ty, origin, definitely_seen)) = seen_names.get_mut(&id.id) {
+                        // Use PotentialBadKeywordArgument when the prior entry came from a
+                        // NotRequired TypedDict field — the conflict is only potential.
+                        let error_kind = if !*definitely_seen {
+                            ErrorKind::PotentialBadKeywordArgument
+                        } else {
+                            ErrorKind::BadKeywordArgument
+                        };
+                        error(
+                            call_errors,
+                            kw.range,
+                            error_kind,
+                            format!("Multiple values for argument `{}`", id.id),
+                        );
+                        *definitely_seen = true;
+                        hint = Some((origin.clone(), *ty));
+                        has_matching_param = true;
+                    } else if let Some((ty, origin, _)) = kwparams.get(&id.id) {
+                        seen_names.insert(&id.id, (*ty, origin.clone(), true));
+                        hint = Some((origin.clone(), *ty));
+                        has_matching_param = true;
+                    } else if matches!(callable_name, Some(FunctionKind::DataclassTransform))
+                        || kwargs.is_none_or(|(_, ty)| ty.is_none())
+                    {
+                        unexpected_keyword_error(&id.id, id.range);
+                    }
+                    if let Some((origin, expected)) = &hint {
+                        let name = match origin {
+                            NameOrigin::Param => Some(id.id.clone()),
+                            NameOrigin::UnpackedKwargs(kwargs_name) => kwargs_name.cloned(),
+                        };
+                        argmap.insert(argument, (*expected).clone(), name);
+                    }
+                    let tcc: &dyn Fn() -> TypeCheckContext = &|| {
+                        TypeCheckContext::of_kind(if has_matching_param {
+                            TypeCheckKind::CallArgument(Some(id.id.clone()), callable_name.cloned())
+                        } else {
+                            TypeCheckKind::CallKwArgs(
+                                Some(id.id.clone()),
+                                kwargs.as_ref().and_then(|(name, _)| name.cloned()),
+                                callable_name.cloned(),
+                            )
+                        })
+                        .with_context(context.map(|ctx| ctx()))
+                    };
+                    let arg_ty = if let Some(pattern) = hint
+                        .as_ref()
+                        .and_then(|(_, hint)| map_int_tuples_parameter_pattern(hint))
+                    {
+                        let argument = match kw.value.as_type_or_expr() {
+                            TypeOrExpr::Expr(expr) => MapIntTuplesPatternArgument::Expr(expr),
+                            TypeOrExpr::Type(ty, _) => {
+                                MapIntTuplesPatternArgument::Type((*ty).clone())
+                            }
+                        };
+                        self.check_map_int_tuples_parameter_pattern(
+                            pattern,
+                            argument,
+                            kw.range,
+                            arg_errors,
+                            call_errors,
+                            tcc,
+                            call_context,
+                            context,
+                        )
+                    } else {
+                        match kw.value.as_type_or_expr() {
+                            TypeOrExpr::Expr(x) => self
+                                .expr_with_argument_cache(
+                                    x,
+                                    match hint {
+                                        Some((_, ty)) => ExprOptions::check(
+                                            ty,
+                                            arg_errors,
+                                            call_errors,
+                                            tcc,
+                                            Some(call_context),
+                                        ),
+                                        None => ExprOptions::infer(arg_errors, None),
+                                    },
+                                    kw.value.argument_cache(),
+                                )
+                                .into_ty(),
+                            TypeOrExpr::Type(x, range) => {
+                                if let Some((_, hint)) = &hint
+                                    && !hint.is_any()
+                                {
+                                    self.check_type_with_options(
+                                        x,
+                                        hint,
+                                        range,
+                                        TypeCheckOptions::new(call_errors, tcc)
+                                            .with_call_context(call_context),
+                                    );
+                                }
+                                (*x).clone()
+                            }
+                        }
+                    };
+                    self.maybe_error_any_argument_type(&arg_ty, kw.range, arg_errors);
+                    if named_ints_capture.is_some()
+                        && !has_matching_param
+                        && let Some(value) = self.captured_named_int(&arg_ty)
+                        && let Some(capture) = &mut named_ints_capture
+                    {
+                        capture.insert(id.id.clone(), value, true);
+                    }
+                }
+            }
+        }
+        if missing_unnamed_posonly > 0 || !missing_named_posonly.is_empty() {
+            let range = keywords.first().map_or(arguments_range, |kw| kw.range);
+            let msg = if missing_unnamed_posonly == 0 {
+                format!(
+                    "Missing {} {}",
+                    pluralize(missing_named_posonly.len(), "positional argument"),
+                    missing_named_posonly
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .join(", "),
+                )
+            } else {
+                format!(
+                    "Expected {}",
+                    count(
+                        missing_unnamed_posonly + missing_named_posonly.len(),
+                        "more positional argument"
+                    ),
+                )
+            };
+            error(call_errors, range, ErrorKind::BadArgumentCount, msg);
+        }
+        let missing_self_param = self_arg.is_some() && num_positional_params == 0;
+        // We'll attempt to match extra positional arguments to kw-only parameters for better error messages.
+        let mut extra_posargs_iter = extra_positional_args.iter();
+        if missing_self_param {
+            // The first extra arg is `self`, so it shouldn't be matched to a kw-only parameter.
+            extra_posargs_iter.next();
+        }
+        let mut extra_posargs_matched = 0;
+        let splat_may_supply_missing_args = splat_kwargs.iter().any(|(_, _, source)| {
+            matches!(
+                source,
+                SplatSource::MappingValue | SplatSource::ExtraItems { open: false, .. }
+            )
+        });
+        for (name, (want, origin, required)) in kwparams.iter() {
+            let seen = seen_names.get(name);
+            if seen.is_none() {
+                match required {
+                    Required::Required => {
+                        if !splat_may_supply_missing_args {
+                            if let Some(arg_range) = extra_posargs_iter.next() {
+                                error(
+                                    call_errors,
+                                    *arg_range,
+                                    ErrorKind::UnexpectedPositionalArgument,
+                                    format!("Expected argument `{name}` to be passed by name"),
+                                );
+                                extra_posargs_matched += 1;
+                            } else {
+                                argmap.unmatched_params.insert(match origin {
+                                    NameOrigin::Param => Some((*name).clone()),
+                                    NameOrigin::UnpackedKwargs(name) => name.cloned(),
+                                });
+                                error(
+                                    call_errors,
+                                    arguments_range,
+                                    ErrorKind::MissingArgument,
+                                    format!("Missing argument `{name}`"),
+                                );
+                            }
+                        }
+                    }
+                    Required::Optional(Some(default)) => {
+                        default_check.push((Some(name), want, default))
+                    }
+                    Required::Optional(None) => {}
+                }
+            }
+            // If `name` has been seen but not definitely seen - for example, if it was matched by
+            // a `NotRequired` field of an unpacked `TypedDict` - then it's possible for the splat
+            // to supply it.
+            let definitely_seen = seen.is_some_and(|(_, _, definitely_seen)| *definitely_seen);
+            if !definitely_seen {
+                for (ty, range, source) in &splat_kwargs {
+                    if let SplatSource::ExtraItems { declared_keys, .. } = source
+                        && declared_keys.contains(*name)
+                    {
+                        // If the splat source declares `name`, then `name` can't possibly be
+                        // supplied by the same source's `extra_items`.
+                        continue;
+                    }
+                    self.check_type_with_options(
+                        ty,
+                        want,
+                        *range,
+                        TypeCheckOptions::new(call_errors, &|| {
+                            TypeCheckContext::of_kind(match source {
+                                SplatSource::MappingValue => TypeCheckKind::CallUnpackKwArg(
+                                    (*name).clone(),
+                                    callable_name.cloned(),
+                                ),
+                                SplatSource::ExtraItems { open, .. } => {
+                                    TypeCheckKind::CallExtraItems(
+                                        *open,
+                                        Some((*name).clone()),
+                                        callable_name.cloned(),
+                                    )
+                                }
+                            })
+                            .with_context(context.map(|ctx| ctx()))
+                        })
+                        .with_call_context(call_context),
+                    );
+                }
+            }
+        }
+        for (name, ty, default) in default_check {
+            // `ty` may contain type variables, so we record quantified bounds from the default and
+            // check for inconsistent solutions. We mark any literals in the default as implicit so
+            // that ordinary type variables get solved to promoted types (`int` rather than
+            // `Literal[N]`). A shape-extension restriction's single binding source preserves the
+            // literal instead.
+            let default_ty = if call_context.is_shape_extension_var_type(ty) {
+                default.ty.clone()
+            } else {
+                default.ty.clone().with_literal_style(LitStyle::Implicit)
+            };
+            self.check_type_with_options(
+                &default_ty,
+                ty,
+                arguments_range,
+                TypeCheckOptions::new(call_errors, &|| {
+                    TypeCheckContext::of_kind(TypeCheckKind::CallArgument(
+                        name.cloned(),
+                        callable_name.cloned(),
+                    ))
+                })
+                .with_call_context(call_context),
+            );
+        }
+        for (mut arg, hint, name, range, argument) in deferred_callbacks {
+            let call_context = &call_context.clone().with_argument(argument);
+            let mut hint = hint.clone();
+            // Read parameter bounds collected from the other arguments while leaving the return
+            // type open for the argument to constrain. Every input of a DSL call in a parameter
+            // type is now as solved as it will be, so the call is evaluated here.
+            if let Type::Callable(callable) = &mut hint {
+                callable.params.visit_mut(&mut |ty| {
+                    self.solver().expand_with_bounds(ty);
+                    for error in ty.finalize_type_level_dsl_at_boundary() {
+                        self.error_with_context(
+                            call_errors,
+                            range,
+                            ErrorKind::UnsupportedOperation,
+                            format!("Cannot evaluate type-level shape DSL call: {error}"),
+                            context,
+                        );
+                    }
+                });
+            }
+            arg.post_check(
+                self,
+                callable_name,
+                &hint,
+                name,
+                false,
+                false,
+                range,
+                arg_errors,
+                call_errors,
+                context,
+                call_context,
+            );
+        }
+        let num_extra_positional_args = extra_positional_args.len();
+        if let Some(arg_range) = extra_arg_pos
+            // This error is redundant if we've already reported an error for every individual arg.
+            && extra_posargs_matched < num_extra_positional_args
+        {
+            let (expected, actual) = if missing_self_param {
+                (
+                    "0 positional arguments".to_owned(),
+                    format!("{num_extra_positional_args} (including implicit `self`)"),
+                )
+            } else {
+                let num_positional_params = num_positional_params - (self_arg.is_some() as usize);
+                (
+                    count(num_positional_params, "positional argument"),
+                    (num_positional_params + num_extra_positional_args).to_string(),
+                )
+            };
+            error(
+                call_errors,
+                arg_range,
+                ErrorKind::BadArgumentCount,
+                format!("Expected {expected}, got {actual}"),
+            );
+        }
+        if let Some(capture) = named_ints_capture {
+            let (source, captured) = capture.finish();
+            let source_context = call_context.for_shape_extension_binding_source(source);
+            let check_context = || {
+                TypeCheckContext::of_kind(TypeCheckKind::CallKwArgs(
+                    None,
+                    None,
+                    callable_name.cloned(),
+                ))
+                .with_context(context.map(|ctx| ctx()))
+            };
+            let options = TypeCheckOptions::new(call_errors, &check_context);
+            let options = match source_context.as_ref() {
+                Some(source_context) => options.with_call_context(source_context),
+                None => options,
+            };
+            self.check_type_with_options(&captured, source, arguments_range, options);
+        }
+        argmap
+    }
+
+    // Resolve an overloaded callback first when a wrapper forwards its arguments unchanged.
+    // This gives normal generic inference the return type selected by those arguments.
+    fn constrain_forwarded_overload_return(&self, call: ForwardedOverloadCall) {
+        let ForwardedOverloadCall {
+            params,
+            has_self,
+            args,
+            keywords,
+            arguments_range,
+        } = call;
+        let Some((callback_arg, forwarded_args)) = args.split_first() else {
+            return;
+        };
+        if !matches!(callback_arg, CallArg::Arg(_)) {
+            return;
+        }
+
+        let self_offset = usize::from(has_self);
+        let (expected_return, forward_keywords) = match params {
+            Params::ParamSpec(prefix, outer_paramspec)
+                if prefix.len() == self_offset + 1
+                    && let Type::Callable(callback) = prefix[self_offset].ty()
+                    && let Params::ParamSpec(callback_prefix, callback_paramspec) =
+                        &callback.params
+                    && callback_prefix.is_empty()
+                    && callback_paramspec == outer_paramspec =>
+            {
+                (callback.ret.clone(), true)
+            }
+            Params::List(params) => {
+                let items = params.items();
+                let Some(callback_param) = items.get(self_offset) else {
+                    return;
+                };
+                let Some(Param::Varargs(_, outer_varargs)) = items.get(self_offset + 1) else {
+                    return;
+                };
+                if !items[self_offset + 2..]
+                    .iter()
+                    .all(|param| matches!(param, Param::KwOnly(..) | Param::Kwargs(..)))
+                {
+                    return;
+                }
+                let callback_ty = match callback_param {
+                    Param::PosOnly(_, ty, _) | Param::Pos(_, ty, _) => ty,
+                    _ => return,
+                };
+                let Type::Callable(callback) = callback_ty else {
+                    return;
+                };
+                let Params::List(callback_params) = &callback.params else {
+                    return;
+                };
+                let [Param::Varargs(_, callback_varargs)] = callback_params.items() else {
+                    return;
+                };
+                let outer_vars = outer_varargs.collect_maybe_placeholder_vars();
+                let callback_vars = callback_varargs.collect_maybe_placeholder_vars();
+                if outer_vars.len() != 1 || outer_vars != callback_vars {
+                    return;
+                }
+                (callback.ret.clone(), false)
+            }
+            _ => return,
+        };
+
+        let probe_errors = self.error_collector();
+        let callback_ty = callback_arg
+            .pre_eval(self, &probe_errors)
+            .inferred_type(self, &probe_errors);
+        let is_overloaded = match &callback_ty {
+            Type::Overload(_) => true,
+            Type::BoundMethod(method) => {
+                matches!(&method.func, BoundMethodType::Overload(_))
+            }
+            _ => false,
+        };
+        if !is_overloaded {
+            return;
+        }
+        let no_keywords = [];
+        let forwarded_keywords = if forward_keywords {
+            keywords
+        } else {
+            &no_keywords
+        };
+        let actual_return = self
+            .freeform_call_infer(
+                callback_ty,
+                forwarded_args,
+                forwarded_keywords,
+                callback_arg.range(),
+                arguments_range,
+                None,
+                &probe_errors,
+            )
+            .ty;
+        if probe_errors.has_hard() {
+            return;
+        }
+
+        let vars = expected_return.collect_maybe_placeholder_vars();
+        let snapshot = self.solver().snapshot_exact_vars(&vars);
+        if !self.is_subset_eq(&actual_return, &expected_return) {
+            self.solver().restore_vars(snapshot);
+        }
+    }
+
+    /// Helper used by `callable_infer` and Expr::Lambda inference to distribute over hints.
+    ///
+    /// `errors` collects call-level errors (arity, argument/parameter mismatches); `arg_errors`
+    /// collects errors from inferring the argument expressions, such as a lambda body whose
+    /// parameter type the hint fixed. Both are scoped per hint member and committed only for the
+    /// accepted member, so a rejected member cannot leak errors. Callers with a single collector
+    /// pass the same reference for both.
+    ///
+    /// Each attempt consumes its own copy of `input`. When there is only one attempt, `input`
+    /// is moved into it rather than cloned.
+    pub fn callable_infer_with_hint<T: Clone, R>(
+        &self,
+        hint: Option<HintRef>,
+        errors: &ErrorCollector,
+        arg_errors: &ErrorCollector,
+        input: T,
+        mut inner: impl FnMut(T, Option<&Type>, &ErrorCollector, &ErrorCollector) -> R,
+        result_type: impl Fn(&R) -> &Type,
+    ) -> R {
+        let owner = Owner::new();
+        let hint = match hint {
+            // Optimization: no-hint and single-hint cases can return immediately.
+            None => return inner(input, None, errors, arg_errors),
+            Some(hint) if hint.types().len() == 1 => {
+                return inner(input, hint.types().first(), errors, arg_errors);
+            }
+            Some(hint) => hint,
+        };
+        let mut hints = if hint.types().len() <= MAX_HINT_WIDTH {
+            hint.types().map(Some)
+        } else {
+            Vec::new()
+        };
+        // Push a marker so we know when no individual hint has matched, or the hint was too wide
+        // to try individual hints. We'll try a combined union hint. Constructing the union is
+        // expensive, so we use the marker to avoid unnecessary construction.
+        hints.push(None);
+        let mut ret_with_error = None;
+        for mut cur_hint in hints {
+            if cur_hint.is_none() {
+                let combined_hint = Type::union(hint.types().to_vec());
+                cur_hint = Some(owner.push(combined_hint));
+            }
+            let cur_errors = self.error_collector();
+            let cur_arg_errors = self.error_collector();
+            let ret = inner(input.clone(), cur_hint, &cur_errors, &cur_arg_errors);
+            if !cur_errors.has_hard()
+                && cur_hint.is_none_or(|hint| {
+                    let snapshot = self
+                        .solver()
+                        .snapshot_exact_vars(&hint.collect_maybe_placeholder_vars());
+                    let res = self.is_subset_eq(result_type(&ret), hint);
+                    self.solver().restore_vars(snapshot);
+                    res
+                })
+            {
+                errors.extend(cur_errors);
+                arg_errors.extend(cur_arg_errors);
+                return ret;
+            } else if ret_with_error.is_none() {
+                ret_with_error = Some((ret, cur_errors, cur_arg_errors));
+            }
+        }
+        let (ret, cur_errors, cur_arg_errors) = ret_with_error.unwrap();
+        errors.extend(cur_errors);
+        arg_errors.extend(cur_arg_errors);
+        ret
+    }
+
+    // Call a function with the given arguments. The arguments are contextually typed, if possible.
+    // We pass two error collectors into this function and return late resolution errors separately:
+    // * arg_errors is used to infer the types of arguments, before passing them to the function.
+    // * call_errors is used for (1) call signature matching, e.g. arity issues and (2) checking the
+    //   types of arguments against the types of parameters.
+    // * Type variable specialization errors reject an overload candidate but are returned separately
+    //   because they are produced after argument matching.
+    // * Return type resolution errors do not affect candidate selection and are reported only for
+    //   the selected candidate.
+    // Callers can pass the same error collector for both, and most callers do. We use two collectors
+    // for overload matching.
+    //
+    // Returns: (return_type, specialization_errors, return_type_errors, argmap, defaults_used,
+    // overload_table), where argmap maps each argument's position to the parameter it was
+    // matched against and defaults_used contains type parameters that reached their declared
+    // default during finishing.
+    pub fn callable_infer(
+        &self,
+        callable: Callable,
+        callable_name: Option<&FunctionKind>,
+        tparams: Option<&TParams>,
+        self_obj: Option<Type>,
+        args: &[CallArg],
+        keywords: &[CallKeyword],
+        arguments_range: TextRange,
+        arg_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+        hint: Option<HintRef>,
+        contextually_opaque_defaults: Option<&SmallSet<Quantified>>,
+        mut ctor_targs: Option<&mut TArgs>,
+    ) -> (
+        Type,
+        Vec<TypeVarSpecializationError>,
+        Vec<ReturnTypeResolutionError>,
+        ArgMap,
+        SmallSet<Quantified>,
+        OverloadTable,
+    ) {
+        let hint = HintRef::filter_for_call(hint, tparams);
+        self.callable_infer_with_hint(
+            hint,
+            call_errors,
+            arg_errors,
+            (callable, self_obj),
+            |(callable, self_obj), cur_hint, cur_call_errors, cur_arg_errors| {
+                self.callable_infer_inner(
+                    callable,
+                    callable_name,
+                    tparams,
+                    self_obj,
+                    args,
+                    keywords,
+                    arguments_range,
+                    cur_arg_errors,
+                    cur_call_errors,
+                    context,
+                    cur_hint,
+                    contextually_opaque_defaults,
+                    &mut ctor_targs,
+                )
+            },
+            |ret| &ret.0,
+        )
+    }
+
+    fn callable_infer_inner(
+        &self,
+        callable: Callable,
+        callable_name: Option<&FunctionKind>,
+        tparams: Option<&TParams>,
+        mut self_obj: Option<Type>,
+        mut args: &[CallArg],
+        keywords: &[CallKeyword],
+        arguments_range: TextRange,
+        arg_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+        hint: Option<&Type>,
+        contextually_opaque_defaults: Option<&SmallSet<Quantified>>,
+        ctor_targs: &mut Option<&mut TArgs>,
+    ) -> (
+        Type,
+        Vec<TypeVarSpecializationError>,
+        Vec<ReturnTypeResolutionError>,
+        ArgMap,
+        SmallSet<Quantified>,
+        OverloadTable,
+    ) {
+        let call_boundary = CallBoundary::new();
+        let call_context = call_boundary
+            .context()
+            .with_argument_side(ArgumentSide::Got);
+
+        let (callable_qs, mut callable, mut shape_extension_vars) = if let Some(tparams) = tparams {
+            let instantiate = |callable| {
+                let (qs, callable) = self.instantiate_fresh_callable(tparams, callable);
+                let extension_vars = shape_extension_vars(tparams, qs.vars());
+                (qs, callable, extension_vars)
+            };
+            // If we have a hint, we want to try to instantiate against it first, so we can contextually type
+            // arguments. If we don't match the hint, we need to throw away any instantiations we might have made.
+            // By invariant, hint will be None if we are calling a constructor.
+            if let Some(hint) = hint {
+                let (qs, callable_, extension_vars) = instantiate(callable.clone());
+                let opaque_default_vars: SmallMap<Var, Var> = tparams
+                    .iter()
+                    .zip(qs.vars())
+                    .filter(|(param, _)| {
+                        contextually_opaque_defaults
+                            .is_some_and(|defaults| defaults.contains(*param))
+                    })
+                    .map(|(_, var)| (*var, self.solver().fresh_unwrap(self.uniques)))
+                    .collect();
+                let contains_dsl_call = self.solver().config.tensor_shapes
+                    && callable_
+                        .ret
+                        .any(|ty| matches!(ty, Type::TypeLevelDslCall(_)));
+                let matches_hint = if extension_vars.is_none()
+                    && !contains_dsl_call
+                    && opaque_default_vars.is_empty()
+                {
+                    self.is_subset_eq(&callable_.ret, hint)
+                } else {
+                    let mut ret_for_hint = callable_.ret.clone();
+                    // DSL calls and parameters that used defaults in the no-hint trial are not
+                    // inferred from the return context. Preserve the surrounding type so other
+                    // parameters can still be inferred, but use isolated variables here.
+                    ret_for_hint.transform_mut(&mut |ty| {
+                        if let Type::Var(var) = ty
+                            && let Some(context_var) = opaque_default_vars.get(var)
+                        {
+                            *ty = context_var.to_type(self.heap);
+                        } else if matches!(ty, Type::TypeLevelDslCall(_))
+                            || matches!(ty, Type::Var(var) if extension_vars.as_ref().is_some_and(|vars| vars.contains(var)))
+                        {
+                            *ty = self.heap.mk_any_implicit();
+                        }
+                    });
+                    self.is_subset_eq(&ret_for_hint, hint)
+                };
+                if matches_hint && !self.solver().has_instantiation_errors(&qs) {
+                    (qs, callable_, extension_vars)
+                } else {
+                    // Even though these quantifieds aren't used, let's make sure to not leave
+                    // unfinished quantifieds around.
+                    let _ = self.finish_quantified(qs, false);
+                    instantiate(callable)
+                }
+            } else {
+                instantiate(callable)
+            }
+        } else {
+            (QuantifiedHandle::empty(), callable, None)
+        };
+        let (mut self_qs, remaining_callable_qs) = if self_obj.is_some()
+            && let Some(first_param) = callable.get_first_param()
+            // TODO(https://github.com/facebook/pyrefly/issues/105): handle nested vars
+            && matches!(first_param, Type::Var(_))
+        {
+            // Quantifieds in `self` need to be finished as soon as `self_arg` is matched, unlike
+            // other quantifieds that are finished at the end of the call, so we split them out to
+            // be handled separately.
+            let (self_qs, remaining_qs) = callable_qs.partition_by(first_param);
+            (Some(self_qs), remaining_qs)
+        } else {
+            (None, callable_qs)
+        };
+        call_boundary.defer_quantified(remaining_callable_qs);
+        if let Some(targs) = ctor_targs.as_mut() {
+            let qs = self.solver().freshen_class_targs(targs, self.uniques);
+            extend_shape_extension_vars_from_targs(&mut shape_extension_vars, targs);
+            let mp = targs.substitution_map();
+            callable.params.visit_mut(&mut |t| t.subst_mut(&mp));
+            if let Some(obj) = self_obj.as_mut() {
+                obj.subst_mut(&mp);
+            } else if let Some(id) = callable_name
+                && id.function_name().as_ref() == &dunder::NEW
+                && let Some((first, rest)) = args.split_first()
+                && let CallArg::Arg(CallValue::Plain(TypeOrExpr::Type(obj, _))) = first
+            {
+                // hack: we inserted a class type into the args list, but we need to substitute it
+                self_obj = Some((*obj).clone().subst(&mp));
+                args = rest;
+            }
+            call_boundary.defer_quantified(qs);
+        }
+        let call_context = call_context.with_shape_extension_vars(shape_extension_vars);
+        self.constrain_forwarded_overload_return(ForwardedOverloadCall {
+            params: &callable.params,
+            has_self: self_obj.is_some(),
+            args,
+            keywords,
+            arguments_range,
+        });
+        let self_arg = self_obj.as_ref().map(|ty| CallArg::ty(ty, arguments_range));
+        let argmap = match callable.params {
+            Params::List(params) | Params::Partial(params) => self.callable_infer_params(
+                callable_name,
+                &params,
+                None,
+                self_arg,
+                &mut self_qs,
+                args,
+                keywords,
+                arguments_range,
+                arg_errors,
+                call_errors,
+                context,
+                &call_context,
+            ),
+            Params::Ellipsis | Params::Materialization => {
+                // Deal with Callable[..., R]
+                for arg in self_arg.iter().chain(args.iter()) {
+                    arg.pre_eval(self, arg_errors).post_infer(self, arg_errors)
+                }
+                for keyword in keywords {
+                    keyword.value.infer(self, arg_errors);
+                }
+                ArgMap::new()
+            }
+            Params::ParamSpec(concatenate, p) => {
+                let p = self.solver().expand(p);
+                match p {
+                    Type::ParamSpecValue(params) => self.callable_infer_params(
+                        callable_name,
+                        &params.prepend_types(&concatenate),
+                        None,
+                        self_arg,
+                        &mut self_qs,
+                        args,
+                        keywords,
+                        arguments_range,
+                        arg_errors,
+                        call_errors,
+                        context,
+                        &call_context,
+                    ),
+                    // This can happen with a signature like `(f: Callable[P, None], *args: P.args, **kwargs: P.kwargs)`.
+                    // Before we match an argument to `f`, we don't know what `P` is, so we don't have an answer for the Var yet.
+                    // Use to_subset_param to preserve Pos vs PosOnly: prefix params from a
+                    // function definition should remain keyword-passable in direct calls.
+                    Type::Var(var) => self.callable_infer_params(
+                        callable_name,
+                        &ParamList::new(
+                            concatenate
+                                .iter()
+                                .map(|p| p.to_param_preserve_name())
+                                .collect(),
+                        ),
+                        Some(var),
+                        self_arg,
+                        &mut self_qs,
+                        args,
+                        keywords,
+                        arguments_range,
+                        arg_errors,
+                        call_errors,
+                        context,
+                        &call_context,
+                    ),
+                    Type::Quantified(q) => {
+                        if let Some((args, keywords)) = self.paramspec_forwarding(
+                            &q,
+                            None,
+                            args,
+                            keywords,
+                            arguments_range,
+                            arg_errors,
+                            call_errors,
+                            context,
+                        ) {
+                            self.callable_infer_params(
+                                callable_name,
+                                &ParamList::new_types(concatenate.into_vec()),
+                                None,
+                                self_arg,
+                                &mut self_qs,
+                                args,
+                                keywords,
+                                arguments_range,
+                                arg_errors,
+                                call_errors,
+                                context,
+                                &call_context,
+                            )
+                        } else {
+                            ArgMap::new()
+                        }
+                    }
+                    Type::Any(_) | Type::Ellipsis => ArgMap::new(),
+                    _ => {
+                        // This could well be our error, but not really sure
+                        self.error_with_context(
+                            call_errors,
+                            arguments_range,
+                            ErrorKind::InvalidParamSpec,
+                            format!("Unexpected ParamSpec type: `{}`", self.for_display(p)),
+                            context,
+                        );
+                        ArgMap::new()
+                    }
+                }
+            }
+        };
+        if let Some(self_qs) = self_qs {
+            call_boundary.defer_quantified(self_qs);
+        }
+        // A violation belongs to this call, so that an overload that causes one is rejected. It
+        // must be taken before generalizing, which expands the answer's var away.
+        let restriction_errors = ctor_targs.as_ref().map_or_else(Vec::new, |targs| {
+            self.solver().take_restricted_answer_errors(targs)
+        });
+        if let Some(targs) = ctor_targs {
+            let recorded_vars = call_context.captured_vars();
+            self.solver().generalize_class_targs(targs, &recorded_vars);
+        }
+        let (overload_table, finish_result, defaults_used) = self.solver().finish_call_boundary(
+            self.solver().config.infer_with_first_use,
+            self.type_order(),
+            call_boundary,
+        );
+        let mut errors = finish_result.map_or_else(|e| e.to_vec(), |_| Vec::new());
+        errors.extend(restriction_errors);
+
+        let (ret, type_level_dsl_errors) =
+            self.finish_return(&overload_table, callable.ret.clone());
+        let return_type_errors = type_level_dsl_errors
+            .into_iter()
+            .map(ReturnTypeResolutionError::TypeLevelDsl)
+            .collect();
+
+        (
+            ret,
+            errors,
+            return_type_errors,
+            argmap,
+            defaults_used,
+            overload_table,
+        )
+    }
+}

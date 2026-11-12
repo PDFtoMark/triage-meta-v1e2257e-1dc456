@@ -1,0 +1,353 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::collections::HashMap;
+
+use lsp_types::DocumentChange;
+use lsp_types::Edit;
+use lsp_types::OptionalVersionedTextDocumentIdentifier;
+use lsp_types::RenameFilesParams;
+use lsp_types::TextDocumentEdit;
+use lsp_types::TextDocumentIdentifier;
+use lsp_types::TextEdit;
+use lsp_types::Uri;
+use lsp_types::WorkspaceEdit;
+use pyrefly_python::PYTHON_EXTENSIONS;
+use pyrefly_python::ast::Ast;
+use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModulePath;
+use pyrefly_util::lined_buffer::LinedBuffer;
+use rayon::prelude::*;
+use ruff_python_ast::Stmt;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use tracing::info;
+
+use crate::lsp::non_wasm::module_helpers::PathRemapper;
+use crate::lsp::non_wasm::module_helpers::handle_from_module_path;
+use crate::lsp::non_wasm::module_helpers::module_info_to_uri;
+use crate::state::state::State;
+use crate::state::state::Transaction;
+
+/// Visitor that looks for imports of an old module name and creates TextEdits to update them
+struct RenameUsageVisitor<'a> {
+    edits: Vec<TextEdit>,
+    old_module_name: &'a ModuleName,
+    new_module_name: &'a ModuleName,
+    current_module_name: ModuleName,
+    is_init: bool,
+    lined_buffer: &'a LinedBuffer,
+}
+
+impl<'a> RenameUsageVisitor<'a> {
+    fn new(
+        old_module_name: &'a ModuleName,
+        new_module_name: &'a ModuleName,
+        current_module_name: ModuleName,
+        is_init: bool,
+        lined_buffer: &'a LinedBuffer,
+    ) -> Self {
+        Self {
+            edits: Vec::new(),
+            old_module_name,
+            new_module_name,
+            current_module_name,
+            is_init,
+            lined_buffer,
+        }
+    }
+
+    fn replacement_for_module(&self, imported_module: ModuleName) -> Option<String> {
+        if imported_module == *self.old_module_name {
+            Some(self.new_module_name.as_str().to_owned())
+        } else {
+            let old_prefix = format!("{}.", self.old_module_name.as_str());
+            let suffix = imported_module.as_str().strip_prefix(&old_prefix)?;
+            Some(format!("{}.{}", self.new_module_name.as_str(), suffix))
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let imported_module = ModuleName::from_name(&alias.name.id);
+                    if let Some(new_import_name) = self.replacement_for_module(imported_module) {
+                        self.edits.push(TextEdit {
+                            range: self.lined_buffer.to_lsp_range(alias.name.range(), None),
+                            new_text: new_import_name,
+                        });
+                    }
+                }
+            }
+            Stmt::ImportFrom(import_from) => {
+                // `from . import name` binds `name` directly, so updating it would also require
+                // a semantic rename of references to that binding.
+                let Some(module) = &import_from.module else {
+                    return;
+                };
+                let Some(imported_module) = self.current_module_name.new_maybe_relative(
+                    self.is_init,
+                    import_from.level,
+                    Some(&module.id),
+                ) else {
+                    return;
+                };
+                let Some(replacement) = self.replacement_for_module(imported_module) else {
+                    return;
+                };
+                let (range, new_text) = if import_from.level == 0 {
+                    (module.range(), replacement)
+                } else {
+                    let current_package = self
+                        .current_module_name
+                        .new_maybe_relative(self.is_init, import_from.level, None)
+                        .expect("resolved above with the same number of dots");
+                    let current_package_prefix = if current_package.as_str().is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}.", current_package.as_str())
+                    };
+                    match replacement.strip_prefix(&current_package_prefix) {
+                        Some(relative_replacement) => {
+                            (module.range(), relative_replacement.to_owned())
+                        }
+                        // Keeping the original dots would resolve against the wrong package.
+                        // Ruff stores their count but not their range, so we can just locate them
+                        // in the source before replacing the whole path.
+                        None => {
+                            let before_module =
+                                TextRange::new(import_from.range().start(), module.range().start());
+                            let dots_offset = self
+                                .lined_buffer
+                                .code_at(before_module)
+                                .find('.')
+                                .expect("relative import has a dot before the module name");
+                            let dots_start = before_module.start()
+                                + TextSize::try_from(dots_offset).expect("offset fits in u32");
+                            (
+                                TextRange::new(dots_start, module.range().end()),
+                                replacement,
+                            )
+                        }
+                    }
+                };
+                self.edits.push(TextEdit {
+                    range: self.lined_buffer.to_lsp_range(range, None),
+                    new_text,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn take_edits(self) -> Vec<TextEdit> {
+        self.edits
+    }
+}
+
+/// Handle workspace/willRenameFiles request to update imports when files are renamed.
+///
+/// This function:
+/// 1. Converts file paths to module names
+/// 2. Uses get_transitive_rdeps to find all files that depend on the renamed module
+/// 3. Uses a visitor pattern to find imports of the old module and creates TextEdits
+/// 4. Returns a WorkspaceEdit with all necessary changes
+///
+/// If the client supports `workspace.workspaceEdit.documentChanges`, the response will use
+/// `document_changes` instead of `changes` for better ordering guarantees and version checking.
+pub fn will_rename_files(
+    state: &State,
+    transaction: &Transaction<'_>,
+    params: RenameFilesParams,
+    supports_document_changes: bool,
+    path_remapper: Option<&PathRemapper>,
+) -> Option<WorkspaceEdit> {
+    info!(
+        "will_rename_files called with {} file(s)",
+        params.files.len()
+    );
+
+    let mut all_changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+
+    for file_rename in &params.files {
+        info!(
+            "  Processing rename: {} -> {}",
+            file_rename.old_uri, file_rename.new_uri
+        );
+
+        // Convert URLs to paths
+        let old_uri = file_rename.old_uri.clone();
+        let new_uri = file_rename.new_uri.clone();
+
+        let old_path = match old_uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                info!("    Failed to convert old_uri to path");
+                continue;
+            }
+        };
+
+        let new_path = match new_uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                info!("    Failed to convert new_uri to path");
+                continue;
+            }
+        };
+
+        // Only process Python files
+        if !PYTHON_EXTENSIONS
+            .iter()
+            .any(|ext| old_path.extension().and_then(|e| e.to_str()) == Some(*ext))
+        {
+            info!("    Skipping non-Python file");
+            continue;
+        }
+
+        // Important: only use filesystem handle (never use an in-memory handle)
+        let module_path = ModulePath::filesystem(old_path.clone());
+        let old_handle = handle_from_module_path(state, module_path.clone());
+
+        // Convert paths to module names
+        let old_module_name = old_handle.module();
+
+        let config = state
+            .config_finder()
+            .python_file(old_handle.module_kind(), &module_path);
+        let new_module_name = ModuleName::from_path(
+            &new_path,
+            config.search_path().chain(
+                config
+                    .fallback_search_path
+                    .for_directory(new_path.parent())
+                    .iter(),
+            ),
+            &config.extra_file_extensions,
+        );
+
+        let new_module_name = match new_module_name {
+            Some(name) if name.is_importable() => name,
+            Some(name) => {
+                info!("    New module name {name} cannot be imported, skipping");
+                continue;
+            }
+            None => {
+                info!("    Could not determine new module name, skipping");
+                continue;
+            }
+        };
+
+        info!(
+            "    Module rename: {} -> {}",
+            old_module_name, new_module_name
+        );
+
+        // If module names are the same, no need to update imports
+        if old_module_name == new_module_name {
+            info!("    Module names are the same, skipping");
+            continue;
+        }
+
+        // Use get_transitive_rdeps to find all files that depend on this module
+        let rdeps = transaction.get_transitive_rdeps(old_handle.clone());
+
+        info!("    Found {} transitive rdeps", rdeps.len());
+
+        // Deduplicate rdeps by module path string (get_transitive_rdeps might return duplicates
+        // with different variants like FileSystem vs Memory for the same path)
+        let unique_rdeps: Vec<_> = {
+            let mut seen = std::collections::HashSet::new();
+            rdeps
+                .into_iter()
+                .filter(|handle| seen.insert(handle.path().as_path().to_owned()))
+                .collect()
+        };
+
+        // Visit each dependent file to find and update imports (parallelized)
+        let rdeps_changes: Vec<(Uri, Vec<TextEdit>)> = unique_rdeps
+            .into_par_iter()
+            .filter_map(|rdep_handle| {
+                let module_info = transaction.get_module_info(&rdep_handle)?;
+
+                let ast = Ast::parse(module_info.contents(), module_info.source_type()).0;
+                let mut visitor = RenameUsageVisitor::new(
+                    &old_module_name,
+                    &new_module_name,
+                    rdep_handle.module(),
+                    rdep_handle.path().is_init(),
+                    module_info.lined_buffer(),
+                );
+
+                for stmt in &ast.body {
+                    visitor.visit_stmt(stmt);
+                }
+
+                let edits_for_file = visitor.take_edits();
+
+                if !edits_for_file.is_empty() {
+                    let uri = module_info_to_uri(&module_info, path_remapper)?;
+                    info!(
+                        "    Found {} import(s) to update in {}",
+                        edits_for_file.len(),
+                        uri
+                    );
+                    Some((uri, edits_for_file))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Merge results into all_changes
+        for (uri, edits) in rdeps_changes {
+            all_changes.entry(uri).or_default().extend(edits);
+        }
+    }
+
+    if all_changes.is_empty() {
+        info!("  No import updates needed");
+        None
+    } else {
+        info!(
+            "  Returning {} file(s) with import updates",
+            all_changes.len()
+        );
+
+        if supports_document_changes {
+            // Use document_changes for better ordering guarantees and version checking
+            // Sort by URI for deterministic ordering
+            let mut sorted_changes: Vec<(Uri, Vec<TextEdit>)> = all_changes.into_iter().collect();
+            sorted_changes.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+            let document_changes: Vec<DocumentChange> = sorted_changes
+                .into_iter()
+                .map(|(uri, edits)| {
+                    DocumentChange::TextDocumentEdit(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            text_document_identifier: TextDocumentIdentifier { uri },
+                            version: None, // None means "any version"
+                        },
+                        edits: edits.into_iter().map(Edit::TextEdit).collect(),
+                    })
+                })
+                .collect();
+
+            Some(WorkspaceEdit {
+                document_changes: Some(document_changes),
+                ..Default::default()
+            })
+        } else {
+            // Fall back to changes for older clients
+            Some(WorkspaceEdit {
+                changes: Some(all_changes),
+                ..Default::default()
+            })
+        }
+    }
+}

@@ -1,0 +1,1376 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+
+use dupe::Dupe;
+use pyrefly_config::args::ConfigOverrideArgs;
+use pyrefly_config::base::ConfigBase;
+use pyrefly_config::config::ConfigSource;
+use pyrefly_config::config::DirectoryRelativeFallbackSearchPathCache;
+use pyrefly_config::config::FallbackSearchPath;
+use pyrefly_config::config::GENERATED_FILE_CONFIG_OVERRIDE;
+use pyrefly_config::environment::script;
+use pyrefly_config::resolve_unconfigured::UnconfiguredOverride;
+use pyrefly_config::resolve_unconfigured::resolve_unconfigured_config;
+use pyrefly_python::module_path::ModulePath;
+use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_util::arc_id::ArcId;
+use pyrefly_util::lock::Mutex;
+use starlark_map::small_map::SmallMap;
+use tracing::warn;
+
+use crate::config::config::ConfigFile;
+use crate::config::config::ProjectLayout;
+use crate::config::finder::ConfigError;
+use crate::config::finder::ConfigFinder;
+use crate::config::finder::debug_log;
+use crate::module::bundled::BundledStub;
+use crate::module::third_party::BundledThirdParty;
+use crate::module::typeshed::BundledTypeshedStdlib;
+use crate::module::typeshed_third_party::BundledTypeshedThirdParty;
+
+/// A function that wraps a [`ConfigConfigurer`] with additional behavior.
+/// The function receives the "inner" configurer and returns a wrapped configurer
+/// that applies custom settings before delegating to the inner one.
+pub type ConfigConfigurerWrapper =
+    Arc<dyn Fn(Arc<dyn ConfigConfigurer>) -> Arc<dyn ConfigConfigurer> + Send + Sync>;
+
+/// Finalizes a config before being returned by a [`ConfigFinder`].
+pub trait ConfigConfigurer: Send + Sync + 'static {
+    /// Sets additional options on, and calls configure to finalize and validate
+    /// [`ConfigFile`]s before being returned.
+    ///
+    /// `root` is the root of the project (directory the config/marker file was found in or
+    /// directory of the Python file we're loading this config for, if no config/marker).
+    /// This may be `None` if [`Path::parent()`] doesn't exist or if it's irrelevant
+    /// (bundled typeshed).
+    ///
+    /// `config` is the configuration loaded from disk or constructed by the
+    /// [`standard_config_finder`] when no config can be found.
+    ///
+    /// `errors` are any errors that occurred while parsing the config. Any
+    /// new errors that occur as a result of configuring should be added to `errors`
+    /// and handled in the same manner. In most cases, this means appending any
+    /// errors to `errors` then returning `errors`. Note:
+    /// - If `configure` handles outputting error information, it is recommended
+    ///   to [`Vec::clear()`] the errors to avoid duplicate error message output.
+    /// - If the `configure` function should handle outputting error information,
+    ///   ensure any pre-existing parse errors in `errors` are also output.
+    ///
+    /// Returns a tuple containing the completed [`ConfigFile`] and any [`ConfigError`]s
+    /// that occurred during parsing or configuring that weren't already output during
+    /// this [`Self::configure`] call.
+    fn configure(
+        &self,
+        root: Option<&Path>,
+        config: ConfigFile,
+        errors: Vec<ConfigError>,
+    ) -> (ArcId<ConfigFile>, Vec<ConfigError>);
+}
+
+/// A basic [`ConfigConfigurer`] implementation that only calls [`ConfigFile::configure_at()`]
+/// and returns the configured config. Any errors are ignored, and an empty [`Vec<ConfigError>`]
+/// is always returned.
+pub struct DefaultConfigConfigurer {}
+
+impl ConfigConfigurer for DefaultConfigConfigurer {
+    fn configure(
+        &self,
+        root: Option<&std::path::Path>,
+        mut config: ConfigFile,
+        _: Vec<pyrefly_config::finder::ConfigError>,
+    ) -> (ArcId<ConfigFile>, Vec<ConfigError>) {
+        // The CLI never has an explicit IDE override, so always pass
+        // `Auto` and let the resolver auto-detect.
+        apply_unconfigured_resolver_if_applicable(&mut config, root, UnconfiguredOverride::Auto);
+        config.configure_at(root);
+        (ArcId::new(config), Vec::new())
+    }
+}
+
+/// If `config` was synthesized (no real `pyrefly.toml` / `[tool.pyrefly]`)
+/// and has not yet been touched by the unconfigured resolver, replace it
+/// with `resolve_unconfigured_config(root, over)` while preserving the
+/// project layout fields the synthesized config already established
+/// (`source`, `import_root`, `fallback_search_path`, default
+/// `project_includes`), as well as `extended_config_paths`, so that a
+/// config whose `extends` chain failed to load is reloaded when the chain
+/// changes.
+///
+/// No-op for configs loaded from a real file or already carrying a
+/// preset/reason — the function is idempotent and safe to call from
+/// every configurer. Used by [`DefaultConfigConfigurer`] (CLI) and
+/// `WorkspaceConfigConfigurer` (LSP) so both paths produce identical
+/// synthesized configs. `get_project_config_for_current_dir` invokes
+/// it directly on the `init_at_root` fallback so that `pyrefly check`
+/// (project mode) reaches the resolver too — without that direct call,
+/// project-mode configs would skip the migration / preset wiring that
+/// the file-mode path gets through the configurer.
+pub(crate) fn apply_unconfigured_resolver_if_applicable(
+    config: &mut ConfigFile,
+    root: Option<&Path>,
+    over: UnconfiguredOverride,
+) {
+    if matches!(config.source, ConfigSource::File(_))
+        || config.root.preset.is_some()
+        || config.synthesized_preset_reason.is_some()
+    {
+        return;
+    }
+    let Some(root_dir) = root else {
+        return;
+    };
+    let mut resolved = resolve_unconfigured_config(root_dir, over);
+    // Carry over the project-layout fields the synthesized config already
+    // computed.
+    resolved.import_root = config.import_root.take();
+    resolved.fallback_search_path = std::mem::take(&mut config.fallback_search_path);
+    resolved.source = std::mem::take(&mut config.source);
+    resolved.extended_config_paths = std::mem::take(&mut config.extended_config_paths);
+    // Absolutize any relative paths the migration produced (mypy's
+    // `files = src, test`, pyright's `extraPaths`, etc.) against the
+    // project root. `import_root` and `fallback_search_path` are already
+    // absolute so the helper is a no-op for them.
+    resolved.rewrite_with_path_to_config(root_dir);
+    *config = resolved;
+}
+
+/// Gives each PEP 723 script under a config that sets `script-command` its own config, which takes
+/// every setting from the script's directory config except the Python environment: that is the
+/// environment that the script command reports for the script.
+struct ScriptEnvironments {
+    configure: Arc<dyn ConfigConfigurer>,
+    /// Runs a script command to find the interpreter of a script's environment, or `None` if it
+    /// does not exist.
+    find_interpreter: fn(&[String], &Path) -> anyhow::Result<Option<PathBuf>>,
+    /// The config of each Python file under a config that sets `script-command`. An entry is valid
+    /// while the file's modification time and directory config are unchanged, so an edit to a
+    /// script's metadata block takes effect.
+    files: Mutex<SmallMap<PathBuf, Arc<FileEnvironment>>>,
+}
+
+struct FileEnvironment {
+    modified: SystemTime,
+    directory_config: ArcId<ConfigFile>,
+    /// Concurrent lookups of one entry wait for the first one, so the script command runs once
+    /// per entry.
+    config: OnceLock<ArcId<ConfigFile>>,
+}
+
+impl ScriptEnvironments {
+    fn new(configure: Arc<dyn ConfigConfigurer>) -> Self {
+        Self {
+            configure,
+            find_interpreter: script::interpreter,
+            files: Mutex::new(SmallMap::new()),
+        }
+    }
+
+    fn clear(&self) {
+        self.files.lock().clear();
+    }
+
+    /// The config for the Python file at `path`, whose directory config is `directory_config`.
+    fn config(&self, directory_config: ArcId<ConfigFile>, path: &ModulePath) -> ArcId<ConfigFile> {
+        let Some(command) = &directory_config.script_command else {
+            return directory_config;
+        };
+        let file = match path.details() {
+            ModulePathDetails::FileSystem(file) | ModulePathDetails::Memory(file) => file.as_path(),
+            ModulePathDetails::Namespace(_)
+            | ModulePathDetails::BundledTypeshed(_)
+            | ModulePathDetails::BundledTypeshedThirdParty(_)
+            | ModulePathDetails::BundledThirdParty(_) => return directory_config,
+        };
+        // Installed packages and the standard library are never scripts.
+        if file.extension().is_none_or(|extension| extension != "py")
+            || directory_config
+                .site_package_path()
+                .chain(&directory_config.python_environment.interpreter_stdlib_path)
+                .any(|root| file.starts_with(root))
+        {
+            return directory_config;
+        }
+        let Ok(modified) = fs::metadata(file).and_then(|metadata| metadata.modified()) else {
+            return directory_config;
+        };
+        let entry = {
+            let mut files = self.files.lock();
+            match files.get(file) {
+                Some(entry)
+                    if entry.modified == modified && entry.directory_config == directory_config =>
+                {
+                    entry.dupe()
+                }
+                _ => {
+                    let entry = Arc::new(FileEnvironment {
+                        modified,
+                        directory_config: directory_config.dupe(),
+                        config: OnceLock::new(),
+                    });
+                    files.insert(file.to_path_buf(), entry.dupe());
+                    entry
+                }
+            }
+        };
+        entry
+            .config
+            .get_or_init(|| {
+                self.script_config(&directory_config, command, file)
+                    .unwrap_or_else(|| directory_config.dupe())
+            })
+            .dupe()
+    }
+
+    /// The config for `file` if it is a PEP 723 script whose environment exists: its directory
+    /// config, loaded again with the interpreter of the script's environment.
+    fn script_config(
+        &self,
+        directory_config: &ConfigFile,
+        command: &[String],
+        file: &Path,
+    ) -> Option<ArcId<ConfigFile>> {
+        let config_path = match &directory_config.source {
+            ConfigSource::File(path)
+            | ConfigSource::FailedParse(path)
+            | ConfigSource::PythonToolMarker(path)
+            | ConfigSource::Marker(path) => path,
+            // There is no config file to load again with the script's interpreter. `uv check
+            // --script` sets `VIRTUAL_ENV` to the environment of a standalone script.
+            ConfigSource::Synthetic(_) => return None,
+        };
+        script::metadata(&fs::read_to_string(file).ok()?)?;
+        let interpreter = match (self.find_interpreter)(command, file) {
+            Ok(Some(interpreter)) => interpreter,
+            Ok(None) => {
+                warn!(
+                    "PEP 723 script `{}` has no environment, so Pyrefly checks it in its project's environment.",
+                    file.display()
+                );
+                return None;
+            }
+            Err(error) => {
+                warn!("{error:#}");
+                return None;
+            }
+        };
+        // The directory config already reported any errors in the file.
+        let (mut config, _) = ConfigFile::from_file(config_path);
+        config.interpreters.select_python_interpreter(interpreter);
+        let (config, errors) = self
+            .configure
+            .configure(config_path.parent(), config, Vec::new());
+        debug_log(errors);
+        Some(config)
+    }
+}
+
+/// A config finder that returns `config` for every Python file, except that a PEP 723 script gets
+/// its own environment when `config` sets `script-command`. `args` and `wrapper` must be the ones
+/// that produced `config`.
+pub fn constant_config_finder(
+    config: ArcId<ConfigFile>,
+    args: ConfigOverrideArgs,
+    wrapper: Option<ConfigConfigurerWrapper>,
+) -> ConfigFinder {
+    let configure: Arc<dyn ConfigConfigurer> =
+        Arc::new(DefaultConfigConfigurerWithOverrides::new(args, false));
+    let configure = match wrapper {
+        Some(wrap) => wrap(configure),
+        None => configure,
+    };
+    let scripts = ScriptEnvironments::new(configure);
+    ConfigFinder::new_constant_with_file(
+        config,
+        Box::new(move |config, path| scripts.config(config, path)),
+    )
+}
+
+pub fn default_config_finder(wrapper: Option<ConfigConfigurerWrapper>) -> ConfigFinder {
+    standard_config_finder(Arc::new(DefaultConfigConfigurer {}), wrapper)
+}
+
+struct DefaultConfigConfigurerWithOverrides {
+    args: ConfigOverrideArgs,
+    ignore_errors: bool,
+}
+
+impl DefaultConfigConfigurerWithOverrides {
+    fn new(args: ConfigOverrideArgs, ignore_errors: bool) -> Self {
+        Self {
+            args,
+            ignore_errors,
+        }
+    }
+}
+
+impl ConfigConfigurer for DefaultConfigConfigurerWithOverrides {
+    fn configure(
+        &self,
+        root: Option<&Path>,
+        mut config: ConfigFile,
+        mut errors: Vec<ConfigError>,
+    ) -> (ArcId<ConfigFile>, Vec<ConfigError>) {
+        apply_unconfigured_resolver_if_applicable(&mut config, root, self.args.preset().into());
+        let (c, mut configure_errors) = self.args.override_config_at(config, root);
+        if self.ignore_errors {
+            errors.clear();
+        } else {
+            errors.append(&mut configure_errors);
+        }
+        (c, errors)
+    }
+}
+
+pub fn default_config_finder_with_overrides(
+    args: ConfigOverrideArgs,
+    ignore_errors: bool,
+    wrapper: Option<ConfigConfigurerWrapper>,
+) -> ConfigFinder {
+    standard_config_finder(
+        Arc::new(DefaultConfigConfigurerWithOverrides::new(
+            args,
+            ignore_errors,
+        )),
+        wrapper,
+    )
+}
+
+/// Create a standard `ConfigFinder`, using the provided [`ConfigConfigurer`] to finalize
+/// the config before caching/returning it.
+///
+/// If `wrapper` is provided, it wraps the `configure` with additional behavior
+/// (e.g., applying internal-specific defaults) before delegation.
+pub fn standard_config_finder(
+    configure: Arc<dyn ConfigConfigurer>,
+    wrapper: Option<ConfigConfigurerWrapper>,
+) -> ConfigFinder {
+    let configure = match wrapper {
+        Some(wrap) => wrap(configure),
+        None => configure,
+    };
+    let configure2 = configure.dupe();
+    let configure3 = configure.dupe();
+    let scripts = Arc::new(ScriptEnvironments::new(configure.dupe()));
+    let scripts2 = scripts.dupe();
+
+    // A cache where path `p` maps to config file with `search_path = [p]`. If we can find the root.
+    let cache_one: Arc<Mutex<SmallMap<PathBuf, ArcId<ConfigFile>>>> =
+        Arc::new(Mutex::new(SmallMap::new()));
+    // A cache where path `p` maps to config file with
+    // `fallback_search_path = [p, p/.., p/../.., ...]`.
+    let cache_parents: Arc<Mutex<SmallMap<PathBuf, ArcId<ConfigFile>>>> =
+        Arc::new(Mutex::new(SmallMap::new()));
+    // A cache where path `p` maps to search paths from `p` to the nearest on-disk config,
+    // marker file, or filesystem root. Used as the `fallback_search_path` in `cache_parents`.
+    let cache_ancestors: Arc<DirectoryRelativeFallbackSearchPathCache> =
+        Arc::new(DirectoryRelativeFallbackSearchPathCache::new(None));
+
+    // Single-slot cache for the synthesized config used by parent-less
+    // paths (the rare `/`, empty memory paths, etc.). Populated lazily
+    // on first lookup, cleared by `clear_extra_caches` on
+    // `did_change_configuration` — the configurer reads workspace
+    // state (e.g. `typeCheckingMode`), so the cache must reset when
+    // that state changes or it would freeze the override at whatever
+    // value was active on first call.
+    let cache_empty: Arc<Mutex<Option<ArcId<ConfigFile>>>> = Arc::new(Mutex::new(None));
+
+    let clear_extra_caches = {
+        let scripts = scripts.dupe();
+        let cache_one = cache_one.dupe();
+        let cache_parents = cache_parents.dupe();
+        let cache_ancestors = cache_ancestors.dupe();
+        let cache_empty = cache_empty.dupe();
+        Box::new(move || {
+            scripts.clear();
+            cache_one.lock().clear();
+            cache_parents.lock().clear();
+            cache_ancestors.clear();
+            *cache_empty.lock() = None;
+            GENERATED_FILE_CONFIG_OVERRIDE.write().clear();
+        })
+    };
+
+    let empty = move || -> (ArcId<ConfigFile>, Vec<ConfigError>) {
+        let mut cache = cache_empty.lock();
+        if let Some(config) = cache.as_ref() {
+            return (config.dupe(), Vec::new());
+        }
+        let (config, errors) = configure3.configure(None, ConfigFile::default(), vec![]);
+        *cache = Some(config.dupe());
+        (config, errors)
+    };
+
+    ConfigFinder::new_custom(
+        Box::new(move |_, path| {
+            Ok(GENERATED_FILE_CONFIG_OVERRIDE
+                .read()
+                .get(&path.module_path_buf())
+                .cloned())
+        }),
+        Box::new(move |file| {
+            let (file_config, parse_errors) = ConfigFile::from_file(file);
+            let (config, validation_errors) =
+                configure.configure(file.parent(), file_config, parse_errors);
+            (config, validation_errors)
+        }),
+        // Fall back to using a default config, but let's see if we can make the `search_path` somewhat useful
+        // based on a few heuristics.
+        Box::new(
+            move |module_kind, path| -> (ArcId<ConfigFile>, Vec<ConfigError>) {
+                let name = module_kind.name();
+                let is_fallback = module_kind.is_fallback();
+                match path.root_of(name) {
+                    // We were able to walk up `path` and match each component of `name` to a directory until we ran out.
+                    // That means the resulting path is likely the root of the 'project', and should therefore be its `search_path`.
+                    Some(path) if !is_fallback => {
+                        let mut cache = cache_one.lock();
+                        if let Some(config) = cache.get(&path) {
+                            return (config.dupe(), Vec::new());
+                        }
+                        let (config, errors) = configure2.configure(
+                            Some(&path),
+                            ConfigFile::init_at_root(&path, &ProjectLayout::Flat, true),
+                            vec![],
+                        );
+                        cache.insert(path, config.dupe());
+                        (config, errors)
+                    }
+
+                    // We couldn't walk up and find a possible root of the project, so let's try to create a search
+                    // path that is still useful for this import by including all of its parents.
+                    _ => {
+                        let parent = match path.details() {
+                            ModulePathDetails::FileSystem(x) | ModulePathDetails::Memory(x) => {
+                                if let Some(path) = x.parent() {
+                                    path
+                                } else {
+                                    return empty();
+                                }
+                            }
+                            ModulePathDetails::Namespace(x) => x.as_path(),
+                            ModulePathDetails::BundledTypeshed(_) => {
+                                return (BundledTypeshedStdlib::config(), Vec::new());
+                            }
+                            ModulePathDetails::BundledTypeshedThirdParty(_) => {
+                                return (BundledTypeshedThirdParty::config(), Vec::new());
+                            }
+                            ModulePathDetails::BundledThirdParty(_) => {
+                                return (BundledThirdParty::config(), Vec::new());
+                            }
+                        };
+                        let mut cache = cache_parents.lock();
+                        if let Some(config) = cache.get(parent) {
+                            return (config.dupe(), Vec::new());
+                        }
+                        let fallback_search_path =
+                            FallbackSearchPath::Explicit(cache_ancestors.get_ancestors(parent));
+                        let mut config = ConfigFile {
+                            source: ConfigSource::Synthetic(Some(parent.to_owned())),
+                            project_includes: ConfigFile::default_project_includes(),
+                            // We use `fallback_search_path` because otherwise a user with `/sys` on their
+                            // computer (all of them) will override `sys.version` in preference to typeshed.
+                            fallback_search_path,
+                            root: ConfigBase::default_for_ide_without_config(),
+                            ..Default::default()
+                        };
+                        config.rewrite_with_path_to_config(parent);
+                        let (config, errors) = configure2.configure(Some(parent), config, vec![]);
+                        cache.insert(parent.to_owned(), config.dupe());
+                        (config, errors)
+                    }
+                }
+            },
+        ),
+        Box::new(move |config, path| scripts2.config(config, path)),
+        clear_extra_caches,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::fs;
+    use std::ops::Deref as _;
+
+    use clap::Parser;
+    use pretty_assertions::assert_eq;
+    use pyrefly_config::args::ConfigOverrideArgs;
+    use pyrefly_config::config::ConfigScope;
+    use pyrefly_python::module_name::ModuleName;
+    use pyrefly_python::module_name::ModuleNameWithKind;
+    use pyrefly_python::module_path::ModulePath;
+    use pyrefly_python::module_path::ModulePathDetails;
+    use pyrefly_python::sys_info::PythonVersion;
+    use pyrefly_util::includes::Includes;
+    use pyrefly_util::test_path::TestPath;
+    use pyrefly_util::thread_pool::ThreadCount;
+
+    use super::*;
+    use crate::commands::check::Handles;
+    use crate::config::config::ConfigSource;
+    use crate::config::environment::environment::PythonEnvironment;
+    use crate::module::finder::DirEntryCache;
+    use crate::module::finder::FindImportOptions;
+    use crate::module::finder::find_import;
+    use crate::state::require::Require;
+    use crate::state::state::State;
+
+    struct TestConfigurer(
+        Box<
+            dyn Fn(
+                    Option<&Path>,
+                    ConfigFile,
+                    Vec<ConfigError>,
+                ) -> (ArcId<ConfigFile>, Vec<ConfigError>)
+                + Send
+                + Sync,
+        >,
+    );
+
+    impl TestConfigurer {
+        fn new_standard(
+            f: impl Fn(
+                Option<&Path>,
+                ConfigFile,
+                Vec<ConfigError>,
+            ) -> (ArcId<ConfigFile>, Vec<ConfigError>)
+            + Send
+            + Sync
+            + 'static,
+        ) -> ConfigFinder {
+            standard_config_finder(Arc::new(TestConfigurer(Box::new(f))), None)
+        }
+    }
+
+    impl ConfigConfigurer for TestConfigurer {
+        fn configure(
+            &self,
+            root: Option<&Path>,
+            config: ConfigFile,
+            errors: Vec<ConfigError>,
+        ) -> (ArcId<ConfigFile>, Vec<ConfigError>) {
+            (self.0)(root, config, errors)
+        }
+    }
+
+    fn script_environments(
+        find_interpreter: fn(&[String], &Path) -> anyhow::Result<Option<PathBuf>>,
+    ) -> ScriptEnvironments {
+        ScriptEnvironments {
+            find_interpreter,
+            ..ScriptEnvironments::new(Arc::new(DefaultConfigConfigurer {}))
+        }
+    }
+
+    /// The config of a project whose `pyproject.toml` sets `script-command`.
+    fn directory_config(root: &Path) -> ArcId<ConfigFile> {
+        let pyproject = root.join("pyproject.toml");
+        fs::write(&pyproject, "[tool.pyrefly]\nscript-command = [\"uv\", \"workspace\", \"metadata\", \"--script\"]\n").unwrap();
+        let (config, _) = ConfigFile::from_file(&pyproject);
+        DefaultConfigConfigurer {}
+            .configure(Some(root), config, Vec::new())
+            .0
+    }
+
+    #[test]
+    fn test_script_environment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let script = root.join("script.py");
+        let module = root.join("module.py");
+        fs::write(
+            &script,
+            "# /// script\n# dependencies = [\"six\"]\n# ///\nimport six\n",
+        )
+        .unwrap();
+        fs::write(&module, "import six\n").unwrap();
+        let scripts =
+            script_environments(|_, _| Ok(Some(PathBuf::from("/script-environment/bin/python"))));
+        let directory = directory_config(root);
+        assert!(directory.script_command.is_some());
+
+        let script_config =
+            scripts.config(directory.dupe(), &ModulePath::filesystem(script.clone()));
+        assert_ne!(script_config, directory, "a script gets its own config");
+        assert_eq!(
+            script_config.interpreters.to_string(),
+            "/script-environment/bin/python",
+            "a script runs in the interpreter of its uv environment",
+        );
+        assert_eq!(
+            scripts.config(directory.dupe(), &ModulePath::filesystem(script)),
+            script_config,
+            "an unchanged script reuses its config",
+        );
+        assert_eq!(
+            scripts.config(directory.dupe(), &ModulePath::filesystem(module)),
+            directory,
+            "a file without a script block uses its directory config",
+        );
+    }
+
+    #[test]
+    fn test_script_without_environment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let script = root.join("script.py");
+        fs::write(&script, "# /// script\n# ///\n").unwrap();
+        let scripts = script_environments(|_, _| Ok(None));
+        let directory = directory_config(root);
+        assert_eq!(
+            scripts.config(directory.dupe(), &ModulePath::filesystem(script)),
+            directory,
+            "a script without an environment uses its directory config",
+        );
+    }
+
+    #[test]
+    fn test_site_package_path_from_environment() {
+        let args = ConfigOverrideArgs::default();
+        let config = TestConfigurer::new_standard(move |_, x, _| args.override_config(x))
+            .python_file(
+                ModuleNameWithKind::guaranteed(ModuleName::unknown()),
+                &ModulePath::filesystem("".into()),
+            );
+        let env = PythonEnvironment::get_default_interpreter_env();
+        if let Some(paths) = env.site_package_path {
+            for p in paths {
+                assert!(config.site_package_path().collect::<Vec<_>>().contains(&&p));
+            }
+        }
+    }
+
+    #[test]
+    fn test_fallback_search_path_fallback() {
+        fn finder(
+            expect_dir: Option<&Path>,
+            module_name: ModuleName,
+            module_path: ModulePath,
+        ) -> ArcId<ConfigFile> {
+            let expect_dir = expect_dir.map(|p| p.to_path_buf());
+            let module_path2 = module_path.clone();
+            TestConfigurer::new_standard(move |dir, x, _| {
+                assert_eq!(
+                    dir.map(|p| p.to_path_buf()),
+                    expect_dir,
+                    "failed for {expect_dir:?}, {module_name}, {module_path}"
+                );
+                (ArcId::new(x), Vec::new())
+            })
+            .python_file(ModuleNameWithKind::guaranteed(module_name), &module_path2)
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::dir(
+                    "with_config",
+                    vec![
+                        TestPath::file("pyrefly.toml"),
+                        TestPath::dir("foo", vec![TestPath::file("bar.py")]),
+                    ],
+                ),
+                TestPath::dir(
+                    "no_config",
+                    vec![TestPath::dir("foo", vec![TestPath::file("bar.py")])],
+                ),
+            ],
+        );
+
+        // we shouldn't do anything to the search path when we found a config file on disk
+        let config_file = finder(
+            Some(&root.join("with_config")),
+            ModuleName::from_str("foo.bar"),
+            ModulePath::filesystem(root.join("with_config/foo/bar.py")),
+        );
+        assert_eq!(
+            config_file.source,
+            ConfigSource::File(root.join("with_config/pyrefly.toml"))
+        );
+        assert_eq!(
+            config_file.search_path().cloned().collect::<Vec<_>>(),
+            vec![root.join("with_config")]
+        );
+        assert_eq!(config_file.fallback_search_path, FallbackSearchPath::Empty);
+
+        // we should get a synthetic config rooted at the inferred import root
+        let config_file = finder(
+            Some(&root.join("no_config")),
+            ModuleName::from_str("foo.bar"),
+            ModulePath::filesystem(root.join("no_config/foo/bar.py")),
+        );
+        assert_eq!(
+            config_file.source,
+            ConfigSource::Synthetic(Some(root.join("no_config")))
+        );
+        assert_eq!(
+            config_file.search_path().cloned().collect::<Vec<_>>(),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            config_file.fallback_search_path,
+            FallbackSearchPath::Explicit(Arc::new(vec![root.join("no_config")])),
+        );
+
+        // check invalid module path parent
+        assert_eq!(
+            finder(
+                None,
+                ModuleName::from_str("foo.bar"),
+                ModulePath::filesystem(PathBuf::from("/")),
+            )
+            .deref(),
+            &ConfigFile::default(),
+        );
+
+        // check typeshed
+        assert_eq!(
+            finder(
+                None,
+                ModuleName::from_str("foo.bar"),
+                ModulePath::bundled_typeshed(PathBuf::from("bundled_typeshed")),
+            ),
+            BundledTypeshedStdlib::config(),
+        );
+
+        // check namespace
+        let config_file = finder(
+            Some(&root.join("no_config/foo")),
+            ModuleName::unknown(),
+            ModulePath::namespace(root.join("no_config/foo")),
+        );
+        assert_eq!(
+            config_file.source,
+            ConfigSource::Synthetic(Some(root.join("no_config/foo")))
+        );
+        assert_eq!(config_file.search_path_from_file, Vec::<PathBuf>::new());
+        assert_eq!(
+            config_file.fallback_search_path,
+            FallbackSearchPath::Explicit(Arc::new(
+                [root.join("no_config/foo"), root.join("no_config")]
+                    .into_iter()
+                    .chain(root.ancestors().map(PathBuf::from))
+                    .collect::<Vec<PathBuf>>()
+            )),
+        );
+
+        // check filesystem/memory
+        let config_file = finder(
+            Some(&root.join("no_config/foo")),
+            ModuleName::unknown(),
+            ModulePath::filesystem(root.join("no_config/foo/bar.py")),
+        );
+        assert_eq!(
+            config_file.source,
+            ConfigSource::Synthetic(Some(root.join("no_config/foo")))
+        );
+        assert_eq!(config_file.search_path_from_file, Vec::<PathBuf>::new());
+        assert_eq!(
+            config_file.fallback_search_path,
+            FallbackSearchPath::Explicit(Arc::new(
+                [root.join("no_config/foo"), root.join("no_config")]
+                    .into_iter()
+                    .chain(root.ancestors().map(PathBuf::from))
+                    .collect::<Vec<PathBuf>>()
+            )),
+        );
+    }
+
+    /// gh-4132: CLI handles must derive module names via the config's fallback
+    /// search path, so files in a config-less directory don't become `__unknown__`.
+    #[test]
+    fn test_handles_all_uses_fallback_search_path() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(root, vec![TestPath::file("foo.py")]);
+
+        let finder = TestConfigurer::new_standard(|_, x, _| {
+            ConfigOverrideArgs::default().override_config(x)
+        });
+        let (handles, _, _) = Handles::new(vec![root.join("foo.py")]).all(&finder);
+        assert_eq!(handles[0].module(), ModuleName::from_str("foo"));
+    }
+
+    #[test]
+    fn test_site_package_dependency_uses_same_bundled_stub_as_importer() {
+        // project/
+        //   |- foo.py ("import pandas")
+        // site-packages/
+        //   |- dependency.py ("import pandas")
+        //   |- pandas/
+        //        |- __init__.py (empty)
+        //
+        // The pandas imports in foo.py and dependency.py should both resolve to pyrefly's bundled
+        // pandas stubs, not site-packages/pandas/.
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let project = root.join("project");
+        let site_packages = root.join("site-packages");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(site_packages.join("pandas")).unwrap();
+        let foo = project.join("foo.py");
+        let dependency = site_packages.join("dependency.py");
+        fs::write(&foo, "import pandas\n").unwrap();
+        fs::write(&dependency, "import pandas\n").unwrap();
+        fs::write(site_packages.join("pandas").join("__init__.py"), "").unwrap();
+
+        let site_packages_for_config = site_packages.clone();
+        let finder = TestConfigurer::new_standard(move |root, mut config, mut errors| {
+            config.interpreters.skip_interpreter_query = true;
+            config.python_environment.site_package_path =
+                Some(vec![site_packages_for_config.clone()]);
+            errors.extend(config.configure_at(root));
+            (ArcId::new(config), errors)
+        });
+        let foo_path = ModulePath::filesystem(foo);
+        let dependency_path = ModulePath::filesystem(dependency);
+        let foo_config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("foo")),
+            &foo_path,
+        );
+        let dependency_config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("dependency")),
+            &dependency_path,
+        );
+        let resolve_pandas = |config: &ConfigFile, origin: &ModulePath| {
+            find_import(
+                config,
+                ModuleName::from_str("pandas"),
+                FindImportOptions {
+                    origin: Some(origin),
+                    ..FindImportOptions::new(&DirEntryCache::new())
+                },
+            )
+            .finding()
+            .unwrap()
+        };
+        let foo_pandas = resolve_pandas(&foo_config, &foo_path);
+        let dependency_pandas = resolve_pandas(&dependency_config, &dependency_path);
+
+        assert!(
+            matches!(
+                foo_pandas.details(),
+                ModulePathDetails::BundledThirdParty(_)
+            ),
+            "expected foo.py to use bundled pandas stubs, got {foo_pandas:?}",
+        );
+        assert_eq!(dependency_pandas, foo_pandas);
+    }
+
+    #[test]
+    fn test_nested_site_package_root_does_not_shadow_bundled_stub() {
+        // site-packages/
+        //   |- vendoring/
+        //        |- _vendor/
+        //             |- thing.py ("import pandas")
+        //             |- pandas/
+        //                  |- __init__.py (empty)
+        //
+        // The guessed import root for thing.py is `site-packages/vendoring/_vendor`, which is
+        // nested inside site-packages rather than equal to it. A vendored pandas in that root is
+        // not on `sys.path`, so it must not take priority over pyrefly's bundled pandas stubs.
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        let site_packages = root.join("site-packages");
+        let vendor = site_packages.join("vendoring").join("_vendor");
+        fs::create_dir_all(vendor.join("pandas")).unwrap();
+        let thing = vendor.join("thing.py");
+        fs::write(&thing, "import pandas\n").unwrap();
+        fs::write(vendor.join("pandas").join("__init__.py"), "").unwrap();
+
+        let site_packages_for_config = site_packages.clone();
+        let finder = TestConfigurer::new_standard(move |root, mut config, mut errors| {
+            config.interpreters.skip_interpreter_query = true;
+            config.python_environment.site_package_path =
+                Some(vec![site_packages_for_config.clone()]);
+            errors.extend(config.configure_at(root));
+            (ArcId::new(config), errors)
+        });
+        let thing_path = ModulePath::filesystem(thing);
+        let thing_config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("thing")),
+            &thing_path,
+        );
+        assert_eq!(
+            thing_config.fallback_search_path,
+            FallbackSearchPath::Explicit(Arc::new(vec![vendor])),
+            "the guessed import root should be nested inside site-packages",
+        );
+
+        let pandas = find_import(
+            &thing_config,
+            ModuleName::from_str("pandas"),
+            FindImportOptions {
+                origin: Some(&thing_path),
+                ..FindImportOptions::new(&DirEntryCache::new())
+            },
+        )
+        .finding()
+        .unwrap();
+        assert!(
+            matches!(pandas.details(), ModulePathDetails::BundledThirdParty(_)),
+            "expected bundled pandas stubs, got {pandas:?}",
+        );
+    }
+
+    /// A real pyrefly.toml should always take priority over a pyproject.toml
+    /// with Python tool sections (e.g. [tool.ruff]) but no [tool.pyrefly].
+    /// Python tool markers help identify project roots, but they never
+    /// supersede explicit pyrefly configuration.
+    #[test]
+    fn test_pyrefly_toml_beats_python_tool_marker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        // Simulate: workspace/ has pyrefly.toml, click/ has pyproject.toml
+        // with [tool.ruff] but no [tool.pyrefly], using src layout.
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                // Parent workspace config
+                TestPath::file("pyrefly.toml"),
+                // Click project (src layout)
+                TestPath::dir(
+                    "click",
+                    vec![
+                        TestPath::file_with_contents(
+                            "pyproject.toml",
+                            "[project]\nname = \"click\"\n\n[tool.ruff]\nline-length = 88\n",
+                        ),
+                        TestPath::dir(
+                            "src",
+                            vec![TestPath::dir(
+                                "click",
+                                vec![
+                                    TestPath::file("__init__.py"),
+                                    TestPath::file("core.py"),
+                                    TestPath::file("types.py"),
+                                ],
+                            )],
+                        ),
+                    ],
+                ),
+            ],
+        );
+
+        let finder = TestConfigurer::new_standard(|_, x, _| (ArcId::new(x), Vec::new()));
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("click.core")),
+            &ModulePath::filesystem(root.join("click/src/click/core.py")),
+        );
+
+        // A real pyrefly.toml always takes priority over a pyproject.toml
+        // with Python tool sections but no [tool.pyrefly].
+        assert_eq!(
+            config.source,
+            ConfigSource::File(root.join("pyrefly.toml")),
+            "parent's pyrefly.toml should take priority over click's pyproject.toml with [tool.ruff]"
+        );
+    }
+
+    /// A pyproject.toml with Python tool sections (e.g. [tool.ruff]) should
+    /// take priority over a bare pyproject.toml (no tool sections) during
+    /// config discovery, because it's a stronger signal of a Python project root.
+    ///
+    /// On the click repo, this improves go-to-def accuracy by 15% (83% -> 98%).
+    #[test]
+    fn test_python_tool_marker_beats_bare_marker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        // Parent has pyproject.toml with [tool.ruff] (Python project root).
+        // Child has bare pyproject.toml (no tool sections).
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::file_with_contents(
+                    "pyproject.toml",
+                    "[project]\nname = \"workspace\"\n\n[tool.ruff]\nline-length = 88\n",
+                ),
+                TestPath::dir(
+                    "subdir",
+                    vec![
+                        TestPath::file_with_contents(
+                            "pyproject.toml",
+                            "[project]\nname = \"subproject\"\n",
+                        ),
+                        TestPath::dir("pkg", vec![TestPath::file("mod.py")]),
+                    ],
+                ),
+            ],
+        );
+
+        let finder = TestConfigurer::new_standard(|_, x, _| (ArcId::new(x), Vec::new()));
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("subdir/pkg/mod.py")),
+        );
+
+        // The parent's pyproject.toml with [tool.ruff] should win because
+        // PythonToolMarker (Group 2) takes priority over bare Marker (Group 3).
+        assert_eq!(
+            config.source,
+            ConfigSource::PythonToolMarker(root.join("pyproject.toml")),
+            "parent's pyproject.toml with [tool.ruff] should take priority over bare child pyproject.toml"
+        );
+    }
+
+    /// A bare pyproject.toml (no Python tool sections, no [tool.pyrefly]) should
+    /// NOT block a parent config — it remains in Group 3 as before.
+    #[test]
+    fn test_bare_pyproject_does_not_block_parent_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::file("pyrefly.toml"),
+                TestPath::dir(
+                    "subproject",
+                    vec![
+                        // Bare pyproject.toml — no [tool.*] sections at all.
+                        TestPath::file_with_contents(
+                            "pyproject.toml",
+                            "[project]\nname = \"subproject\"\n",
+                        ),
+                        TestPath::dir("pkg", vec![TestPath::file("mod.py")]),
+                    ],
+                ),
+            ],
+        );
+
+        let finder = TestConfigurer::new_standard(|_, x, _| (ArcId::new(x), Vec::new()));
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("subproject/pkg/mod.py")),
+        );
+
+        // A bare pyproject.toml is still Group 3, so the parent's pyrefly.toml
+        // (Group 1) takes precedence.
+        assert_eq!(config.source, ConfigSource::File(root.join("pyrefly.toml")));
+    }
+
+    /// Going through `default_config_finder` (which uses
+    /// [`DefaultConfigConfigurer`]) on an unconfigured project with no
+    /// nearby mypy/pyright config produces a config with the basic preset
+    /// and a `NoNearbyConfig` reason — proving the resolver wiring is
+    /// reached for the non-File path.
+    #[test]
+    fn test_unconfigured_project_gets_basic_preset() {
+        use pyrefly_config::base::Preset;
+        use pyrefly_config::config::FallbackSearchPath;
+        use pyrefly_config::config::SynthesizedPresetReason;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![TestPath::dir("pkg", vec![TestPath::file("mod.py")])],
+        );
+
+        let finder = default_config_finder(None);
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("pkg/mod.py")),
+        );
+
+        assert_eq!(
+            config.source,
+            ConfigSource::Synthetic(Some(root.to_path_buf()))
+        );
+        assert_eq!(config.root.preset, Some(Preset::Basic));
+        assert_eq!(
+            config.synthesized_preset_reason,
+            Some(SynthesizedPresetReason::NoNearbyConfig)
+        );
+        // Field-preservation guard: the cache_one path enters
+        // `apply_unconfigured_resolver_if_applicable` with a config
+        // whose `fallback_search_path` is already populated by
+        // `ConfigFile::init_at_root(_, _, fallback=true)`. The carry-
+        // over lines in the resolver are what keep that value through
+        // the swap to the resolver-fresh config; without them the
+        // resolver-fresh config's default `Empty` would land here and
+        // module resolution would lose the import-root fallback.
+        assert!(
+            matches!(config.fallback_search_path, FallbackSearchPath::Explicit(_)),
+            "carry-over lost `fallback_search_path` from input config; got {:?}",
+            config.fallback_search_path,
+        );
+    }
+
+    /// A checked target with synthesized configuration still reports the typeshed warning.
+    #[test]
+    fn test_unconfigured_project_reports_outdated_python_version_warning() {
+        use clap::Parser;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![TestPath::dir("pkg", vec![TestPath::file("mod.py")])],
+        );
+
+        let args = ConfigOverrideArgs::try_parse_from([
+            "pyrefly",
+            "--python-version",
+            "3.9",
+            "--skip-interpreter-query",
+        ])
+        .unwrap();
+        let finder = default_config_finder_with_overrides(args, false, None);
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("pkg/mod.py")),
+        );
+
+        assert_eq!(config.python_version(), PythonVersion::new(3, 9, 0));
+        let (_, _, sourcedb_errors) = Handles::new([root.join("pkg/mod.py")]).all(&finder);
+        assert!(sourcedb_errors.is_empty());
+        let messages: Vec<String> = finder
+            .errors()
+            .iter()
+            .map(|error| error.get_message())
+            .collect();
+        assert!(
+            messages.iter().any(|message| message
+                .contains("older than the oldest version described by the bundled typeshed stubs")),
+            "expected the outdated Python version warning from the synthesized config, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_typeshed_warning_with_external_dependency() {
+        for (version, warning_count) in [
+            (PythonVersion::new(3, 12, 0), 0),
+            (PythonVersion::new(3, 9, 0), 1),
+        ] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let project = tempdir.path().join("project");
+            let site_packages = tempdir.path().join("site-packages");
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&site_packages).unwrap();
+            fs::write(
+                project.join("pyrefly.toml"),
+                format!("python-version = \"{version}\"\n"),
+            )
+            .unwrap();
+            let main = project.join("main.py");
+            fs::write(&main, "import dependency\nvalue: int = dependency.value\n").unwrap();
+            fs::write(site_packages.join("dependency.py"), "value: int = 42\n").unwrap();
+
+            let finder = TestConfigurer::new_standard(move |root, mut config, mut errors| {
+                // Model an external Python 3.9 environment without querying a real interpreter.
+                config.interpreters.skip_interpreter_query = true;
+                config
+                    .python_environment
+                    .python_version
+                    .get_or_insert(PythonVersion::new(3, 9, 0));
+                config.python_environment.site_package_path = Some(vec![site_packages.clone()]);
+                errors.extend(config.configure_at(root));
+                (ArcId::new(config), errors)
+            });
+            let state = State::new(finder, ThreadCount::Inline);
+            let (handles, _, sourcedb_errors) = Handles::new([main]).all(state.config_finder());
+            assert!(sourcedb_errors.is_empty());
+            assert_eq!(handles[0].sys_info().version(), version);
+            let mut transaction = state.new_transaction(Require::Exports, None);
+            transaction.run(&handles, Require::Errors, None);
+            assert!(
+                transaction
+                    .get_errors(&handles)
+                    .collect_errors()
+                    .ordinary
+                    .is_empty()
+            );
+            let warnings = transaction.get_config_errors();
+            assert_eq!(warnings.len(), warning_count);
+        }
+    }
+
+    #[test]
+    fn test_typeshed_warning_for_multiple_target_directories() {
+        for configured in [false, true] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let mut files = Vec::new();
+            for directory in ["a", "b"] {
+                let root = tempdir.path().join(directory);
+                fs::create_dir_all(&root).unwrap();
+                let file = root.join("main.py");
+                fs::write(&file, "value: int = 42\n").unwrap();
+                files.push(file);
+                if configured {
+                    fs::write(root.join("pyrefly.toml"), "python-version = \"3.9\"\n").unwrap();
+                }
+            }
+            let args = ConfigOverrideArgs::try_parse_from([
+                "pyrefly",
+                "--python-version",
+                "3.9",
+                "--skip-interpreter-query",
+            ])
+            .unwrap();
+            let finder = default_config_finder_with_overrides(args, false, None);
+            let (_, _, sourcedb_errors) = Handles::new(files).all(&finder);
+            // Consumers of this slot treat any entry as a fatal source-database failure.
+            assert!(sourcedb_errors.is_empty());
+            assert_eq!(finder.errors().len(), if configured { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn test_unconfigured_project_under_hidden_dir_is_not_excluded() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().join(".codex/worktrees/wt/project");
+        fs::create_dir_all(&root).unwrap();
+        TestPath::setup_test_directory(
+            &root,
+            vec![TestPath::dir("pkg", vec![TestPath::file("mod.py")])],
+        );
+
+        let finder = default_config_finder(None);
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("pkg/mod.py")),
+        );
+
+        assert!(
+            config
+                .get_filtered_globs(None, ConfigScope::Default)
+                .covers(&root.join("pkg/mod.py"))
+        );
+    }
+
+    /// Same setup, but with a `mypy.ini` at the project root. The resolver
+    /// detects it, runs the in-memory mypy migration, and the resulting
+    /// config has `Preset::Legacy` plus the migrated mypy values
+    /// (`check_unannotated_defs = Some(true)`).
+    #[test]
+    fn test_unconfigured_project_with_mypy_ini_migrates() {
+        use pyrefly_config::base::Preset;
+        use pyrefly_config::config::SynthesizedPresetReason;
+        use pyrefly_config::migration::run::MigratedConfigSource;
+        use pyrefly_config::migration::run::MigratedFromKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::file_with_contents("mypy.ini", "[mypy]\ncheck_untyped_defs = True\n"),
+                TestPath::dir("pkg", vec![TestPath::file("mod.py")]),
+            ],
+        );
+
+        let finder = default_config_finder(None);
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("pkg/mod.py")),
+        );
+
+        assert_eq!(config.root.preset, Some(Preset::Legacy));
+        assert_eq!(
+            config.synthesized_preset_reason,
+            Some(SynthesizedPresetReason::Migrated(MigratedFromKind::Mypy(
+                MigratedConfigSource::DedicatedFile,
+            ))),
+        );
+        assert_eq!(
+            config.root.check_unannotated_defs,
+            Some(true),
+            "full migration: mypy's check_untyped_defs should flow through"
+        );
+    }
+
+    /// Same setup, but with `pyrightconfig.json` at the project root. The
+    /// resolver detects it and migrates pyright's settings; preset is left
+    /// at `None` (== Default behavior) per the migration's contract.
+    #[test]
+    fn test_unconfigured_project_with_pyrightconfig_migrates() {
+        use pyrefly_config::config::SynthesizedPresetReason;
+        use pyrefly_config::migration::run::MigratedConfigSource;
+        use pyrefly_config::migration::run::MigratedFromKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::file_with_contents(
+                    "pyrightconfig.json",
+                    r#"{ "include": ["pkg/**/*.py"] }"#,
+                ),
+                TestPath::dir("pkg", vec![TestPath::file("mod.py")]),
+            ],
+        );
+
+        let finder = default_config_finder(None);
+        let config = finder.python_file(
+            ModuleNameWithKind::guaranteed(ModuleName::from_str("pkg.mod")),
+            &ModulePath::filesystem(root.join("pkg/mod.py")),
+        );
+
+        assert_eq!(config.root.preset, None);
+        assert_eq!(
+            config.synthesized_preset_reason,
+            Some(SynthesizedPresetReason::Migrated(
+                MigratedFromKind::Pyright(MigratedConfigSource::DedicatedFile,)
+            )),
+        );
+    }
+
+    /// `standard_config_finder`'s parent-less fallback (the `empty`
+    /// cache) must invalidate when `ConfigFinder::clear()` runs. The
+    /// LSP triggers `clear()` on `did_change_configuration`, and a
+    /// stale `empty` would freeze the workspace's `typeCheckingMode`
+    /// at whatever it was on first lookup — making `Auto → Strict`
+    /// (or any other live update) silently invisible for any module
+    /// that resolves through `empty`.
+    ///
+    /// We exercise the bug with a configurer that reads a mutable
+    /// `Preset` from shared state, mimicking how
+    /// `WorkspaceConfigConfigurer` reads `workspace.type_checking_mode`.
+    #[test]
+    fn test_empty_cache_invalidates_on_clear() {
+        use std::sync::Mutex;
+
+        use pyrefly_config::base::Preset;
+
+        let workspace_preset = Arc::new(Mutex::new(Preset::Strict));
+        let workspace_preset_for_closure = workspace_preset.clone();
+        let finder = TestConfigurer::new_standard(move |_, mut config, _| {
+            config.root.preset = Some(*workspace_preset_for_closure.lock().unwrap());
+            (ArcId::new(config), Vec::new())
+        });
+
+        // `/` has no parent, so `python_file` routes to `empty.dupe()`.
+        let path = ModulePath::filesystem(PathBuf::from("/"));
+        let cfg1 = finder.python_file(ModuleNameWithKind::guaranteed(ModuleName::unknown()), &path);
+        assert_eq!(cfg1.root.preset, Some(Preset::Strict));
+
+        // Mutate the workspace state and tell the finder to reload —
+        // the same sequence the LSP runs on a config-change event.
+        *workspace_preset.lock().unwrap() = Preset::Basic;
+        finder.clear();
+
+        let cfg2 = finder.python_file(ModuleNameWithKind::guaranteed(ModuleName::unknown()), &path);
+        assert_eq!(
+            cfg2.root.preset,
+            Some(Preset::Basic),
+            "`empty` cache should reset on `ConfigFinder::clear`",
+        );
+    }
+}

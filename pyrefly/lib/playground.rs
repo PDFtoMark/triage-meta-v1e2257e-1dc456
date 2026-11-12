@@ -1,0 +1,1318 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::num::NonZeroU32;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use dupe::Dupe;
+use lsp_types::CompletionItem;
+use lsp_types::CompletionItemKind;
+use lsp_types::Contents;
+use lsp_types::DiagnosticTag;
+use lsp_types::SemanticTokens;
+use lsp_types::SemanticTokensLegend;
+use lsp_types::TextEdit;
+use pyrefly_build::handle::Handle;
+use pyrefly_build::source_db::map_db::MapDatabase;
+use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModulePath;
+use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_python::sys_info::SysInfo;
+use pyrefly_util::arc_id::ArcId;
+use pyrefly_util::lined_buffer::DisplayPos;
+use pyrefly_util::lined_buffer::DisplayRange;
+use pyrefly_util::lined_buffer::LineNumber;
+use pyrefly_util::lined_buffer::LinedBuffer;
+use pyrefly_util::prelude::VecExt;
+use pyrefly_util::thread_pool::ThreadCount;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use serde::Deserialize;
+use serde::Serialize;
+use starlark_map::small_map::SmallMap;
+
+use crate::config::config::ConfigFile;
+use crate::config::config::toml_error_span;
+use crate::config::error_kind::ShownSeverity;
+use crate::config::finder::ConfigFinder;
+use crate::lsp::wasm::hover::get_hover;
+use crate::memory_project::memory_config;
+use crate::state::load::FileContents;
+use crate::state::lsp::AllOffPartial;
+use crate::state::lsp::InlayHintConfig;
+use crate::state::require::Require;
+use crate::state::semantic_tokens::SemanticTokensLegends;
+use crate::state::state::State;
+use crate::state::state::Transaction;
+
+#[derive(Serialize)]
+pub struct Position {
+    #[serde(rename(serialize = "column"))]
+    pub column: i32,
+    #[serde(rename(serialize = "lineNumber"))]
+    pub line: i32,
+}
+
+impl Position {
+    pub fn new(line: i32, column: i32) -> Self {
+        Self { line, column }
+    }
+
+    fn from_display_pos(position: DisplayPos) -> Self {
+        Self {
+            line: position.line_within_file().get() as i32,
+            column: position.column().get() as i32,
+        }
+    }
+
+    // This should always succeed, but we are being conservative
+    fn to_display_pos(&self) -> Option<DisplayPos> {
+        Some(DisplayPos::Source {
+            line: LineNumber::new(u32::try_from(self.line).ok()?)?,
+            column: NonZeroU32::new(u32::try_from(self.column).ok()?)?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Range {
+    #[serde(rename(serialize = "startLineNumber", deserialize = "startLineNumber"))]
+    pub start_line: i32,
+    #[serde(rename(serialize = "startColumn", deserialize = "startColumn"))]
+    pub start_col: i32,
+    #[serde(rename(serialize = "endLineNumber", deserialize = "endLineNumber"))]
+    pub end_line: i32,
+    #[serde(rename(serialize = "endColumn", deserialize = "endColumn"))]
+    pub end_col: i32,
+}
+
+impl Range {
+    fn new(range: DisplayRange) -> Self {
+        Self {
+            start_line: range.start.line_within_file().get() as i32,
+            start_col: range.start.column().get() as i32,
+            end_line: range.end.line_within_file().get() as i32,
+            end_col: range.end.column().get() as i32,
+        }
+    }
+
+    /// Returns `None` for a range that is not valid, including one that ends before it starts.
+    fn to_display_range(&self) -> Option<DisplayRange> {
+        let start = DisplayPos::Source {
+            line: LineNumber::new(u32::try_from(self.start_line).ok()?)?,
+            column: NonZeroU32::new(u32::try_from(self.start_col).ok()?)?,
+        };
+        let end = DisplayPos::Source {
+            line: LineNumber::new(u32::try_from(self.end_line).ok()?)?,
+            column: NonZeroU32::new(u32::try_from(self.end_col).ok()?)?,
+        };
+        (start <= end).then_some(DisplayRange { start, end })
+    }
+}
+
+fn toml_parse_error_range(contents: &str, err: &anyhow::Error) -> (i32, i32, i32, i32) {
+    let Some(span) = toml_error_span::<ConfigFile>(contents, err) else {
+        return (1, 1, 1, 1);
+    };
+    // Delegate byte-offset -> (line, column) conversion to `LinedBuffer` so the
+    // config diagnostic uses the same UTF-scalar column convention as every other
+    // diagnostic and clamps offsets that land inside a multi-byte character.
+    let lined_buffer = LinedBuffer::new(Arc::new(contents.to_owned()));
+    let range = lined_buffer.display_range(
+        TextRange::new(
+            TextSize::new(span.start as u32),
+            TextSize::new(span.end as u32),
+        ),
+        None,
+    );
+    (
+        range.start.line_within_file().get() as i32,
+        range.start.column().get() as i32,
+        range.end.line_within_file().get() as i32,
+        range.end.column().get() as i32,
+    )
+}
+
+#[derive(Serialize, Clone)]
+pub struct Diagnostic {
+    #[serde(rename(serialize = "startLineNumber"))]
+    pub start_line: i32,
+    #[serde(rename(serialize = "startColumn"))]
+    pub start_col: i32,
+    #[serde(rename(serialize = "endLineNumber"))]
+    pub end_line: i32,
+    #[serde(rename(serialize = "endColumn"))]
+    pub end_col: i32,
+    pub message_header: String,
+    pub message_details: String,
+    pub kind: String,
+    pub severity: i32,
+    /// Monaco marker tags, which use the same numbers as LSP diagnostic tags.
+    pub tags: Vec<DiagnosticTag>,
+    pub filename: String,
+}
+
+/// A Monaco `ISingleEditOperation`.
+#[derive(Serialize)]
+pub struct CompletionTextEdit {
+    range: Range,
+    text: String,
+}
+
+#[derive(Serialize)]
+pub struct AutoCompletionItem {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// A Monaco `CompletionItemKind`, whose numbering differs from LSP's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<i32>,
+    #[serde(
+        rename(serialize = "sortText"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    sort_text: Option<String>,
+    /// Without these, accepting an import completion does nothing visible.
+    #[serde(
+        rename(serialize = "additionalTextEdits"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    import_edits: Option<Vec<CompletionTextEdit>>,
+}
+
+/// LSP and Monaco both number `CompletionItemKind`, but differently. Monaco's values:
+/// https://github.com/microsoft/vscode/blob/main/src/vs/editor/common/standalone/standaloneEnums.ts
+fn to_monaco_completion_kind(kind: CompletionItemKind) -> i32 {
+    match kind {
+        CompletionItemKind::Method => 0,
+        CompletionItemKind::Function => 1,
+        CompletionItemKind::Constructor => 2,
+        CompletionItemKind::Field => 3,
+        CompletionItemKind::Variable => 4,
+        CompletionItemKind::Class => 5,
+        CompletionItemKind::Struct => 6,
+        CompletionItemKind::Interface => 7,
+        CompletionItemKind::Module => 8,
+        CompletionItemKind::Property => 9,
+        CompletionItemKind::Event => 10,
+        CompletionItemKind::Operator => 11,
+        CompletionItemKind::Unit => 12,
+        CompletionItemKind::Value => 13,
+        CompletionItemKind::Constant => 14,
+        CompletionItemKind::Enum => 15,
+        CompletionItemKind::EnumMember => 16,
+        CompletionItemKind::Keyword => 17,
+        CompletionItemKind::Text => 18,
+        CompletionItemKind::Color => 19,
+        CompletionItemKind::File => 20,
+        CompletionItemKind::Reference => 21,
+        CompletionItemKind::Folder => 23,
+        CompletionItemKind::TypeParameter => 24,
+        CompletionItemKind::Snippet => 27,
+        _ => unreachable!("unknown LSP CompletionItemKind"),
+    }
+}
+
+/// A definition, in a sandbox file or in a file that comes with Pyrefly.
+#[derive(Serialize)]
+pub struct Location {
+    /// The sandbox filename, or the path of a stub that comes with Pyrefly.
+    filename: String,
+    range: Range,
+    /// The text of a file that is not a sandbox file, so that the sandbox can show it.
+    /// Set only when the caller asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contents: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MonacoHover {
+    contents: Vec<Contents>,
+}
+
+#[derive(Serialize)]
+pub struct InlayHint {
+    label: String,
+    position: Position,
+}
+
+pub struct Playground {
+    state: State,
+    handles: SmallMap<String, Handle>,
+    active_filename: String,
+    sys_info: SysInfo,
+    config_finder: ConfigFinder,
+    /// Diagnostics produced while loading/parsing configuration in the sandbox
+    config_diagnostics: Vec<Diagnostic>,
+}
+
+impl Playground {
+    pub fn new(python_version: Option<&str>) -> Result<Self, String> {
+        let (mut config, sys_info) = memory_config(python_version).map_err(|e| e.to_string())?;
+
+        config.configure();
+        let config = ArcId::new(config);
+        let config_finder = ConfigFinder::new_constant(config.dupe());
+
+        let state = State::new(config_finder, ThreadCount::default());
+        let config_finder_for_self = ConfigFinder::new_constant(config.dupe());
+
+        Ok(Self {
+            state,
+            handles: SmallMap::new(),
+            active_filename: String::new(),
+            sys_info,
+            config_finder: config_finder_for_self,
+            config_diagnostics: Vec::new(),
+        })
+    }
+
+    pub fn update_sandbox_files(
+        &mut self,
+        files: SmallMap<String, String>,
+        force_update: bool,
+    ) -> Option<String> {
+        self.config_diagnostics.clear();
+        // Parse configuration if present in the in-memory files
+        let mut parsed_config: Option<ConfigFile> = None;
+        if let Some(cfg_str) = files.get("pyrefly.toml") {
+            match ConfigFile::parse_config(cfg_str) {
+                Ok(cfg) => parsed_config = Some(cfg),
+                Err(err) => {
+                    let (start_line, start_col, end_line, end_col) =
+                        toml_parse_error_range(cfg_str, &err);
+                    // Attach a diagnostic to pyrefly.toml on parse/validation failure
+                    self.config_diagnostics.push(Diagnostic {
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        message_header: "TOML parse error".to_owned(),
+                        message_details: err.to_string(),
+                        kind: "parse-error".to_owned(),
+                        // MarkerSeverity.Error (8)
+                        severity: 8,
+                        tags: Vec::new(),
+                        filename: "pyrefly.toml".to_owned(),
+                    });
+                    if !force_update {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        self.handles.clear();
+        // Base configuration: use parsed config if available, otherwise defaults
+        let mut config = parsed_config.unwrap_or_default();
+        config.python_environment.set_empty_to_default();
+        config.interpreters.skip_interpreter_query = true;
+
+        // Determine runtime SysInfo from config (if provided) or previous value
+        let desired_version = config
+            .python_environment
+            .python_version
+            .unwrap_or(self.sys_info.version());
+        let desired_platform = self.sys_info.platform().clone();
+        self.sys_info = SysInfo::new(desired_version, desired_platform.clone());
+        config.python_environment.python_version = Some(self.sys_info.version());
+        config.python_environment.python_platform = Some(desired_platform);
+
+        // Build source DB from .py and .pyi files only
+        let mut file_contents = Vec::new();
+        let mut source_db = MapDatabase::new(self.sys_info.dupe());
+        for (filename, content) in &files {
+            if !filename.ends_with(".py") && !filename.ends_with(".pyi") {
+                continue;
+            }
+            let suffix = if filename.ends_with(".pyi") {
+                ".pyi"
+            } else {
+                ".py"
+            };
+            // Use from_relative_path to properly convert file paths like "folder/file.py"
+            // to module names like "folder.file" (instead of incorrectly creating "folder/file").
+            // Only the normal components count, so `./folder//file.py` and `/folder/file.py`
+            // give the same module name.
+            let relative_path: PathBuf = Path::new(filename.as_str())
+                .components()
+                .filter(|component| matches!(component, Component::Normal(_)))
+                .collect();
+            let module_name = ModuleName::from_relative_path(&relative_path).unwrap_or_else(|_| {
+                ModuleName::from_str(filename.strip_suffix(suffix).unwrap_or(filename))
+            });
+            let module_path = PathBuf::from(filename.clone());
+            let memory_path = ModulePath::memory(module_path.clone());
+
+            source_db.insert(module_name, memory_path.dupe());
+
+            let handle = Handle::new(module_name, memory_path, self.sys_info.dupe());
+            self.handles.insert(filename.clone(), handle);
+            file_contents.push((
+                module_path,
+                Some(Arc::new(FileContents::from_source(content.clone()))),
+            ));
+        }
+
+        config.source_db = Some(ArcId::new(Box::new(source_db)));
+
+        config.configure();
+        let config = ArcId::new(config);
+        let new_config_finder = ConfigFinder::new_constant(config.dupe());
+
+        self.state = State::new(new_config_finder, ThreadCount::default());
+        self.config_finder = ConfigFinder::new_constant(config.dupe());
+
+        if self.handles.contains_key("sandbox.py") {
+            self.active_filename = "sandbox.py".to_owned();
+        } else if let Some((first_filename, _)) = self.handles.first() {
+            self.active_filename = first_filename.clone();
+        }
+
+        let mut transaction = self
+            .state
+            .new_committable_transaction(Require::Exports, None);
+        transaction.as_mut().set_memory(file_contents);
+
+        let handles: Vec<Handle> = self.handles.values().map(|handle| handle.dupe()).collect();
+
+        self.state.run_with_committing_transaction(
+            transaction,
+            &handles,
+            Require::Everything,
+            None,
+            None,
+        );
+        Some(format!(
+            "{}.{}",
+            desired_version.major, desired_version.minor
+        ))
+    }
+
+    pub fn update_single_file(&mut self, filename: String, content: String) {
+        if let Some(_handle) = self.handles.get(&filename) {
+            let module_path = PathBuf::from(&filename);
+            let file_content = vec![(
+                module_path,
+                Some(Arc::new(FileContents::from_source(content))),
+            )];
+
+            let mut transaction = self
+                .state
+                .new_committable_transaction(Require::Exports, None);
+            transaction.as_mut().set_memory(file_content);
+
+            let handles: Vec<Handle> = self.handles.values().map(|handle| handle.dupe()).collect();
+
+            self.state.run_with_committing_transaction(
+                transaction,
+                &handles,
+                Require::Everything,
+                None,
+                None,
+            );
+
+            if self.handles.contains_key(&filename) {
+                self.active_filename = filename;
+            }
+        }
+    }
+
+    pub fn set_active_file(&mut self, filename: &str) {
+        if self.handles.contains_key(filename) {
+            self.active_filename = filename.to_owned();
+        }
+    }
+
+    pub fn get_errors(&self) -> Vec<Diagnostic> {
+        let mut all_diagnostics = Vec::new();
+        let transaction = self.state.transaction();
+
+        for (filename, handle) in &self.handles {
+            let errors = transaction.get_errors([handle]);
+            let collected = errors.collect_errors();
+            let unused = errors.collect_unused_ignore_errors_for_display(&collected);
+            let mut output_errors = collected.ordinary;
+            output_errors.extend(collected.hints);
+            output_errors.extend(collected.directives);
+            output_errors.extend(unused.ordinary);
+            output_errors.extend(unused.hints);
+            let file_errors = output_errors.into_iter().filter_map(|e| {
+                let severity = e.severity().shown()?;
+                let range = e.display_range();
+                Some(Diagnostic {
+                    start_line: range.start.line_within_file().get() as i32,
+                    start_col: range.start.column().get() as i32,
+                    end_line: range.end.line_within_file().get() as i32,
+                    end_col: range.end.column().get() as i32,
+                    message_header: e.msg_header().to_owned(),
+                    message_details: e.msg_details().unwrap_or("").to_owned(),
+                    kind: e.error_kind().to_name().to_owned(),
+                    // Severity values defined here: https://github.com/microsoft/vscode/blob/main/src/vs/editor/common/standalone/standaloneEnums.ts
+                    severity: match severity {
+                        ShownSeverity::Error => 8,
+                        ShownSeverity::Warn => 4,
+                        ShownSeverity::Info => 2,
+                        // As in the LSP, a hint without its own editor look is shown like `info`.
+                        ShownSeverity::Hint if e.editor_tag().is_none() => 2,
+                        ShownSeverity::Hint => 1,
+                    },
+                    tags: e.editor_tag().into_iter().collect(),
+                    filename: filename.clone(),
+                })
+            });
+            all_diagnostics.extend(file_errors);
+        }
+
+        // Include any diagnostics gathered while loading config
+        all_diagnostics.extend(self.config_diagnostics.iter().cloned());
+        all_diagnostics
+    }
+
+    fn to_text_size(&self, transaction: &Transaction, pos: Position) -> Option<TextSize> {
+        let handle = self.handles.get(&self.active_filename)?;
+        let info = transaction.get_module_info(handle)?;
+        Some(info.lined_buffer().from_display_pos(pos.to_display_pos()?))
+    }
+
+    pub fn hover(&self, pos: Position) -> Option<MonacoHover> {
+        let handle = self.handles.get(&self.active_filename)?;
+        let transaction = self.state.transaction();
+        let position = self.to_text_size(&transaction, pos)?;
+        let hover = get_hover(&transaction, handle, position, true)?;
+        Some(MonacoHover {
+            contents: vec![hover.contents],
+        })
+    }
+
+    pub fn semantic_tokens(&self, range: Option<Range>) -> Option<SemanticTokens> {
+        let handle = self.handles.get(&self.active_filename)?;
+        let transaction = self.state.transaction();
+        let range = range.and_then(|r| {
+            let display_range = r.to_display_range()?;
+            transaction
+                .get_module_info(handle)
+                .map(|info| info.lined_buffer().from_display_range(&display_range))
+        });
+        Some(SemanticTokens {
+            result_id: None,
+            data: transaction
+                .semantic_tokens(handle, range, None, true)
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn semantic_tokens_legend(&self) -> SemanticTokensLegend {
+        SemanticTokensLegends::lsp_semantic_token_legends()
+    }
+
+    /// Returns the definitions at `pos`. With `with_contents`, a definition in a
+    /// file that is not a sandbox file comes with the text of that file.
+    pub fn goto_definition(&mut self, pos: Position, with_contents: bool) -> Vec<Location> {
+        let handle = match self.handles.get(&self.active_filename) {
+            Some(handle) => handle,
+            None => return Vec::new(),
+        };
+        let transaction = self.state.transaction();
+        let position = match self.to_text_size(&transaction, pos) {
+            Some(position) => position,
+            None => return Vec::new(),
+        };
+        transaction
+            .goto_definition(handle, position)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                // Bundled stubs keep the path relative to their own root, so the
+                // root goes in front of it to make the filename unique.
+                let (filename, is_sandbox_file) = match r.module.path().details() {
+                    ModulePathDetails::Memory(path) => (path.to_path_buf(), true),
+                    ModulePathDetails::FileSystem(path) => (path.to_path_buf(), false),
+                    ModulePathDetails::BundledTypeshed(path) => {
+                        (Path::new("typeshed/stdlib").join(path.as_path()), false)
+                    }
+                    ModulePathDetails::BundledTypeshedThirdParty(path) => {
+                        (Path::new("typeshed/stubs").join(path.as_path()), false)
+                    }
+                    ModulePathDetails::BundledThirdParty(path) => {
+                        (Path::new("stubs").join(path.as_path()), false)
+                    }
+                    // A namespace package is a directory, with no text to show.
+                    ModulePathDetails::Namespace(_) => return None,
+                };
+                let filename = filename.to_string_lossy();
+                // A stub path uses the native separator, but the sandbox reads the
+                // filename of a stub as a URI path.
+                let filename = if is_sandbox_file {
+                    filename.into_owned()
+                } else {
+                    filename.replace('\\', "/")
+                };
+                Some(Location {
+                    filename,
+                    range: Range::new(r.module.display_range(r.range)),
+                    contents: (with_contents && !is_sandbox_file)
+                        .then(|| r.module.contents().to_string()),
+                })
+            })
+            .collect()
+    }
+
+    pub fn autocomplete(&self, pos: Position) -> Vec<AutoCompletionItem> {
+        let handle = match self.handles.get(&self.active_filename) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let transaction = self.state.transaction();
+        self.to_text_size(&transaction, pos)
+            .map_or(Vec::new(), |position| {
+                transaction.completion(handle, position, Default::default(), false, None)
+            })
+            .into_map(
+                |CompletionItem {
+                     label,
+                     detail,
+                     sort_text,
+                     kind,
+                     additional_text_edits,
+                     ..
+                 }| AutoCompletionItem {
+                    label,
+                    detail,
+                    kind: kind.map(to_monaco_completion_kind),
+                    sort_text,
+                    // Convert LSP ranges (0-based) to the 1-based coordinates Monaco wants.
+                    import_edits: additional_text_edits.map(|edits| {
+                        edits.into_map(|TextEdit { range, new_text }| CompletionTextEdit {
+                            range: Range {
+                                start_line: range.start.line as i32 + 1,
+                                start_col: range.start.character as i32 + 1,
+                                end_line: range.end.line as i32 + 1,
+                                end_col: range.end.character as i32 + 1,
+                            },
+                            text: new_text,
+                        })
+                    }),
+                },
+            )
+    }
+
+    pub fn inlay_hint(&self, call_argument_names: bool) -> Vec<InlayHint> {
+        let handle = match self.handles.get(&self.active_filename) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let transaction = self.state.transaction();
+        transaction
+            .get_module_info(handle)
+            .zip(transaction.inlay_hints(
+                handle,
+                InlayHintConfig {
+                    call_argument_names: if call_argument_names {
+                        AllOffPartial::All
+                    } else {
+                        AllOffPartial::Off
+                    },
+                    ..Default::default()
+                },
+                Default::default(),
+            ))
+            .map(|(info, hints)| {
+                hints.into_map(|hint| {
+                    let position = Position::from_display_pos(info.display_pos(hint.position));
+                    let label = hint.label_parts.into_iter().map(|(text, _)| text).collect();
+                    InlayHint { label, position }
+                })
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::error_kind::ErrorKind;
+
+    #[test]
+    fn test_parameter_name_inlay_hints_can_be_enabled() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "def f(value: int) -> None:\n    pass\n\nf(1)".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        assert!(
+            state
+                .inlay_hint(false)
+                .iter()
+                .all(|hint| hint.label != "value= ")
+        );
+        assert!(
+            state
+                .inlay_hint(true)
+                .iter()
+                .any(|hint| hint.label == "value= ")
+        );
+    }
+
+    #[test]
+    fn test_goto_definition_in_other_files() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "import os\nfrom utils import helper\nhelper()\nos.getcwd()\n".to_owned(),
+        );
+        files.insert(
+            "utils.py".to_owned(),
+            "\n\ndef helper() -> None: ...\n".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let definitions = state.goto_definition(Position::new(3, 1), true);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].filename, "utils.py");
+        assert_eq!(definitions[0].range.start_line, 3);
+        assert_eq!(definitions[0].range.start_col, 5);
+        assert!(
+            definitions[0].contents.is_none(),
+            "a sandbox file needs no contents"
+        );
+
+        let definitions = state.goto_definition(Position::new(4, 4), true);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].filename, "typeshed/stdlib/os/__init__.pyi");
+        assert!(
+            definitions[0]
+                .contents
+                .as_ref()
+                .expect("a stub should come with its contents")
+                .contains("def getcwd()")
+        );
+
+        let definitions = state.goto_definition(Position::new(4, 4), false);
+        assert_eq!(definitions.len(), 1);
+        assert!(
+            definitions[0].contents.is_none(),
+            "a stub should come without its contents when the caller does not ask"
+        );
+    }
+
+    #[test]
+    fn test_import_file_with_unnormalized_name() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "from utils import helper\nfrom pkg.mod import value\nhelper()\nprint(value)\n"
+                .to_owned(),
+        );
+        files.insert(
+            "./utils.py".to_owned(),
+            "def helper() -> None: ...\n".to_owned(),
+        );
+        files.insert("/pkg//mod.py".to_owned(), "value = 1\n".to_owned());
+        state.update_sandbox_files(files, true);
+
+        let errors = state.get_errors();
+        assert!(
+            errors.is_empty(),
+            "`./utils.py` and `/pkg//mod.py` should be importable as `utils` and `pkg.mod`, got: {:?}",
+            errors.iter().map(|e| &e.message_header).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_semantic_tokens_ignores_reversed_range() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert("sandbox.py".to_owned(), "x = 1\ny = 2\n".to_owned());
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let reversed = Range {
+            start_line: 2,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        };
+        assert_eq!(
+            state.semantic_tokens(Some(reversed)).unwrap().data,
+            state.semantic_tokens(None).unwrap().data,
+            "a reversed range should give the tokens of the whole file"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_json_omits_unset_fields() {
+        let item = AutoCompletionItem {
+            label: "x".to_owned(),
+            detail: None,
+            kind: None,
+            sort_text: None,
+            import_edits: None,
+        };
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({ "label": "x" }),
+            "a field that is `None` should be absent, not `null`"
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_includes_auto_import_edit() {
+        // gh-2967: accepting an auto-import completion must also insert its import line.
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert("sandbox.py".to_owned(), "reveal_type".to_owned());
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let items = state.autocomplete(Position::new(1, 12));
+        let reveal = items
+            .iter()
+            .find(|i| i.label == "reveal_type")
+            .expect("reveal_type completion should be offered");
+
+        // Monaco's Function kind is 1 (LSP's is 3), verifying the kind remap.
+        assert_eq!(reveal.kind, Some(1));
+        let edits = reveal
+            .import_edits
+            .as_ref()
+            .expect("reveal_type completion should carry an auto-import edit");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text, "from typing import reveal_type\n");
+        assert_eq!(edits[0].range.start_line, 1);
+        assert_eq!(edits[0].range.start_col, 1);
+    }
+
+    #[test]
+    fn test_regular_import() {
+        let mut state = Playground::new(None).unwrap();
+        let expected_errors: Vec<String> = Vec::new();
+
+        let mut files = SmallMap::new();
+        // Use the List import to avoid unused import diagnostic
+        files.insert(
+            "main.py".to_owned(),
+            "from typing import List\nx: List[int] = []".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        assert_eq!(
+            state
+                .get_errors()
+                .into_iter()
+                .map(|x| x.message_header)
+                .collect::<Vec<_>>(),
+            expected_errors,
+        );
+    }
+
+    #[test]
+    fn test_invalid_import() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert("main.py".to_owned(), "from t".to_owned());
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let expected_headers = &[
+            "Cannot find module `t`",
+            "Parse error: Expected `import`, found newline",
+        ];
+        let expected_details = &[
+            "  Did you mean `nt`?\n  Looked in these locations:\n  Build system source database",
+            "",
+        ];
+        let expected_error_kinds = &[ErrorKind::MissingImport, ErrorKind::ParseError];
+
+        assert_eq!(
+            &state.get_errors().into_map(|x| x.message_header),
+            expected_headers
+        );
+        assert_eq!(
+            &state.get_errors().into_map(|x| x.message_details),
+            expected_details
+        );
+
+        assert_eq!(
+            state.get_errors().into_map(|x| x.kind),
+            expected_error_kinds.map(|k| k.to_name()),
+        );
+    }
+
+    #[test]
+    fn test_cross_file_import() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "from utils import helper_function\nresult = helper_function()".to_owned(),
+        );
+        files.insert(
+            "utils.py".to_owned(),
+            "def helper_function() -> str:\n    return \"Hello from utils!\"".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let errors = state.get_errors();
+
+        let import_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == "MissingImport")
+            .collect();
+
+        assert_eq!(
+            import_errors.len(),
+            0,
+            "Should have no import errors with cross-file support"
+        );
+
+        for error in &errors {
+            assert!(!error.filename.is_empty(), "Error should include filename");
+            assert!(
+                error.filename.ends_with(".py") || error.filename.ends_with(".pyi"),
+                "Filename should end with .py or .pyi"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_file_errors_with_filenames() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "from utils import get_number\nresult: str = get_number()".to_owned(),
+        );
+        files.insert(
+            "utils.py".to_owned(),
+            "def get_number() -> int:\n    return \"not a number\"".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let errors = state.get_errors();
+
+        let _sandbox_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.filename == "sandbox.py")
+            .collect();
+        let _utils_errors: Vec<_> = errors.iter().filter(|e| e.filename == "utils.py").collect();
+
+        assert!(
+            !errors.is_empty(),
+            "Should have some errors from type mismatches"
+        );
+
+        for error in &errors {
+            assert!(!error.filename.is_empty(), "Error should include filename");
+            assert!(
+                error.filename == "sandbox.py" || error.filename == "utils.py",
+                "Error filename should be one of the test files, got: {}",
+                error.filename
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_update_with_cross_file_errors() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "sandbox.py".to_owned(),
+            "from utils import get_number\nresult: int = get_number()".to_owned(),
+        );
+        files.insert(
+            "utils.py".to_owned(),
+            "def get_number() -> int:\n    return 42".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let errors = state.get_errors();
+        assert_eq!(errors.len(), 0, "Should have no errors initially");
+
+        state.update_single_file(
+            "utils.py".to_owned(),
+            "def get_number() -> int:\n    return \"not a number\"".to_owned(),
+        );
+
+        let errors_after_update = state.get_errors();
+
+        let utils_errors: Vec<_> = errors_after_update
+            .iter()
+            .filter(|e| e.filename == "utils.py")
+            .collect();
+
+        assert!(
+            !utils_errors.is_empty(),
+            "Should detect error in utils.py after incremental update"
+        );
+
+        for error in &errors_after_update {
+            assert!(!error.filename.is_empty(), "Error should include filename");
+        }
+    }
+
+    #[test]
+    fn test_pyi_stub_file_support() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+
+        // Create a .pyi stub file
+        files.insert(
+            "mymodule.pyi".to_owned(),
+            "def greet(name: str) -> str: ...".to_owned(),
+        );
+
+        // Create a .py file that uses the stub
+        files.insert(
+            "main.py".to_owned(),
+            "from mymodule import greet\nresult: int = greet(\"test\")".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+
+        // Should have a type error: greet returns str, not int
+        let type_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| {
+                e.message_header.contains("not assignable")
+                    || e.message_header.contains("incompatible")
+            })
+            .collect();
+
+        assert!(
+            !type_errors.is_empty(),
+            "Should detect type mismatch when using .pyi stub file"
+        );
+
+        // Verify that .pyi files are processed
+        assert!(
+            state.handles.contains_key("mymodule.pyi"),
+            ".pyi file should be in handles"
+        );
+    }
+
+    #[test]
+    fn test_stub_takes_precedence_over_source_for_same_module() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+
+        // Same module ("greet") provided by both a source file and a stub, with
+        // deliberately different return types so the type checker output pins which
+        // one import resolution uses.
+        files.insert(
+            "greet.py".to_owned(),
+            "def greet(name: str) -> str:\n    return name".to_owned(),
+        );
+        files.insert(
+            "greet.pyi".to_owned(),
+            "def greet(name: str) -> int: ...".to_owned(),
+        );
+        files.insert(
+            "main.py".to_owned(),
+            "from greet import greet\nresult: str = greet(\"test\")".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+
+        // If the stub wins, `greet` returns `int`, so assigning to `str` is a type
+        // error. If the source file won instead, `greet` would return `str` and this
+        // assignment would be error-free.
+        let type_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| {
+                e.message_header.contains("not assignable")
+                    || e.message_header.contains("incompatible")
+            })
+            .collect();
+
+        let headers: Vec<_> = errors.iter().map(|e| &e.message_header).collect();
+        assert!(
+            !type_errors.is_empty(),
+            "greet.pyi's `int` return type should take precedence over greet.py's `str`: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_py_and_pyi_files() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+
+        // Both .py and .pyi files should be accepted
+        files.insert("module1.py".to_owned(), "x: int = 1".to_owned());
+        files.insert("module2.pyi".to_owned(), "y: str".to_owned());
+        files.insert(
+            "pyrefly.toml".to_owned(),
+            "python-version = \"3.12\"".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+
+        assert_eq!(
+            state.handles.len(),
+            2,
+            "Should have 2 module handles (.py and .pyi)"
+        );
+        assert!(state.handles.contains_key("module1.py"));
+        assert!(state.handles.contains_key("module2.pyi"));
+        assert!(
+            !state.handles.contains_key("pyrefly.toml"),
+            "Config file should not be a module"
+        );
+    }
+
+    #[test]
+    fn test_config_toml_parse_error_range() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert("main.py".to_owned(), String::new());
+        files.insert(
+            "pyrefly.toml".to_owned(),
+            "preset = \"strict\"\npytorch-efficiency-lints = \"true\"\n".to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+
+        let diagnostic = state
+            .get_errors()
+            .into_iter()
+            .find(|error| error.filename == "pyrefly.toml")
+            .expect("expected a pyrefly.toml parse diagnostic");
+        assert_eq!(diagnostic.message_header, "TOML parse error");
+        // The diagnostic points at the offending value on line 2. Column 28 is
+        // the opening quote of `"true"`: `pytorch-efficiency-lints = ` is 27
+        // characters, so the value begins at 1-based column 28.
+        assert_eq!(diagnostic.start_line, 2);
+        assert_eq!(diagnostic.start_col, 28);
+    }
+
+    #[test]
+    fn test_unsupported_python_version_is_config_error() {
+        // Editing `3.12` to `3.13` passes through `3.1`, which must not crash the sandbox.
+        let mut state = Playground::new(Some("3.12")).unwrap();
+        let mut files = SmallMap::new();
+        files.insert("main.py".to_owned(), "x: int = 1\n".to_owned());
+        files.insert(
+            "pyrefly.toml".to_owned(),
+            "python-version = \"3.1\"\n".to_owned(),
+        );
+
+        assert_eq!(state.update_sandbox_files(files.clone(), false), None);
+        assert!(state.update_sandbox_files(files, true).is_some());
+        let diagnostic = state
+            .get_errors()
+            .into_iter()
+            .find(|error| error.filename == "pyrefly.toml")
+            .expect("expected a pyrefly.toml parse diagnostic");
+        assert!(
+            diagnostic
+                .message_details
+                .contains("minimum supported version is 3.5.0")
+        );
+        assert!(Playground::new(Some("3.1")).is_err());
+    }
+
+    #[test]
+    fn test_nested_folder_imports() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+
+        // Create a nested folder file: foo/bar.py
+        files.insert(
+            "foo/bar.py".to_owned(),
+            "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n\nx: int = 42"
+                .to_owned(),
+        );
+
+        // Import from the nested module
+        files.insert(
+            "sandbox.py".to_owned(),
+            "from foo.bar import greet, x\n\nresult = greet(\"World\")\nprint(result)\nprint(x)"
+                .to_owned(),
+        );
+
+        state.update_sandbox_files(files, true);
+        state.set_active_file("sandbox.py");
+
+        let errors = state.get_errors();
+
+        // Should have NO missing-import errors
+        let missing_import_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == "missing-import")
+            .collect();
+
+        assert!(
+            missing_import_errors.is_empty(),
+            "Should successfully import from nested folder file (foo/bar.py -> foo.bar module)"
+        );
+
+        // Verify the nested file is registered with correct module name
+        assert!(
+            state.handles.contains_key("foo/bar.py"),
+            "Nested file should be in handles"
+        );
+    }
+
+    #[test]
+    fn test_unused_import_diagnostics() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "from typing import List, Dict\nx: List[int] = []".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        let unused_imports: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == "unused-import")
+            .collect();
+
+        assert_eq!(unused_imports.len(), 1, "Should detect 1 unused import");
+        assert_eq!(
+            unused_imports[0].message_header,
+            "Import `Dict` may be unused"
+        );
+        assert_eq!(unused_imports[0].severity, 1); // MarkerSeverity.Hint
+    }
+
+    #[test]
+    fn test_unused_variable_diagnostics() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "def foo():\n    x = 42\n    _ignored = 0\n    y = 10\n    return y".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        let unused_variables: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == "unused-variable")
+            .collect();
+
+        assert_eq!(unused_variables.len(), 1, "Should detect 1 unused variable");
+        assert_eq!(unused_variables[0].message_header, "Variable `x` is unused");
+        assert_eq!(unused_variables[0].severity, 1); // MarkerSeverity.Hint
+    }
+
+    #[test]
+    fn test_pytest_tracebackhide_not_reported_as_unused() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "def foo():\n    __tracebackhide__ = True".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        assert!(errors.iter().all(|error| error.kind != "unused-variable"));
+    }
+
+    #[test]
+    fn test_unused_parameter_diagnostics() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "def greet(name: str, age: int, _unused: bool) -> str:\n    return f\"Hello {name}\""
+                .to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        let unused_parameters: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == "unused-parameter")
+            .collect();
+
+        assert_eq!(
+            unused_parameters.len(),
+            1,
+            "Should detect 1 unused parameter and skip the underscore-prefixed parameter"
+        );
+        assert_eq!(
+            unused_parameters[0].message_header,
+            "Parameter `age` is unused"
+        );
+        assert_eq!(unused_parameters[0].severity, 1); // MarkerSeverity.Hint
+    }
+
+    #[test]
+    fn test_unused_parameter_suppressed_by_ignore() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "def greet(name: str, age: int) -> str:  # pyrefly: ignore[unused-parameter]\n    return name"
+                .to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let kinds: Vec<_> = state.get_errors().into_iter().map(|e| e.kind).collect();
+        assert!(kinds.is_empty(), "unexpected diagnostics: {kinds:?}");
+    }
+
+    // https://github.com/facebook/pyrefly/issues/5113
+    #[test]
+    fn test_kind_set_to_hint_in_config() {
+        let mut state = Playground::new(None).unwrap();
+        let mut files = SmallMap::new();
+        files.insert(
+            "main.py".to_owned(),
+            "import os\nx: int = \"wrong\"\n".to_owned(),
+        );
+        files.insert(
+            "pyrefly.toml".to_owned(),
+            "[errors]\nbad-assignment = \"hint\"\n".to_owned(),
+        );
+        state.update_sandbox_files(files, true);
+        state.set_active_file("main.py");
+
+        let errors = state.get_errors();
+        // The severity and the serialized tags are what Monaco receives.
+        let marker = |kind: &str| {
+            let e = errors.iter().find(|e| e.kind == kind).unwrap();
+            (e.severity, serde_json::to_string(&e.tags).unwrap())
+        };
+        // MarkerSeverity.Hint with MarkerTag.Unnecessary, drawn greyed out.
+        assert_eq!(marker("unused-import"), (1, "[1]".to_owned()));
+        // MarkerSeverity.Info, with no tag.
+        assert_eq!(marker("bad-assignment"), (2, "[]".to_owned()));
+    }
+}

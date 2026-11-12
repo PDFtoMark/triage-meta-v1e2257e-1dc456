@@ -1,0 +1,3162 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use pyrefly_python::sys_info::PythonVersion;
+
+use crate::test::util::TestEnv;
+use crate::testcase;
+
+testcase!(
+    test_simple_function_decorator,
+    r#"
+from typing import assert_type, Callable, Any
+
+def decorator(f: Callable[[int], int]) -> int: ...
+
+@decorator
+def decorated(x: int) -> int:
+   return x
+
+assert_type(decorated, int)
+    "#,
+);
+
+testcase!(
+    test_abstract_method_implicit_return,
+    r#"
+import abc
+class Foo(abc.ABC):
+    @abc.abstractmethod
+    def foo(self) -> str:
+        """
+        Some docstring
+        """
+    "#,
+);
+
+testcase!(
+    test_identity_function_decorator,
+    r#"
+from typing import Any, Callable, reveal_type
+
+def decorator[T](f: T) -> T: ...
+
+@decorator
+def decorated(x: int) -> str:
+   return f"{x}"
+
+reveal_type(decorated)  # E: revealed type: (x: int) -> str
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_follows_wrapped_chain,
+    r#"
+from functools import wraps
+from inspect import unwrap
+from typing import assert_type, reveal_type
+
+def inner(x: int) -> str:
+    return f"{x}"
+
+@wraps(inner)
+def middle(x: object) -> None:
+    pass
+
+@wraps(middle)
+def outer(x: object) -> None:
+    pass
+
+reveal_type(unwrap(outer))  # E: revealed type: (x: int) -> str
+assert_type(outer(object()), None)
+assert_type(middle.__wrapped__(1), str)
+assert_type(outer.__wrapped__(object()), None)
+assert_type(unwrap(outer, stop=None)(1), str)
+    "#,
+);
+
+testcase!(
+    test_functools_wrapped_call_chains,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def inner(x: int) -> str:
+    return str(x)
+
+def middle(x: object) -> None:
+    pass
+
+def outer(x: object) -> bool:
+    return False
+
+wrapped_middle = update_wrapper(middle, inner)
+wrapped_outer = update_wrapper(wrapper=outer, wrapped=wrapped_middle)
+assert_type(wrapped_outer(object()), bool)
+assert_type(wrapped_outer.__wrapped__(object()), None)
+assert_type(unwrap(wrapped_outer)(1), Any)
+
+called_middle = wraps(inner)(middle)
+called_outer = wraps(called_middle)(outer)
+assert_type(called_outer(object()), bool)
+assert_type(called_outer.__wrapped__(object()), None)
+assert_type(unwrap(called_outer)(1), Any)
+    "#,
+);
+
+testcase!(
+    test_functools_wraps_generic_chain,
+    r#"
+from functools import wraps
+from inspect import unwrap
+from typing import assert_type
+
+def inner[T](x: T) -> list[T]:
+    return [x]
+
+@wraps(inner)
+def outer[T](x: T) -> tuple[T]:
+    return (x,)
+
+assert_type(outer(1), tuple[int])
+assert_type(outer.__wrapped__(1), list[int])
+assert_type(unwrap(outer)(1), list[int])
+    "#,
+);
+
+testcase!(
+    test_functools_wraps_preserves_method_and_property,
+    r#"
+from functools import wraps
+from typing import Any, Callable, assert_type
+
+def decorate(fn: Callable[[Any, int], int]):
+    @wraps(fn)
+    def wrapper(self: Any, x: int) -> int:
+        return fn(self, x)
+    return wrapper
+
+def property_source(self: Any) -> int:
+    return 1
+
+class Parent:
+    def method(self, x: int) -> int:
+        return x
+
+class Child(Parent):
+    @decorate
+    def method(self, x: int) -> int:
+        return x
+
+    @property
+    @wraps(property_source)
+    def value(self) -> int:
+        return 1
+
+assert_type(Child().method(1), int)
+assert_type(Child().value, int)
+    "#,
+);
+
+testcase!(
+    test_functools_wraps_unknown_target_preserves_signature,
+    TestEnv::new().enable_partially_unknown_type_error(),
+    r#"
+from functools import wraps
+from typing import Callable, assert_type
+
+def untyped(x):
+    return x
+
+@wraps(untyped)  # E: The type of this argument is partially unknown  # E: The type of this argument is partially unknown
+def wrapper(x: int) -> int:
+    return x
+
+def consume(f: Callable[[int], int]) -> int:
+    return f(1)
+
+assert_type(consume(wrapper), int)
+    "#,
+);
+
+testcase!(
+    test_functools_update_wrapper_loop,
+    r#"
+from functools import partial, update_wrapper
+from typing import Callable
+
+def build(handler: Callable[[int], int], apps: tuple[list[Callable[..., int]], ...]) -> Callable[[int], int]:
+    for app in apps[::-1]:
+        for middleware in app:
+            handler = update_wrapper(partial(middleware, handler=handler), handler)
+    return handler
+    "#,
+);
+
+testcase!(
+    test_functools_update_wrapper_function_loop,
+    r#"
+from functools import update_wrapper
+from typing import assert_type
+
+def source(x: int) -> int:
+    return x
+
+def wrapper(x: int) -> int:
+    return x
+
+def repeatedly(count: int) -> int:
+    fn = source
+    for _ in range(count):
+        fn = update_wrapper(wrapper, fn)
+    return fn(1)
+
+assert_type(repeatedly(3), int)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_mutated_middle,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def leaf() -> str:
+    return "leaf"
+
+def middle() -> int:
+    return 1
+
+update_wrapper(middle, leaf)
+
+@wraps(middle)
+def outer() -> bool:
+    return False
+
+assert_type(unwrap(outer)(), Any)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_retargeted_function,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def original() -> int:
+    return 1
+
+def replacement() -> str:
+    return "replacement"
+
+@wraps(original)
+def wrapper() -> bool:
+    return False
+
+alias = wrapper
+update_wrapper(alias, replacement)
+assert_type(unwrap(wrapper)(), Any)
+assert_type(unwrap(alias)(), Any)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_target_mutated_later,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def leaf() -> str:
+    return "leaf"
+
+def middle() -> int:
+    return 1
+
+@wraps(middle)
+def outer() -> bool:
+    return False
+
+update_wrapper(middle, leaf)
+assert_type(unwrap(outer)(), Any)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_factory_before_mutation,
+    r#"
+from functools import update_wrapper as mutate, wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def leaf() -> str:
+    return "leaf"
+
+def target() -> int:
+    return 1
+
+factory = wraps(target)
+mutate(target, leaf)
+
+@factory
+def outer() -> bool:
+    return False
+
+assert_type(unwrap(outer)(), Any)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_control_flow_mutations,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, Callable, assert_type
+
+def leaf() -> str:
+    return "leaf"
+
+def branch(flag: bool) -> None:
+    def target() -> int:
+        return 1
+
+    @wraps(target)
+    def outer() -> bool:
+        return False
+
+    alias: Callable[[], int] = target
+    if flag:
+        update_wrapper(alias, leaf)
+    assert_type(unwrap(outer)(), Any)
+
+def loop(count: int) -> None:
+    def target() -> int:
+        return 1
+
+    @wraps(target)
+    def outer() -> bool:
+        return False
+
+    for _ in range(count):
+        update_wrapper(target, leaf)
+    assert_type(unwrap(outer)(), Any)
+
+def caught() -> None:
+    def target() -> int:
+        return 1
+
+    @wraps(target)
+    def outer() -> bool:
+        return False
+
+    try:
+        update_wrapper(target, leaf)
+        raise RuntimeError()
+    except RuntimeError:
+        assert_type(unwrap(outer)(), Any)
+
+branch(True)
+loop(101)
+caught()
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_direct_wraps_mutation,
+    r#"
+from functools import wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def leaf() -> str:
+    return "leaf"
+
+def target() -> int:
+    return 1
+
+@wraps(target)
+def outer() -> bool:
+    return False
+
+wraps(leaf)(target)
+assert_type(unwrap(outer)(), Any)
+    "#,
+);
+
+testcase!(
+    test_functools_wrapper_loop_forms,
+    r#"
+from functools import update_wrapper, wraps
+from typing import assert_type
+
+def source(x: int) -> int:
+    return x
+
+def first(x: int) -> int:
+    return x
+
+def second(x: int) -> int:
+    return x
+
+def called(count: int) -> int:
+    fn = source
+    for _ in range(count):
+        fn = wraps(fn)(first)
+    return fn(1)
+
+def decorated(count: int) -> int:
+    fn = source
+    for _ in range(count):
+        @wraps(fn)
+        def wrapper(x: int) -> int:
+            return x
+        fn = wrapper
+    return fn(1)
+
+def alternating(count: int) -> int:
+    fn = source
+    for _ in range(count):
+        fn = update_wrapper(first, fn)
+        fn = update_wrapper(second, fn)
+    return fn(1)
+
+def conditional(count: int, flag: bool) -> int:
+    fn = source
+    for _ in range(count):
+        if flag:
+            fn = update_wrapper(first, fn)
+        else:
+            fn = update_wrapper(second, fn)
+    return fn(1)
+
+assert_type(called(3), int)
+assert_type(decorated(3), int)
+assert_type(alternating(3), int)
+assert_type(conditional(3, True), int)
+    "#,
+);
+
+testcase!(
+    test_functools_generic_wrapper_loop,
+    r#"
+from functools import wraps
+from typing import Callable, assert_type
+
+def decorate[F: Callable[..., object]](fn: F):
+    @wraps(fn)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        return fn(*args, **kwargs)
+    return wrapper
+
+def source(x: int) -> int:
+    return x
+
+def repeatedly(count: int) -> object:
+    fn = source
+    for _ in range(count):
+        fn = decorate(fn)
+    return fn(1)
+
+assert_type(repeatedly(3), object)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_unknown_wrapping_state,
+    r#"
+from functools import update_wrapper, wraps
+from inspect import unwrap
+from typing import Any, Callable, assert_type
+
+def inner() -> str:
+    return "wrapped"
+
+@wraps(inner)
+def wrapper() -> int:
+    return 1
+
+def annotated(fn: Callable[[], int]) -> None:
+    assert_type(unwrap(fn), Any)
+
+    @wraps(fn)
+    def outer() -> bool:
+        return False
+
+    assert_type(unwrap(outer), Any)
+
+annotated(wrapper)
+
+def mutated() -> int:
+    return 1
+
+update_wrapper(mutated, inner)
+assert_type(unwrap(mutated), Any)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_union_branches,
+    r#"
+from functools import wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def inner() -> str:
+    return "wrapped"
+
+@wraps(inner)
+def wrapper() -> int:
+    return 1
+
+def plain() -> int:
+    return 2
+
+@wraps(inner)
+def another() -> bool:
+    return False
+
+def check(flag: bool) -> None:
+    choice = wrapper if flag else plain
+    assert_type(unwrap(choice)(), Any | str)
+
+    @wraps(choice)
+    def outer() -> bool:
+        return False
+
+    assert_type(unwrap(outer)(), int | str)
+
+    shared_target = wrapper if flag else another
+    assert_type(unwrap(shared_target)(), str)
+    "#,
+);
+
+testcase!(
+    test_inspect_unwrap_starred_arguments,
+    r#"
+from functools import wraps
+from inspect import unwrap
+from typing import Any, assert_type
+
+def inner() -> str:
+    return "wrapped"
+
+@wraps(inner)
+def wrapper() -> int:
+    return 1
+
+assert_type(unwrap(*(wrapper,)), Any)
+assert_type(unwrap(*(wrapper,), stop=None), Any)
+    "#,
+);
+
+testcase!(
+    test_signature_modifying_function_decorator,
+    r#"
+from typing import assert_type, Callable, Any
+
+def decorator[T, R](f: Callable[[T], R]) -> Callable[[T, T], R]: ...
+
+@decorator
+def decorated(x: int) -> str:
+   return f"{x}"
+
+assert_type(decorated, Callable[[int, int], str])
+    "#,
+);
+
+testcase!(
+    test_chaining_decorators,
+    r#"
+from typing import assert_type, Callable, Any
+
+def decorator0[T, R](f: Callable[[T], R]) -> Callable[[T], set[R]]: ...
+
+def decorator1[T, R](f: Callable[[T], R]) -> Callable[[T], list[R]]: ...
+
+@decorator1
+@decorator0
+def decorated(x: int) -> str:
+   return f"{x}"
+
+assert_type(decorated, Callable[[int], list[set[str]]])
+    "#,
+);
+
+testcase!(
+    test_walrus_in_decorator,
+    r#"
+from typing import assert_type, Callable, Literal
+
+def decorator[T](x: object) -> Callable[[T], T]: ...
+
+@decorator(x := 42)
+def foo() -> None: ...
+
+assert_type(x, Literal[42])
+
+@decorator(y := "bar")
+class Bar: ...
+
+assert_type(y, Literal["bar"])
+    "#,
+);
+
+testcase!(
+    test_parameter_type_inferred_from_decorator,
+    r#"
+from typing import Callable, assert_type
+
+def enforce_int_arg(func: Callable[[int], None]) -> Callable[[int], None]:
+    return func
+
+@enforce_int_arg
+def takes_inferred(i) -> None:
+    assert_type(i, int)
+    "#,
+);
+
+testcase!(
+    test_generic_decorator_with_unannotated_param,
+    r#"
+from typing import Callable, TypeVar
+
+T1 = TypeVar("T1")
+T2 = TypeVar("T2")
+T3 = TypeVar("T3")
+
+def decorator(func: Callable[[T1, T2], T3]) -> Callable[[T1, T2], T3]:
+    return func
+
+class Expr:
+    @decorator
+    def __truediv__(self, other) -> "Expr":
+        return Expr()
+
+x = Expr()
+y = x / 2
+    "#,
+);
+
+testcase!(
+    test_callable_instance,
+    r#"
+from typing import Callable, reveal_type
+class im_callable:
+    def __call__[T](self, arg: T, /) -> T: ...
+@im_callable()
+def f(x: int) -> int:
+    return x
+reveal_type(f)  # E: revealed type: (x: int) -> int
+    "#,
+);
+
+// This test case does not directly use a decorator, but it verifies our
+// handling of the `@final` decorator applied to `typing.TypeVar`, which can
+// trigger recursion that breaks legacy type parameter handling if we are not
+// careful.
+testcase!(
+    test_that_final_decorator_on_type_var_works,
+    r#"
+from typing import MutableSequence
+x: MutableSequence[int]
+    "#,
+);
+
+// A regression test for a bug where we were not correctly handling the anywhere
+// type for a decorated function.
+testcase!(
+    test_decorator_general_type,
+    r#"
+from typing import assert_type, Callable
+
+def decorator(f: Callable[[int], int]) -> int: ...
+
+def anywhere():
+    assert_type(decorated, int)
+
+@decorator
+def decorated(x: int) -> int:
+   return x
+    "#,
+);
+
+testcase!(
+    test_classmethod_first_param,
+    r#"
+from typing import assert_type
+
+class C:
+    @classmethod
+    def f(cls) -> int:
+        return cls.g()
+
+    @classmethod
+    def g(cls) -> int:
+        return 42
+
+assert_type(C.f(), int)
+assert_type(C.g(), int)
+    "#,
+);
+
+// https://github.com/facebook/pyrefly/issues/5294
+testcase!(
+    test_classmethod_missing_receiver,
+    r#"
+from abc import ABC, abstractmethod
+from builtins import classmethod as cm
+from typing import Protocol, overload
+
+alias = classmethod
+
+class C:
+    @classmethod
+    def missing() -> None: ...  # E: Class method `missing` must accept the class as its first positional parameter
+
+    @classmethod
+    def kwargs_only(**kwargs: object) -> None: ...  # E: Class method `kwargs_only` must accept the class as its first positional parameter
+
+    @classmethod
+    def keyword_only(*, cls: object = None) -> None: ...  # E: Class method `keyword_only` must accept the class as its first positional parameter
+
+    @classmethod
+    def __init_subclass__() -> None: ...  # E: Class method `__init_subclass__` must accept the class as its first positional parameter
+
+    @classmethod
+    def __class_getitem__() -> None: ...  # E: Class method `__class_getitem__` must accept the class as its first positional parameter
+
+class Implicit:
+    def __init_subclass__() -> None: ...  # E: Class method `__init_subclass__` must accept the class as its first positional parameter
+
+    def __class_getitem__() -> None: ...  # E: Class method `__class_getitem__` must accept the class as its first positional parameter
+
+class Aliased:
+    @cm
+    def imported() -> None: ...  # E: Class method `imported` must accept the class as its first positional parameter
+
+    @alias
+    def assigned() -> None: ...  # E: Class method `assigned` must accept the class as its first positional parameter
+
+class Abstract(ABC):
+    @classmethod
+    @abstractmethod
+    def missing() -> None: ...  # E: Class method `missing` must accept the class as its first positional parameter
+
+class Interface(Protocol):
+    @classmethod
+    def missing() -> None: ...  # E: Class method `missing` must accept the class as its first positional parameter
+
+class Overloaded:
+    @classmethod
+    @overload
+    def method() -> None: ...  # E: Class method `method` must accept the class as its first positional parameter
+    @classmethod
+    @overload
+    def method(cls, x: int) -> None: ...
+    @classmethod
+    def method(*args: object, **kwargs: object) -> None: ...
+"#,
+);
+
+testcase!(
+    test_classmethod_receiver_capacity,
+    r#"
+class C:
+    @classmethod
+    def conventional(cls) -> None: ...
+
+    @classmethod
+    def unconventional(klass) -> None: ...
+
+    @classmethod
+    def positional_only(klass, /) -> None: ...
+
+    @classmethod
+    def variadic(*args: object) -> None: ...
+
+    @classmethod
+    def variadic_keywords(*args: object, **kwargs: object) -> None: ...
+
+    def __init_subclass__(cls) -> None: ...
+
+    def __class_getitem__(*args: object) -> None: ...
+
+C.conventional()
+C.unconventional()
+C.positional_only()
+C.variadic(1)
+C.variadic_keywords(x=1)
+"#,
+);
+
+testcase!(
+    test_classmethod_receiver_decorator_combinations,
+    r#"
+from typing import Any, Callable, final, no_type_check
+
+def add_receiver(f: Callable[[], None]) -> Callable[[object], None]:
+    def wrapper(cls: object) -> None:
+        f()
+    return wrapper
+
+unknown: Any = lambda f: f
+
+class C:
+    @classmethod
+    @add_receiver
+    def wrapped() -> None: ...
+
+    @classmethod
+    @unknown
+    def uncertain() -> None: ...
+
+    @classmethod
+    @no_type_check
+    def unchecked() -> None: ...  # E: Class method `unchecked` must accept the class as its first positional parameter
+
+    @staticmethod
+    def static() -> None: ...
+
+    @classmethod
+    @staticmethod
+    def mixed() -> None: ...
+
+    @staticmethod
+    @classmethod
+    def reversed() -> None: ...
+
+    @classmethod
+    @property
+    def descriptor() -> None: ...
+
+    @classmethod
+    @final
+    def inner() -> None: ...  # E: Class method `inner` must accept the class as its first positional parameter
+
+    @final
+    @classmethod
+    def outer() -> None: ...  # E: Class method `outer` must accept the class as its first positional parameter
+
+C.wrapped()
+"#,
+);
+
+testcase!(
+    test_abstract_classmethod,
+    r#"
+from typing import assert_type
+import abc
+
+class C(abc.ABC):
+    @abc.abstractclassmethod  # E: `abc.abstractclassmethod` is deprecated
+    def f(cls) -> int:
+        return 42
+
+assert_type(C.f(), int)
+    "#,
+);
+
+testcase!(
+    test_staticmethod_first_param,
+    r#"
+from typing import assert_type, Any
+
+class C:
+    @staticmethod
+    def f(x):
+        assert_type(x, Any)
+
+    @staticmethod
+    def g(x: int):
+        return x
+
+C.f(0)
+assert_type(C.g(0), int)
+    "#,
+);
+
+testcase!(
+    test_abstract_staticmethod,
+    r#"
+from typing import assert_type
+import abc
+
+class C(abc.ABC):
+    @abc.abstractstaticmethod  # E: `abc.abstractstaticmethod` is deprecated
+    def f() -> int:
+        return 42
+
+assert_type(C.f(), int)
+    "#,
+);
+
+testcase!(
+    test_final,
+    r#"
+from typing import final, reveal_type
+@final  # E: `@final` can only be used on methods
+def f(x: int) -> int:
+    return x
+reveal_type(f)  # E: revealed type: (x: int) -> int
+    "#,
+);
+
+testcase!(
+    test_invalid_top_level_function_decorators,
+    r#"
+from typing import *
+from abc import abstractstaticmethod, abstractmethod # E: `abstractstaticmethod` is deprecated
+from enum import member, nonmember
+
+@member  # E: can only be used on methods
+@nonmember  # E: can only be used on methods
+@abstractmethod  # E: can only be used on methods
+@staticmethod  # E: can only be used on methods
+@classmethod  # E: can only be used on methods
+@abstractstaticmethod  # E: can only be used on methods # E: `abc.abstractstaticmethod` is deprecated
+@property  # E: can only be used on methods
+@final  # E: can only be used on methods
+@override  # E: can only be used on methods
+def f(x: int) -> int:
+    return x
+    "#,
+);
+
+testcase!(
+    test_callable_class_as_decorator,
+    r#"
+import dataclasses
+from typing import Callable, assert_type
+
+@dataclasses.dataclass(frozen=True)
+class decorator:
+    metadata: int
+
+    def __call__[TReturn, **TParams](
+        self, func: Callable[TParams, TReturn]
+    ) -> Callable[TParams, TReturn]:
+        ...
+
+class C:
+    @decorator(42)
+    def f(self, x: int) -> int:
+        return x
+
+assert_type(C().f(42), int)
+    "#,
+);
+
+testcase!(
+    test_decorate_to_any,
+    r#"
+from typing import Any, assert_type
+
+def decorate(f) -> Any: ...
+
+class C:
+    @decorate
+    def f(self, x: int): ...
+
+# `f` is `Any` now, we should be able to call it with anything and get back `Any`.
+assert_type(C().f("any", b"thing"), Any)
+    "#,
+);
+
+testcase!(
+    test_class_decorator_returning_type_any,
+    r#"
+from typing import Any, assert_type
+
+def erase_class(cls: type[Any]) -> type[Any]: ...
+def inferred_type_any(cls: type[Any]): return cls
+def returns_any(cls: type[Any]) -> Any: ...
+
+# Only an explicit `-> type[Any]` return annotation erases the class interface.
+@erase_class
+class C:
+    def __init__(self, x: int) -> None: ...
+
+assert_type(C, type[Any])
+assert_type(C(unknown=1, arbitrary="x"), Any)
+
+# An inferred `type[Any]` return type must not erase the class interface.
+@inferred_type_any
+class D:
+    def __init__(self, x: int) -> None: ...
+
+D(x=1)
+D(x=1, unknown=2)  # E: Unexpected keyword argument `unknown`
+
+# A bare `Any` return type (not `type[Any]`) must not erase the class interface.
+@returns_any
+class E:
+    def __init__(self, x: int) -> None: ...
+
+E(x=1)
+E(x=1, unknown=2)  # E: Unexpected keyword argument `unknown`
+    "#,
+);
+
+testcase!(
+    test_decorate_to_generic_callable,
+    r#"
+from typing import Any, Callable, TypeVar, assert_type
+T = TypeVar('T')
+
+def decorate(f) -> Callable[[Any, T], T]:
+    return lambda _, x: x
+
+class C:
+    @decorate
+    def f(self): ...
+
+assert_type(C().f(0), int)
+    "#,
+);
+
+// Test that `@decorate` doesn't interfere with reading other decorators, by verifying that an
+// override error is still reported.
+testcase!(
+    test_override_error_with_generic_callable_decorator,
+    r#"
+from typing import Any, Callable, TypeVar, assert_type, override
+T = TypeVar('T')
+
+def decorate(f) -> Callable[[Any, T], T]:
+    return lambda _, x: x
+
+class C:
+    @override
+    @decorate
+    def f(self): ...  # E: no parent class has a matching attribute
+
+    @decorate
+    @override
+    def g(self): ...  # E: no parent class has a matching attribute
+    "#,
+);
+
+testcase!(
+    test_decorate_generic_function,
+    r#"
+from typing import assert_type
+
+def decorate[T](f: T) -> T:
+    return f
+
+class C:
+    @decorate
+    def f[T](self, x: T) -> T:
+        return x
+
+assert_type(C().f(0), int)
+    "#,
+);
+
+testcase!(
+    test_property_decorated_to_callback_protocol,
+    r#"
+from typing import assert_type, Protocol, Callable, Concatenate, Any
+
+class P[**TParams, TReturn](Protocol):
+    def __call__(self, *args: TParams.args, **kwargs: TParams.kwargs) -> TReturn: ...
+
+def f[**TParams, TReturn](func: Callable[Concatenate[Any, TParams], TReturn]) -> P[TParams, TReturn]:
+    ...
+
+class Foo:
+    @property
+    @f
+    def p(self) -> int:
+        return 42
+
+def test(x: Foo) -> None:
+    assert_type(x.p, int)
+    "#,
+);
+
+testcase!(
+    test_method_decorated_to_callback_protocol,
+    r#"
+from typing import assert_type, Protocol, Callable, Concatenate, Any
+
+class P[**TParams, TReturn](Protocol):
+    def __call__(self, *args: TParams.args, **kwargs: TParams.kwargs) -> TReturn: ...
+
+def f[**TParams, TReturn](func: Callable[Concatenate[Any, TParams], TReturn]) -> P[TParams, TReturn]:
+    ...
+
+class Foo:
+    @f
+    def p(self) -> int:
+        return 42
+
+def test(x: Foo) -> None:
+    assert_type(x.p(), int)
+    "#,
+);
+
+testcase!(
+    test_method_decorated_to_callable_instance,
+    r#"
+class A:
+    def __call__(self):
+        pass
+def decorate(f) -> A:
+    return A()
+@decorate
+def f():
+    pass
+def g(a: A):
+    pass
+g(f)
+    "#,
+);
+
+testcase!(
+    test_decorator_missing_concatenate_parameters,
+    r#"
+from typing import Callable, Concatenate
+
+def inject_one[T, **P, R](
+    view: Callable[Concatenate[T, str, P], R],
+) -> Callable[Concatenate[T, P], R]: ...
+
+class C:
+    @inject_one  # E: Callable is missing a positional parameter with type `str`
+    def one(self) -> int:
+        return 0
+
+def inject_two[**P, R](
+    view: Callable[Concatenate[str, bool, P], R],
+) -> Callable[P, R]: ...
+
+@inject_two  # E: Callable is missing 2 positional parameters with types `str` and `bool`
+def two() -> int:
+    return 0
+    "#,
+);
+
+testcase!(
+    test_decorator_concatenate_parameter_mismatch_is_not_missing,
+    r#"
+from typing import Callable, Concatenate
+
+def inject[**P, R](
+    view: Callable[Concatenate[str, int, P], R],
+) -> Callable[P, R]: ...
+
+@inject  # E: Argument `(x: bool) -> None` is not assignable
+         # N: Callable is missing
+def f(x: bool) -> None: ...
+    "#,
+);
+
+testcase!(
+    bug = "This error message is confusing, I think we need to be clearer when we are printing the *type* of an argument",
+    test_decorator_error_message,
+    r#"
+from typing import Callable, Any
+def dec(arg: Callable[..., Any]) -> Callable[..., int]: ...
+@dec
+def f0(arg: Callable[..., int]) -> Callable[..., int]: ...
+@dec  # E: Argument `int` is not assignable to parameter `arg` with type `(...) -> Any` in function `dec`
+@f0
+def f0(arg: Callable[..., int]) -> Callable[..., int]: ...
+    "#,
+);
+
+// This reproduces return inference without annotating the decorator or its wrapper.
+// https://github.com/facebook/pyrefly/issues/1115
+testcase!(
+    test_inferred_decorator_union_alias_display,
+    r#"
+from collections.abc import Callable
+from typing import reveal_type
+
+type ResponseReturnValue = str | bytes | tuple[str, int]
+
+def unauthorized() -> ResponseReturnValue: ...
+
+def login_required[**P, R](func: Callable[P, R]):
+    def wrapped(*args: P.args, **kwargs: P.kwargs):
+        if args:
+            return unauthorized()
+        return func(*args, **kwargs)
+    return wrapped
+
+def handler() -> int:
+    return 0
+
+def setup_required(view: Callable[..., int]) -> Callable[..., int]: ...
+
+# The inferred return union exceeds the width limit and widens to Unknown.
+decorated = login_required(handler)
+reveal_type(decorated)  # E: revealed type: () -> Unknown
+setup_required(decorated)
+    "#,
+);
+
+// Reported in https://github.com/facebook/pyrefly/issues/491
+testcase!(
+    test_total_ordering,
+    r#"
+from functools import total_ordering
+from typing import reveal_type
+
+@total_ordering
+class A:
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __eq__(self, other: "A") -> bool:  # E: `A.__eq__` overrides parent class `object` in an inconsistent manner
+        return self.x == other.x
+    def __lt__(self, other: "A") -> bool:
+        return self.x < other.x
+
+a = A(x=1)
+b = A(x=2)
+
+# This should give the correct type for the method `__lt__`
+reveal_type(A.__lt__)  # E: revealed type: (self: A, other: A) -> bool
+# This should give be synthesized via `functools.total_ordering`
+reveal_type(A.__gt__)  # E: revealed type: (self: A, other: A) -> bool
+a <= b
+"#,
+);
+
+testcase!(
+    test_total_ordering_no_rich_cmp,
+    r#"
+from functools import total_ordering
+
+@total_ordering  # E: Class `A` must define at least one of the rich comparison methods.
+class A:
+    def __init__(self, x: int) -> None:
+        self.x = x
+"#,
+);
+
+// `total_ordering` only fills in methods the class doesn't already have, including methods
+// generated on an ancestor dataclass.
+testcase!(
+    test_total_ordering_on_ordered_dataclass_subclass,
+    r#"
+from dataclasses import dataclass
+from functools import total_ordering
+from typing import reveal_type
+
+@dataclass(order=True)
+class D:
+    x: int
+
+@total_ordering
+class NoOwnMethods(D):  # E: Cannot safely extend dataclass `D` with `order=True`
+    pass
+
+# `OwnLt` keeps `D`'s generated `__gt__`, so `OwnLt(1) > D(1)` fails.
+@total_ordering
+class OwnLt(D):  # E: Cannot safely extend dataclass `D` with `order=True`
+    def __lt__(self, other: object) -> bool:
+        return True
+
+reveal_type(OwnLt.__gt__)  # E: revealed type: (self: D, other: D) -> bool
+
+# `OwnLt` still uses `D`'s generated `__gt__`, so comparing it with `OrderedOverOwnLt` can fail.
+@dataclass(order=True)
+class OrderedOverOwnLt(OwnLt):  # E: Cannot safely extend dataclass `D` with `order=True`
+    y: int = 0
+"#,
+);
+
+// Methods that `total_ordering` filled in on an ancestor count as defined, so `B` gets nothing new.
+testcase!(
+    test_total_ordering_on_total_ordering_subclass,
+    r#"
+from functools import total_ordering
+from typing import reveal_type
+
+@total_ordering
+class A:
+    def __lt__(self, other: "A") -> bool:
+        return True
+
+@total_ordering
+class B(A):
+    def __gt__(self, other: object) -> bool:
+        return True
+
+reveal_type(B.__ge__)  # E: revealed type: (self: B, other: A) -> bool
+"#,
+);
+
+// Methods that `total_ordering` fills in on a mixin are user-defined as far as the dataclass is
+// concerned, so they replace the dataclass's generated methods that come later in the MRO.
+testcase!(
+    test_total_ordering_mixin_before_ordered_dataclass,
+    r#"
+from dataclasses import dataclass
+from functools import total_ordering
+
+@dataclass(order=True)
+class D:
+    x: int
+
+@total_ordering
+class Mix:
+    def __lt__(self, other: object) -> bool:
+        return True
+
+class C(Mix, D):
+    pass
+
+@dataclass(order=True)
+class E(C):
+    y: int = 0
+"#,
+);
+
+testcase!(
+    test_total_ordering_inherited_rich_cmp,
+    r#"
+from functools import total_ordering
+from typing import reveal_type
+
+class Base:
+    def __lt__(self, other: "Base") -> bool: ...
+
+@total_ordering
+class Child(Base):
+    pass
+
+reveal_type(Child.__gt__)  # E: revealed type: (self: Child, other: Base) -> bool
+    "#,
+);
+
+testcase!(
+    test_total_ordering_dataclass,
+    r#"
+from dataclasses import dataclass
+from functools import total_ordering
+from typing import reveal_type
+
+@dataclass
+@total_ordering
+class A:
+    x: int
+    def __lt__(self, other: "A") -> bool:
+        return self.x < other.x
+
+a = A(x=1)
+b = A(x=2)
+
+# This should give the correct type for the method `__lt__`
+reveal_type(A.__lt__)  # E: revealed type: (self: A, other: A) -> bool
+# This should give be synthesized via `functools.total_ordering`
+reveal_type(A.__gt__)  # E: revealed type: (self: A, other: A) -> bool
+a <= b
+"#,
+);
+
+testcase!(
+    test_total_ordering_precedence,
+    r#"
+from functools import total_ordering
+from typing import reveal_type
+
+@total_ordering
+class A:
+    def __init__(self, x: int) -> None:
+        self.x = x
+    def __eq__(self, other: "A") -> bool:  # E: `A.__eq__` overrides parent class `object` in an inconsistent manner
+        return self.x == other.x
+    def __lt__(self, other: "A") -> bool:
+        return self.x < other.x
+    def __le__(self, other: object) -> bool:
+        if not isinstance(other, A):
+            return NotImplemented
+        return self.x <= other.x
+
+# This should give the correct type for the method `__lt__`
+reveal_type(A.__lt__)  # E: revealed type: (self: A, other: A) -> bool
+# This should give be synthesized via `functools.total_ordering` via `__lt__`
+reveal_type(A.__gt__)  # E: revealed type: (self: A, other: A) -> bool
+
+# This should give the correct type for the method `__le__`
+reveal_type(A.__le__)  # E: revealed type: (self: A, other: object) -> bool
+# This should give be synthesized via `functools.total_ordering` via `__le__`
+reveal_type(A.__ge__)  # E: revealed type: (self: A, other: object) -> bool
+"#,
+);
+
+testcase!(
+    test_abstract_method_skip_return,
+    r#"
+from abc import ABC, abstractmethod
+
+class C(ABC):
+        @abstractmethod
+        def m1(self) -> int:
+            return NotImplemented
+
+        @abstractmethod
+        def m2(self) -> int:
+            pass
+
+        @abstractmethod
+        def m3(self) -> int:
+            """some docstring"""
+
+        @abstractmethod
+        def m4(self) -> int: ...
+
+        @abstractmethod
+        def method5(self) -> int:
+            return "sub" # E: Returned type `Literal['sub']` is not assignable to declared return type `int`
+    "#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/3362.
+// These assignments should behave like @classmethod: cls should be type[Self],
+// calls should preserve subclass types, and initialized attributes should exist on the class.
+testcase!(
+    test_desugared_classmethod_application,
+    r#"
+from typing import Self, assert_type
+class A:
+    def f(cls):
+        assert_type(cls, type[Self])
+        return cls
+    f = classmethod(f)
+
+class B(A):
+    pass
+
+assert_type(A.f(), type[A])
+assert_type(A().f(), type[A])
+assert_type(B.f(), type[B])
+
+class Holder:
+    def foo(cls, string: str) -> int:
+        return len(string)
+
+    foo = classmethod(foo)
+
+assert_type(Holder.foo("hello"), int)
+
+class InitializesOnClass:
+    def initialize(cls) -> None:
+        cls.value = 1
+
+    initialize = classmethod(initialize)
+
+InitializesOnClass.initialize()
+assert_type(InitializesOnClass.value, int)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_scope,
+    r#"
+from typing import assert_type
+
+def f(cls: type[object]) -> int:
+    return 1
+
+class Outer:
+    def f(self):
+        return self
+
+    class Inner:
+        f = classmethod(f)
+
+assert_type(Outer().f(), Outer)
+assert_type(Outer.Inner.f(), int)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_alias,
+    r#"
+from typing import Self, assert_type
+
+class A:
+    def f(self):
+        return self
+
+    g = f
+    f = classmethod(f)
+
+class B(A):
+    pass
+
+assert_type(A().g(), A)
+assert_type(B().g(), B)
+assert_type(A.f(), type[A])
+assert_type(B.f(), type[B])
+
+class Redefined:
+    def f(self):
+        return self
+    g = f
+
+    def f(cls):
+        return cls
+    f = classmethod(f)
+
+assert_type(Redefined().g(), Redefined)
+assert_type(Redefined.f(), type[Redefined])
+
+class Generic[T = str]:
+    def f(self):
+        return self
+
+    g = f
+    f = classmethod(f)
+
+assert_type(Generic[int]().g(), Generic[int])
+assert_type(Generic[int].f(), type[Generic[int]])
+
+class WithSelf:
+    def f(self, other: Self) -> Self:
+        return other
+
+    g = f
+    f = classmethod(f)
+
+assert_type(WithSelf().g(WithSelf()), WithSelf)
+assert_type(WithSelf.f(WithSelf()), WithSelf)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_captured_default,
+    r#"
+from typing import Callable, assert_type
+
+class A:
+    def f(self) -> int:
+        return 1
+
+    def use(self, callback: Callable[[A], int] = f) -> int:
+        return callback(self)
+
+    f = classmethod(f)
+
+assert_type(A().use(), int)
+assert_type(A.f(), int)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_receiver_dependent_return,
+    r#"
+from typing import assert_type
+
+class A:
+    @classmethod
+    def helper(cls):
+        return cls
+
+    def f(self):
+        return self.helper()
+
+    g = f
+    f = classmethod(f)
+
+class B(A):
+    pass
+
+assert_type(A.f(), type[A])
+assert_type(A().g(), type[A])
+assert_type(B.f(), type[B])
+assert_type(B().g(), type[B])
+
+class Generic[T]:
+    @classmethod
+    def helper(cls):
+        return cls
+
+    def f(self):
+        return self.helper()
+
+    g = f
+    f = classmethod(f)
+
+assert_type(Generic[int].f(), type[Generic[int]])
+assert_type(Generic[int]().g(), type[Generic[int]])
+
+class Specialized(Generic[int]):
+    pass
+
+assert_type(Specialized.f(), type[Specialized])
+assert_type(Specialized().g(), type[Specialized])
+
+class Factory[T]:
+    @classmethod
+    def helper(cls):
+        return cls()
+
+    def f(self):
+        return self.helper()
+
+    g = f
+    f = classmethod(f)
+
+assert_type(Factory[str].f(), Factory[str])
+assert_type(Factory[str]().g(), Factory[str])
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_defaulted_type_parameter,
+    r#"
+from typing import assert_type
+
+class A:
+    def f[T = int](self, x: T) -> T:
+        return x
+
+    g = f
+    f = classmethod(f)
+
+assert_type(A.f(1), int)
+assert_type(A().g("hello"), str)
+
+class SameName:
+    def f[Receiver = int](self, x: Receiver) -> Receiver:
+        return x
+
+    g = f
+    f = classmethod(f)
+
+assert_type(SameName.f(1), int)
+assert_type(SameName().g("hello"), str)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_decorator_composition,
+    r#"
+from typing import Callable, Concatenate, assert_type
+
+def adapt[**P, R](f: Callable[Concatenate[A, P], R]) -> Callable[Concatenate[type[A], P], R]:
+    def wrapper(cls: type[A], *args: P.args, **kwargs: P.kwargs) -> R:
+        return f(cls(), *args, **kwargs)
+    return wrapper
+
+class A:
+    @adapt
+    def f(self, x: int) -> int:
+        self.value = x
+        return x
+
+    f = classmethod(f)
+
+assert_type(A.f(1), int)
+assert_type(A().f(1), int)
+A.value  # E: Instance-only attribute `value` of class `A` is not visible on the class
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_overload,
+    r#"
+from typing import assert_type, overload
+
+class A:
+    @overload
+    def f(cls, x: int) -> int: ...
+    @overload
+    def f(cls, x: str) -> str: ...
+    def f(cls, x: int | str) -> int | str:
+        return x
+
+    g = f
+    f = classmethod(f)
+
+assert_type(A.f(1), int)
+assert_type(A().f("hello"), str)
+assert_type(A().g(1), int)
+assert_type(A().g("hello"), str)
+    "#,
+);
+
+// Receiver-boundary tests keep instance aliases precise when class access has different behavior.
+testcase!(
+    test_desugared_receiver_boundary_descriptor,
+    r#"
+from typing import assert_type, overload
+
+class Descriptor:
+    @overload
+    def __get__(self, obj: None, owner: type[object]) -> str: ...
+    @overload
+    def __get__(self, obj: A, owner: type[object]) -> int: ...
+    def __get__(self, obj: object | None, owner: type[object]) -> int | str:
+        return "class" if obj is None else 1
+
+class A:
+    value = Descriptor()
+    def f(self):
+        return self.value
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_receiver_alias,
+    r#"
+from typing import assert_type
+
+class A:
+    @property
+    def value(self) -> int:
+        return 1
+    def f(self):
+        receiver = self
+        return receiver.value
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_nested_capture,
+    r#"
+from typing import assert_type
+
+class A:
+    @property
+    def value(self) -> int:
+        return 1
+    def f(self):
+        def read():
+            return self.value
+        return read
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g()(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_final_helper,
+    r#"
+from typing import assert_type
+
+class A:
+    @classmethod
+    def helper(cls) -> int:
+        return 1
+    def f(self):
+        return self.helper()
+    g = f
+    f = classmethod(f)
+    def helper(self) -> str:
+        return "instance"
+
+assert_type(A().g(), str)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_instance_field,
+    r#"
+from typing import assert_type
+
+class A:
+    def __init__(self):
+        self.value = 1
+    def f(self):
+        return self.value
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_generic_helper,
+    r#"
+from typing import assert_type
+
+class A[T]:
+    @classmethod
+    def helper(cls, value: T) -> T:
+        return value
+    def f(self, value: T):
+        return self.helper(value)
+    g = f
+    f = classmethod(f)
+
+assert_type(A[int]().g(1), int)
+assert_type(A[int].f(1), int)
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_helper_before_wrap,
+    r#"
+from typing import assert_type
+
+class A:
+    @classmethod
+    def helper(cls) -> int:
+        return 1
+    def f(self):
+        return self.helper()
+    g = f
+    def helper(self) -> str:
+        return "instance"
+    f = classmethod(f)
+
+assert_type(A().g(), str)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_receiver_boundary_receiver_write,
+    r#"
+from typing import assert_type
+
+class A:
+    def f(self) -> int:
+        self.created = 1
+        return 1
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.created  # E: Instance-only attribute `created`
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_classmethod_respects_shadowing,
+    r#"
+from typing import Self, assert_type
+
+def identity[T](x: T) -> T:
+    return x
+
+class A:
+    classmethod = identity
+
+    def f(self):
+        assert_type(self, Self)
+        return self
+
+    f = classmethod(f)
+
+assert_type(A().f(), A)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_rebound_decorator,
+    r#"
+from typing import Callable, overload
+
+def adapt(f: Callable[[A], int]) -> Callable[[type[A]], int]:
+    def wrapper(cls: type[A]) -> int:
+        return f(cls())
+    return wrapper
+
+class A:
+    @adapt
+    def f(self) -> int:
+        return 1
+    adapt = overload
+    f = classmethod(f)
+
+A.f()
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_branch_alias,
+    r#"
+from typing import assert_type
+
+def example(flag: bool) -> None:
+    class A:
+        def f(self):
+            return self
+        if flag:
+            f = classmethod(f)
+        else:
+            g = f
+    if not flag:
+        assert_type(A().g(), A)
+
+example(False)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_property_alias,
+    r#"
+from typing import assert_type
+
+class A:
+    @property
+    def value(self) -> int:
+        return 1
+    def f(self):
+        return self.value
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+value: int = A().g()
+    "#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/793 - we don't
+// want the `contextmanager` decorator to lose the "forall-ness" of the decorated
+// function.
+testcase!(
+    test_contextmanager_preserves_tparams_and_forall,
+    r#"
+import contextlib
+from contextlib import contextmanager
+from typing import Generator, List, assert_type
+
+@contextmanager
+def generic_ctx[T](val: T) -> Generator[T, None, None]:
+    yield val
+
+def test(x: int, items: List[int]):
+    with generic_ctx(x) as val:
+        assert_type(val, int)
+    m = generic_ctx(items)
+    assert_type(m, contextlib._GeneratorContextManager[List[int], None, None])
+"#,
+);
+
+// When we preserve "forall-ness" of decorated callables, we need to make sure
+// that we don't accidentally leak `Type::Quantified` when a decorator returns
+// a generic non-callable type.
+testcase!(
+    test_decorator_returns_non_callable_produces_gradual_type,
+    r#"
+from typing import TypeVar, Callable, List, assert_type, Any
+
+def list_decorator[T](f: Callable[[T], T]) -> List[T]: ...
+
+@list_decorator
+def my_func[T](x: T) -> T:
+    return x
+
+def test():
+    assert_type(my_func, List[Any])
+"#,
+);
+
+// If a decorator returns a callable that has additional tparams that weren't
+// in the original function, we need to make sure the decorated function type is
+// generic over all tparams.
+testcase!(
+    test_decorator_adds_new_tparams_to_forall,
+    r#"
+from typing import TypeVar, Callable, Tuple, assert_type
+
+def add_generic[T, S](f: Callable[[T], T]) -> Callable[[T, S], Tuple[T, S]]:
+    return lambda x, y: (f(x), y)
+
+@add_generic
+def my_func[T](x: T) -> T:
+    return x
+
+def test(x: int, y: str):
+    res = my_func(x, y)
+    assert_type(res, Tuple[int, str])
+"#,
+);
+
+// If a decorator converts a generic callable into a non-generic, we should drop the callable's tparams
+testcase!(
+    test_decorator_strips_tparams_and_forall,
+    r#"
+from typing import TypeVar, Callable, Tuple, reveal_type
+
+def add_generic[T](f: Callable[[T], T]) -> Callable[[object], None]:
+    ...
+
+@add_generic
+def my_func[T](x: T) -> T:
+    return x
+
+reveal_type(my_func)  # E: revealed type: (object) -> None
+"#,
+);
+
+testcase!(
+    test_dual_use_decorator,
+    r#"
+from typing import assert_type
+from functools import wraps
+
+def optional_debug(func_or_flag=None):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    if callable(func_or_flag):
+        return decorator(func_or_flag)
+    return decorator
+
+# Used without parentheses — func_or_flag receives the function directly.
+@optional_debug
+def compute(x: int, y: int, z: int) -> int:
+    return x + y + z
+
+r1 = compute(1, 2, 3)
+assert_type(r1, int)
+
+# Used with parentheses — func_or_flag receives the flag, returns decorator.
+@optional_debug(True)
+def compute2(x: int, y: int, z: int) -> int:
+    return x + y + z
+
+r2 = compute2(1, 2, 3)
+assert_type(r2, int)
+    "#,
+);
+
+testcase!(
+    test_unannotated_decorator_preserves_signature,
+    r#"
+from typing import assert_type
+
+def make_decorator(target, decorator_func):
+    decorator_func.__name__ = target.__name__
+    return decorator_func
+
+def add_dispatch_support(target=None):
+    def decorator(dispatch_target):
+        def op_dispatch_handler(*args, **kwargs):
+            return dispatch_target(*args, **kwargs)
+        op_dispatch_handler = make_decorator(dispatch_target, op_dispatch_handler)
+        return op_dispatch_handler
+    if target is None:
+        return decorator
+    return decorator(target)
+
+@add_dispatch_support
+def matmul(a: int, b: int, name: str | None = None) -> int:
+    return a + b
+
+r = matmul(1, 2, name="test")
+assert_type(r, int)
+    "#,
+);
+
+fn env_numba() -> TestEnv {
+    let mut env = TestEnv::one_with_path(
+        "numba",
+        "numba/__init__.pyi",
+        r#"
+from numba.core.decorators import jit, njit
+"#,
+    );
+    env.add_with_path(
+        "numba.core.decorators",
+        "numba/core/decorators.pyi",
+        r#"
+def jit(*args, **kwargs): ...
+def njit(*args, **kwargs): ...
+"#,
+    );
+    env
+}
+
+testcase!(
+    test_numba_jit_decorators_preserve_signature,
+    env_numba(),
+    r#"
+import numba
+from typing import assert_type
+
+@numba.jit(nopython=True)
+def test1(a: int, b: int) -> int:
+    return a + b
+
+@numba.njit(cache=True)
+def test2(a: int, b: int) -> int:
+    return a + b
+
+assert_type(test1(1, 2), int)
+assert_type(test2(1, 2), int)
+"#,
+);
+
+testcase!(
+    test_disjoint_base_decorator_misuse,
+    r#"
+from typing import NamedTuple, Protocol, TypedDict, assert_never
+from typing_extensions import disjoint_base
+
+@disjoint_base
+class Nominal:
+    pass
+
+@disjoint_base
+class Row(NamedTuple):
+    x: int
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a function
+def f() -> None:
+    pass
+
+class C:
+    @disjoint_base  # E: `@disjoint_base` cannot be applied to a function
+    def m(self) -> None:
+        pass
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a TypedDict
+class Movie(TypedDict):
+    name: str
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a Protocol
+class SupportsClose(Protocol):
+    def close(self) -> None:
+        ...
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a Protocol
+class BadProto(Protocol):
+    pass
+
+@disjoint_base
+class Other:
+    pass
+
+def keep_invalid_protocol_out_of_disjoint_base(x: BadProto) -> None:
+    if isinstance(x, Other):
+        # If `@disjoint_base` on a Protocol were honored, the intersection of
+        # the two disjoint bases would narrow `x` to `Never` and `assert_never`
+        # would be silently accepted. The error here proves the Protocol was
+        # NOT marked as a disjoint base.
+        assert_never(x)  # E: not assignable to parameter `arg` with type `Never`
+
+# A concrete (non-Protocol) class extending `BadProto` should not error, since
+# the rejected `@disjoint_base` on `BadProto` is not inherited.
+class ConcreteFromBadProto(BadProto):
+    pass
+"#,
+);
+
+testcase!(
+    test_disjoint_base_decorator_misuse_from_typing,
+    TestEnv::new_with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+from typing import Protocol, disjoint_base
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a function
+def f() -> None:
+    pass
+
+@disjoint_base  # E: `@disjoint_base` cannot be applied to a Protocol
+class P(Protocol):
+    pass
+"#,
+);
+
+testcase!(
+    test_disjoint_base_incompatible_inheritance,
+    r#"
+from typing import NamedTuple
+from typing_extensions import disjoint_base
+
+@disjoint_base
+class Left: ...
+
+@disjoint_base
+class Right: ...
+
+@disjoint_base
+class Third: ...
+
+@disjoint_base
+class LeftChild(Left): ...
+
+@disjoint_base
+class Record(NamedTuple):
+    value: int
+
+class Plain: ...
+
+class LeftOnly(Left, Plain): ...
+class MostSpecific(LeftChild, Left): ...
+
+class LeftA(Left): ...
+class LeftB(Left): ...
+class SameRepresentative(LeftA, LeftB): ...
+
+class LeftAndObject(Left, object): ...
+class LeftAndInt(Left, int): ...  # E: incompatible disjoint bases
+
+class Bad(Left, Right): ...  # E: inherits from incompatible disjoint bases `Left`, `Right`
+class BadThree(Left, Right, Third): ...  # E: inherits from incompatible disjoint bases `Left`, `Right`, `Third`
+class BadViaChild(LeftChild, Right): ...  # E: incompatible disjoint bases
+class BadViaLeftOnly(LeftOnly, Right): ...  # E: incompatible disjoint bases
+# `Bad` cached `Left` (its first direct base), so re-conflicts with `Right`
+# but not with `Left`.
+class BadViaInvalidIntermediate(Bad, Right): ...  # E: incompatible disjoint bases
+class BadViaInvalidIntermediateCompatible(Bad, Left): ...
+
+class LeftRecord(Left, Record): ...  # E: incompatible disjoint bases
+
+@disjoint_base
+class DecoratedBad(Left, Right): ...  # E: incompatible disjoint bases
+
+# `Right` is already in `DecoratedBad`'s MRO, so no new conflict.
+class CascadingFromDecoratedBad(DecoratedBad, Right): ...
+"#,
+);
+
+// `@dataclass(slots=True)` promotes a class to its own disjoint-base
+// representative only when synthesis produces a fresh slot name. A bare
+// `@dataclass` middle class must not re-credit its grandparent's slots.
+testcase!(
+    test_disjoint_base_dataclass_slots_through_bare_middle_class,
+    r#"
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class A:
+    x: int
+
+@dataclass
+class B(A): ...
+
+@dataclass(slots=True)
+class CNoNew(B): ...
+
+@dataclass(slots=True)
+class CNew(B):
+    y: int
+
+class Other:
+    __slots__ = ("z",)
+
+# CNoNew inherits `A` as representative (no fresh slot synthesized).
+class MixNoNew(CNoNew, Other): ...  # E: incompatible disjoint bases `A`, `Other`
+# CNew synthesizes `y`, becoming its own representative.
+class MixNew(CNew, Other): ...  # E: incompatible disjoint bases `CNew`, `Other`
+"#,
+);
+
+testcase!(
+    test_unannotated_class_decorator,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+def my_decorator(cls):
+    return cls
+
+@my_decorator  # E: Untyped class decorator may modify `A` in unexpected ways
+class A: ...
+"#,
+);
+
+testcase!(
+    test_class_decorator_returns_unknown,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+from typing import Callable
+
+def untyped(x):
+    return x
+
+def returns_unknown(cls: type):
+    return untyped(cls)
+
+def returns_unknown_or_none(cls: type, flag: bool = True):
+    return untyped(cls) if flag else None
+
+def factory(**kwargs: int) -> Callable:
+    return untyped
+
+@returns_unknown  # E: Untyped class decorator may modify `A` in unexpected ways
+class A: ...
+
+@returns_unknown_or_none  # E: Untyped class decorator may modify `B` in unexpected ways
+class B: ...
+
+@factory(x=1)  # E: Untyped class decorator may modify `C` in unexpected ways
+class C: ...
+"#,
+);
+
+testcase!(
+    test_stacked_class_decorators_blame_first_unknown,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+def untyped(cls):
+    return cls
+
+# Decorators apply bottom-up, so only the lower one is blamed for the unknown result.
+@untyped
+@untyped  # E: Untyped class decorator may modify `A` in unexpected ways
+class A: ...
+"#,
+);
+
+testcase!(
+    test_typed_class_decorator_no_error,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+from typing import TypeVar
+T = TypeVar("T")
+
+def typed(cls: type[T]) -> type[T]:
+    return cls
+
+@typed
+class B: ...
+"#,
+);
+
+testcase!(
+    test_class_decorator_explicit_any_return_no_error,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+from typing import Any
+
+def anydec(cls) -> Any: ...
+
+@anydec
+class C: ...
+"#,
+);
+
+testcase!(
+    test_unannotated_callable_instance_class_decorator,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+class Decorator:
+    def __call__(self, cls):
+        return cls
+
+class TypedDecorator:
+    def __call__[T](self, cls: type[T]) -> type[T]:
+        return cls
+
+@Decorator()  # E: Untyped class decorator may modify `D` in unexpected ways
+class D: ...
+
+@TypedDecorator()
+class E: ...
+"#,
+);
+
+testcase!(
+    test_implicit_any_class_decorator,
+    TestEnv::new().enable_untyped_class_decorator_error(),
+    r#"
+def untyped(x):
+    return x
+
+d = untyped(1)
+
+@d  # E: Untyped class decorator
+class C: ...
+"#,
+);
+
+testcase!(
+    test_untyped_function_decorator,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Any
+
+my_decorator: Any = lambda f: f
+
+@my_decorator  # E: Untyped function decorator obscures the type of function `g`
+def g() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_untyped_method_decorator,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Any
+
+my_decorator: Any = lambda f: f
+
+class C:
+    @my_decorator  # E: Untyped function decorator obscures the type of function `m`
+    def m(self) -> int:
+        return 1
+"#,
+);
+
+// Pyright exempts fully unannotated decorators because it keeps the undecorated type, but
+// pyrefly does not, so the decorated function really is unknown.
+testcase!(
+    test_unannotated_function_decorator,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+def my_decorator(f):
+    return f
+
+@my_decorator  # E: Untyped function decorator obscures the type of function `g`
+def g() -> int:
+    return 1
+
+class C:
+    @my_decorator  # E: Untyped function decorator obscures the type of function `m`
+    def m(self) -> int:
+        return 1
+"#,
+);
+
+testcase!(
+    test_function_decorator_returns_unknown,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Callable
+
+def untyped(x):
+    return x
+
+def returns_unknown(f: Callable[[], int]):
+    return untyped(f)
+
+def returns_unknown_or_none(f: Callable[[], int], flag: bool = True):
+    return untyped(f) if flag else None
+
+@returns_unknown  # E: Untyped function decorator obscures the type of function `g`
+def g() -> int:
+    return 1
+
+@returns_unknown_or_none  # E: Untyped function decorator obscures the type of function `h`
+def h() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_function_decorator_partially_unknown_no_error,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+# The result is a callable with unknown parameters, which is only partially unknown.
+def wrapping(f):
+    def wrapper(*args, **kwargs):
+        return f(*args, **kwargs)
+    return wrapper
+
+@wrapping
+def g() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_stacked_function_decorators_blame_first_unknown,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+
+def typed(f: T) -> T:
+    return f
+
+def untyped(f):
+    return f
+
+my_decorator: Any = lambda f: f
+
+# Only the decorator that made the type unknown is reported, not the typed one applied after it.
+@typed
+@untyped  # E: Untyped function decorator obscures the type of function `g`
+def g() -> int:
+    return 1
+
+# A decorator whose own type is `Any` is reported once, not again for its result.
+@typed
+@my_decorator  # E: Untyped function decorator obscures the type of function `h`
+def h() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_typed_function_decorator_no_error,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Callable
+
+def typed(f: Callable[[], int]) -> Callable[[], int]:
+    return f
+
+@typed
+def h() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_function_decorator_explicit_any_return_no_error,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Any
+
+def anydec(f) -> Any: ...
+
+@anydec
+def k() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_implicit_any_function_decorator,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+def untyped(x):
+    return x
+
+# `d` has an implicit `Any` type (from an untyped call), which obscures the function too.
+d = untyped(1)
+
+@d  # E: Untyped function decorator obscures the type of function `g`
+def g() -> int:
+    return 1
+"#,
+);
+
+testcase!(
+    test_untyped_function_decorator_suppressed,
+    TestEnv::new().enable_untyped_function_decorator_error(),
+    r#"
+from typing import Any
+
+my_decorator: Any = lambda f: f
+
+@my_decorator  # pyrefly: ignore[untyped-function-decorator]
+def g() -> int:
+    return 1
+"#,
+);
+
+// A decorator with no definition after it parses as a nameless function, whose
+// decorators still have to be bound: a walrus in one defines a real name.
+testcase!(
+    test_decorator_with_no_definition,
+    r#"
+from typing import Literal, assert_type
+@x := 1
+assert_type(x, Literal[1])  # E: Parse error: Expected class, function definition or async function definition after decorator
+"#,
+);
+
+testcase!(
+    test_decorator_with_incomplete_walrus,
+    r#"
+@x :=  # E: Parse error: Expected an expression
+y = 1  # E: Parse error: Expected class, function definition or async function definition after decorator
+"#,
+);
+
+testcase!(
+    test_decorator_on_nameless_class,
+    r#"
+from typing import Literal, assert_type
+@y := 2
+class  # E: Parse error: Expected an identifier
+assert_type(y, Literal[2])  # E: Parse error: Expected an indented block after `class` definition
+"#,
+);
+
+testcase!(
+    test_method_decorated_to_union_with_any,
+    r#"
+from typing import Any, TypeVar, assert_type
+
+T = TypeVar("T")
+
+def maybe_unknown(f: T) -> T | Any: ...
+
+class A:
+    @maybe_unknown
+    def method(self, name: str) -> int: ...
+
+    @maybe_unknown
+    def __getattr__(self, name: str) -> int: ...
+
+def f(a: A) -> None:
+    assert_type(a.method("x"), int | Any)
+    assert_type(a.anything, int | Any)
+"#,
+);
+
+// Calling a special decorator like `property` directly first checks whether it applies to its
+// argument. That check must not report errors for a lambda inferred without the parameter type as a
+// hint, because the normal call then infers the lambda again with the hint.
+testcase!(
+    test_decorator_call_does_not_report_unhinted_lambda,
+    TestEnv::new()
+        .enable_implicit_any_lambda_error()
+        .enable_unknown_attribute_access_error(),
+    r#"
+from functools import cached_property
+
+class C:
+    a = property(lambda self: self.name)
+    b = cached_property(lambda self: self.name)
+    c = staticmethod(lambda x: x.name)  # E: Type of lambda parameter `x` is unknown  # E: The type of attribute `name` is unknown
+"#,
+);
+
+testcase!(
+    test_desugared_classmethod_docstring_write,
+    r#"
+from typing import assert_type
+
+def helper(cls: type[A], value: int) -> int:
+    return value
+
+class A:
+    def f(cls, value: int) -> int:
+        return helper(cls, value)
+    f.__doc__ = helper.__doc__
+    f.__doc__ = "documentation"
+    f.__doc__ += " extension"
+    f = classmethod(f)
+
+assert_type(A.f(1), int)
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_docstring_with_alias,
+    r#"
+from typing import assert_type
+
+class A:
+    def f(self):
+        return self
+    g = f
+    f.__doc__ = "documentation"
+    f = classmethod(f)
+
+assert_type(A().g(), A)
+assert_type(A.f(), type[A])
+    "#,
+);
+
+testcase!(
+    test_desugared_classmethod_docstring_rhs_capture,
+    r#"
+from __future__ import annotations
+from typing import Callable, assert_type
+
+captured: list[Callable[[A], A]] = []
+def capture(fn: Callable[[A], A]) -> str:
+    captured.append(fn)
+    return "documentation"
+
+class A:
+    def f(self):
+        return self
+    f.__doc__ = capture(f)
+    f = classmethod(f)
+
+assert_type(captured[0](A()), A)
+assert_type(A.f(), type[A])
+    "#,
+);
+
+// Special-export aliases must preserve the values captured by their RHS expressions.
+testcase!(
+    test_desugared_provenance_constructor_alias,
+    r#"
+from typing import Self, assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+class A:
+    decorate = identity
+    identity = classmethod
+    def f(self):
+        assert_type(self, Self)
+        return self
+    f = decorate(f)
+
+assert_type(A().f(), A)
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_helper_alias,
+    r#"
+from typing import assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+class A:
+    decorate = identity
+    identity = classmethod
+    @decorate
+    def helper(self):
+        return self
+    def f(self):
+        return self.helper()
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), A)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_partial_phi,
+    r#"
+from typing import Self, assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+flag: bool = bool()
+class A:
+    if flag:
+        decorate = classmethod
+    else:
+        decorate = identity
+    def f(self):
+        assert_type(self, Self)
+        return self
+    f = decorate(f)
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_agreeing_phi,
+    r#"
+from typing import Self, assert_type
+
+cm = classmethod
+flag: bool = bool()
+class A:
+    if flag:
+        decorate = cm
+    else:
+        decorate = cm
+    def f(cls):
+        assert_type(cls, Self)
+        return cls
+    f = decorate(f)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_distinct_import_phi,
+    r#"
+from typing import Self, assert_type
+
+flag: bool = bool()
+class A:
+    if flag:
+        from builtins import classmethod as decorate
+    else:
+        from builtins import classmethod as decorate
+    def f(cls):
+        assert_type(cls, type[Self])
+        return cls
+    f = decorate(f)
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_same_name_alias,
+    r#"
+from typing import Self, assert_type
+
+class A:
+    decorate = classmethod
+    decorate = decorate
+    def f(cls):
+        assert_type(cls, Self)
+        return cls
+    f = decorate(f)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_module_alias,
+    r#"
+import builtins as b
+from typing import Self, assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+class A:
+    decorate = b.classmethod
+    b = identity
+    def f(cls):
+        assert_type(cls, Self)
+        return cls
+    f = decorate(f)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_large_agreeing_diamond,
+    r#"
+from typing import Self, assert_type
+
+flag: bool = bool()
+a0 = classmethod
+class A:
+    if flag: a1 = a0
+    else: a1 = a0
+    if flag: a2 = a1
+    else: a2 = a1
+    if flag: a3 = a2
+    else: a3 = a2
+    if flag: a4 = a3
+    else: a4 = a3
+    if flag: a5 = a4
+    else: a5 = a4
+    if flag: a6 = a5
+    else: a6 = a5
+    if flag: a7 = a6
+    else: a7 = a6
+    if flag: a8 = a7
+    else: a8 = a7
+    if flag: a9 = a8
+    else: a9 = a8
+    if flag: a10 = a9
+    else: a10 = a9
+    if flag: a11 = a10
+    else: a11 = a10
+    if flag: a12 = a11
+    else: a12 = a11
+    if flag: a13 = a12
+    else: a13 = a12
+    if flag: a14 = a13
+    else: a14 = a13
+    if flag: a15 = a14
+    else: a15 = a14
+    if flag: a16 = a15
+    else: a16 = a15
+    if flag: a17 = a16
+    else: a17 = a16
+    if flag: a18 = a17
+    else: a18 = a17
+    if flag: a19 = a18
+    else: a19 = a18
+    if flag: a20 = a19
+    else: a20 = a19
+    if flag: a21 = a20
+    else: a21 = a20
+    if flag: a22 = a21
+    else: a22 = a21
+    if flag: a23 = a22
+    else: a23 = a22
+    if flag: a24 = a23
+    else: a24 = a23
+    if flag: a25 = a24
+    else: a25 = a24
+    if flag: a26 = a25
+    else: a26 = a25
+    if flag: a27 = a26
+    else: a27 = a26
+    if flag: a28 = a27
+    else: a28 = a27
+    if flag: a29 = a28
+    else: a29 = a28
+    if flag: a30 = a29
+    else: a30 = a29
+    if flag: a31 = a30
+    else: a31 = a30
+    if flag: a32 = a31
+    else: a32 = a31
+    def f(cls):
+        assert_type(cls, Self)
+        return cls
+    f = a32(f)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_attribute_sensitive_diamond,
+    r#"
+import builtins as b
+from typing import Self, assert_type
+
+flag: bool = bool()
+class A:
+    if flag:
+        decorate = b.classmethod
+    else:
+        decorate = b.staticmethod
+    def f(self):
+        assert_type(self, Self)
+        return self
+    f = decorate(f)
+"#,
+);
+
+testcase!(
+    test_desugared_provenance_direct_module_import,
+    r#"
+import builtins as b
+from typing import Self, assert_type
+
+class A:
+    def f(cls):
+        assert_type(cls, type[Self])
+        return cls
+    f = b.classmethod(f)
+
+assert_type(A.f(), type[A])
+"#,
+);
+
+// Coverage for class-local receiver bookkeeping and conservative operation boundaries.
+testcase!(
+    test_desugared_cleanup_generic_static_helper,
+    r#"
+from typing import assert_type
+
+class A[T]:
+    @staticmethod
+    def helper[U](value: U) -> U:
+        return value
+    def f(self, value: T):
+        return self.helper(value)
+    g = f
+    f = classmethod(f)
+
+assert_type(A[int]().g(1), int)
+assert_type(A[int].f(1), int)
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_shadowed_static_decorator,
+    r#"
+from typing import assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+class A:
+    staticmethod = identity
+    @staticmethod
+    def helper(self) -> int:
+        return 1
+    def f(self):
+        return self.helper()
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_super_in_used_group,
+    r#"
+from typing import assert_type
+
+class Base:
+    def helper(self) -> int:
+        return 1
+
+class A(Base):
+    def f(self):
+        return super().helper()
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), int)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_rejected_overload_group,
+    r#"
+from typing import assert_type, overload
+
+class A:
+    @overload
+    def f(self, value: int) -> int: ...
+    @overload
+    def f(self, value: str) -> str: ...
+    def f(self, value: int | str) -> int | str:
+        receiver = self
+        return value
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(1), int)
+assert_type(A().g("hello"), str)
+A.f(1)  # E: No matching overload
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_used_custom_decorator,
+    r#"
+from typing import assert_type
+
+def identity[T](value: T) -> T:
+    return value
+
+class A:
+    @identity
+    def f(self):
+        return self
+    g = f
+    f = classmethod(f)
+
+assert_type(A().g(), A)
+A.f()  # E: Argument `type[A]` is not assignable
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_with_conversion,
+    r#"
+from contextlib import suppress
+from typing import Self, assert_type
+
+class A:
+    def f(self):
+        assert_type(self, Self)
+        return self
+    with suppress(Exception):
+        f = classmethod(f)
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_conditional_definitions,
+    r#"
+from typing import Self, assert_type
+
+flag: bool = bool()
+class A:
+    if flag:
+        def f(self):
+            assert_type(self, Self)
+            return self
+    else:
+        def f(self):
+            assert_type(self, Self)
+            return self
+    f = classmethod(f)  # E: Argument
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_generic_captured_default,
+    r#"
+from typing import Callable, assert_type
+
+class A:
+    def f(self) -> int:
+        return 1
+    def use[T](self, marker: T, callback: Callable[[A], int] = f) -> int:
+        return callback(self)
+    f = classmethod(f)
+
+assert_type(A().use("marker"), int)
+assert_type(A.f(), int)
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_mixed_overload_decorators,
+    r#"
+from typing import Self, assert_type, overload
+
+def identity[F](function: F) -> F:
+    return function
+
+class A:
+    @overload
+    @identity
+    def f(self, value: int) -> int: ...
+    @overload
+    @identity
+    def f(self, value: str) -> str: ...
+    def f(self, value: int | str) -> int | str:
+        assert_type(self, Self)
+        return value
+    f = classmethod(f)
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_repeated_overload_decorators,
+    r#"
+from typing import Self, assert_type, overload
+
+class A:
+    @overload
+    @overload
+    def f(cls, value: int) -> int: ...
+    @overload
+    @overload
+    def f(cls, value: str) -> str: ...
+    def f(cls, value: int | str) -> int | str:
+        assert_type(cls, type[Self])
+        return value
+    f = classmethod(f)
+"#,
+);
+
+testcase!(
+    test_desugared_cleanup_comprehension_iterator_capture,
+    r#"
+from typing import assert_type
+
+class A:
+    def f(self):
+        return self
+    xs = [x for x in (f,)]
+    f = classmethod(f)
+
+assert_type(A.xs[0](A()), A)
+assert_type(A.f(), type[A])
+"#,
+);

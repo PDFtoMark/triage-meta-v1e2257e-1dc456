@@ -1,0 +1,130 @@
+name: "CI: Extension test"
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      wheels:
+        description: 'Test the packages made from the `dist` artifact of the calling run'
+        type: boolean
+        default: false
+    outputs:
+      prerelease_flag:
+        description: '"--pre-release" if dev version, empty string otherwise'
+        value: ${{ jobs.build_extension.outputs.prerelease_flag }}
+  push:
+    branches: [ main ]
+    paths:
+      - '**/*'
+      - '!.*'
+      - '.github/workflows/ci_extension_build.yml'
+      - '.github/workflows/ci_extension_test.yml'
+  # Narrower than the push trigger above, because a pull request pays for the
+  # whole nine-platform binary build before any test runs. Server changes are
+  # already covered per pull request by the Rust and Scrut suites in
+  # ci_pyrefly.yml; what only this workflow can check is the extension itself,
+  # against the packaged VSIX.
+  pull_request:
+    paths:
+      - 'lsp/**'
+      - '.github/workflows/ci_extension_build.yml'
+      - '.github/workflows/ci_extension_test.yml'
+
+jobs:
+  build_extension:
+    uses: ./.github/workflows/ci_extension_build.yml
+    with:
+      wheels: ${{ inputs.wheels || false }}
+
+  test_extension:
+    needs: build_extension
+    if: success()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            arch: x64
+          - os: windows-11-arm
+            platform: win32
+            arch: arm64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          # GitHub's ARM64 runners cannot run 32-bit ARM code, so the ARMv7
+          # executable runs through QEMU instead.
+          - os: ubuntu-latest
+            platform: linux
+            arch: armhf
+          - os: ubuntu-latest
+            platform: alpine
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: alpine
+            arch: arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+          - os: macos-15
+            platform: darwin
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repo (to see version.bzl in next step)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Get all history for all branches and tags
+      - name: download built vsix
+        uses: actions/download-artifact@v7
+        with:
+          name: pyrefly-${{ matrix.platform }}-${{ matrix.arch }}
+      - name: Rename .vsix to .zip
+        run: |
+            mv *.vsix *.zip
+        shell: bash
+      - name: Extract .zip file
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            powershell -Command "Expand-Archive -Path *.zip -DestinationPath extracted"
+          else
+            unzip *.zip -d extracted
+          fi
+        shell: bash
+      - name: Copy extracted files to lsp/bin
+        run: |
+          mkdir -p lsp/bin && mv extracted/extension/bin/* lsp/bin/
+        shell: bash
+      - name: Set up QEMU for the ARMv7 executable
+        if: ${{ matrix.arch == 'armhf' }}
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install --yes --no-install-recommends qemu-user-binfmt libc6-armhf-cross libgcc-s1-armhf-cross
+          echo "QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf" >> "$GITHUB_ENV"
+      # Now run the test
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        working-directory: lsp/
+      - run: npm run compile
+        working-directory: lsp/
+      - name: Run single-root extension tests
+        run: bash ./run_extension_tests.sh single-root
+        shell: bash
+        working-directory: lsp/
+      - name: Run multi-root extension tests
+        run: bash ./run_extension_tests.sh multi-root
+        shell: bash
+        working-directory: lsp/
+      - name: Run no-folders extension tests
+        run: bash ./run_extension_tests.sh no-folders
+        shell: bash
+        working-directory: lsp/
+      - name: Run failed-start extension tests
+        run: bash ./run_extension_tests.sh failed-start
+        shell: bash
+        working-directory: lsp/

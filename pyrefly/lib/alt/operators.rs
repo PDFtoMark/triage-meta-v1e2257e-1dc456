@@ -1,0 +1,1501 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use pyrefly_graph::index::Idx;
+use pyrefly_python::ast::Ast;
+use pyrefly_python::dunder;
+use pyrefly_types::dimension::Int;
+use pyrefly_types::dimension::canonicalize;
+use pyrefly_types::dimension::int_type_is_provably_nonnegative;
+use pyrefly_types::function::BodyKind;
+use pyrefly_types::known_class::KnownClass;
+use pyrefly_types::lit_int::LitInt;
+use pyrefly_types::literal::LitStyle;
+use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::simplify::intersect;
+use pyrefly_types::type_var::Restriction;
+use pyrefly_util::prelude::VecExt;
+use ruff_python_ast::CmpOp;
+use ruff_python_ast::ExprBinOp;
+use ruff_python_ast::ExprCompare;
+use ruff_python_ast::ExprUnaryOp;
+use ruff_python_ast::Operator;
+use ruff_python_ast::StmtAugAssign;
+use ruff_python_ast::UnaryOp;
+use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+
+use crate::alt::answers::LookupAnswer;
+use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::call::CallStyle;
+use crate::alt::callable::CallArg;
+use crate::alt::expr::MAX_TUPLE_LENGTH;
+use crate::alt::narrow::IntersectFallback;
+use crate::alt::solve::TypeFormContext;
+use crate::alt::unwrap::HintRef;
+use crate::binding::binding::KeyAnnotation;
+use crate::config::error_kind::ErrorKind;
+use crate::error::collector::ErrorCollector;
+use crate::error::context::ErrorContext;
+use crate::error::context::TypeCheckContext;
+use crate::error::context::TypeCheckKind;
+use crate::module::typeshed::typeshed;
+use crate::types::class::Class;
+use crate::types::literal::Lit;
+use crate::types::tuple::Tuple;
+use crate::types::types::BoundMethodType;
+use crate::types::types::Type;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EqualityCompatibilityGroup {
+    Numeric,
+    BytesLike,
+    SetLike,
+    Str,
+}
+
+enum BinaryOperatorOrder {
+    ForwardOnly,
+    ForwardFirst,
+    ReflectedFirst,
+}
+
+/// A value includes `Never`, which means that execution does not return.
+enum OperatorReturn {
+    Value(Type),
+    Declined,
+    ValueOrDecline(Type),
+}
+
+/// Failed signatures retain their diagnostics and recovery type until dispatch completes.
+enum OperatorCallOutcome {
+    Missing,
+    SignatureError {
+        callee_errors: ErrorCollector,
+        call_errors: ErrorCollector,
+        ret: Type,
+    },
+    Returned(OperatorReturn),
+}
+
+impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    fn callable_dunder_helper(
+        &self,
+        method_type: Type,
+        range: TextRange,
+        callee_errors: &ErrorCollector,
+        call_errors: &ErrorCollector,
+        context: &dyn Fn() -> ErrorContext,
+        opname: &Name,
+        call_arg_type: &Type,
+    ) -> Type {
+        self.record_resolved_trace(range, &method_type);
+        let callable = self.as_call_target_or_error(
+            method_type,
+            CallStyle::Method(opname),
+            range,
+            callee_errors,
+            Some(context),
+        );
+        self.call_infer_with_return_errors(
+            callable,
+            &[CallArg::ty(call_arg_type, range)],
+            &[],
+            range,
+            call_errors,
+            callee_errors,
+            Some(context),
+            None,
+            None,
+        )
+        .ty
+    }
+
+    fn try_literal_int_binop(op: Operator, lhs: &Type, rhs: &Type) -> Option<Type> {
+        let (Type::Literal(lhs), Type::Literal(rhs)) = (lhs, rhs) else {
+            return None;
+        };
+        let (Lit::Int(lhs), Lit::Int(rhs)) = (&lhs.value, &rhs.value) else {
+            return None;
+        };
+        let result = match op {
+            Operator::Add => lhs.add(rhs),
+            Operator::Sub => lhs.sub(rhs),
+            Operator::Mult => lhs.mul(rhs),
+            Operator::FloorDiv => lhs.floor_div(rhs)?,
+            _ => return None,
+        };
+        Some(result.to_implicit_type())
+    }
+
+    /// Try to handle binary operations on symbolic integer types.
+    /// Returns Some(result_type) if the operation was handled, None otherwise.
+    fn try_int_binop(&self, op: Operator, lhs: &Type, rhs: &Type) -> Option<Type> {
+        // Only handle if tensor shapes feature is enabled
+        if !self.solver().config.tensor_shapes {
+            return None;
+        }
+
+        // Only handle arithmetic operations that make sense for dimensions
+        if !matches!(
+            op,
+            Operator::Add | Operator::Sub | Operator::Mult | Operator::FloorDiv | Operator::Pow
+        ) {
+            return None;
+        }
+
+        // Literal integers are allowed as the non-shape side of dimension arithmetic, but
+        // ordinary literal arithmetic should keep the normal integer operator behavior.
+        let is_shape_operand = |ty: &Type| match ty {
+            Type::Int(_) => true,
+            Type::Quantified(q) => q.kind() == QuantifiedKind::IntVar,
+            Type::TypeVar(tv) => tv.kind() == QuantifiedKind::IntVar,
+            _ => false,
+        };
+        if !is_shape_operand(lhs) && !is_shape_operand(rhs) {
+            return None;
+        }
+
+        if op == Operator::Pow {
+            let base = match lhs {
+                Type::Literal(lit) => {
+                    let Lit::Int(base) = &lit.value else {
+                        return None;
+                    };
+                    let base = base.as_i64()?;
+                    if base < 0 {
+                        return None;
+                    }
+                    self.heap.mk_int(Int::Literal(base))
+                }
+                Type::Int(_) => lhs.clone(),
+                Type::Quantified(q) if q.kind() == QuantifiedKind::IntVar => lhs.clone(),
+                Type::TypeVar(tv) if tv.kind() == QuantifiedKind::IntVar => lhs.clone(),
+                _ => return None,
+            };
+            let exponent = match rhs {
+                Type::Literal(lit) => {
+                    let Lit::Int(exp) = &lit.value else {
+                        return None;
+                    };
+                    let exp = exp.as_i64()?;
+                    if exp < 0 {
+                        return Some(self.heap.mk_class_type(self.stdlib.float().clone()));
+                    }
+                    self.heap.mk_int(Int::Literal(exp))
+                }
+                Type::Int(Int::Literal(exp)) => {
+                    if *exp < 0 {
+                        return Some(self.heap.mk_class_type(self.stdlib.float().clone()));
+                    }
+                    rhs.clone()
+                }
+                Type::Int(_) if int_type_is_provably_nonnegative(rhs) => rhs.clone(),
+                Type::Int(_) => return Some(self.heap.mk_any_implicit()),
+                Type::Quantified(q) if q.kind() == QuantifiedKind::IntVar => {
+                    return Some(self.heap.mk_any_implicit());
+                }
+                Type::TypeVar(tv) if tv.kind() == QuantifiedKind::IntVar => {
+                    return Some(self.heap.mk_any_implicit());
+                }
+                Type::ClassType(cls) if cls.is(KnownClass::Int) => {
+                    return Some(self.heap.mk_any_implicit());
+                }
+                Type::ClassType(cls) if cls.is(KnownClass::Float) => {
+                    return Some(self.heap.mk_class_type(self.stdlib.float().clone()));
+                }
+                _ if self
+                    .is_subset_eq(rhs, &self.heap.mk_class_type(self.stdlib.int().clone())) =>
+                {
+                    return Some(self.heap.mk_any_implicit());
+                }
+                _ => return None,
+            };
+            return Some(canonicalize(self.heap.mk_int(Int::pow(base, exponent))));
+        }
+
+        // Extract the dimension type from Int or an integer literal paired with one.
+        let to_dim_type = |ty: &Type| -> Option<Type> {
+            match ty {
+                Type::Literal(f) if let Lit::Int(n) = &f.value => {
+                    // Convert literal to `Int`.
+                    n.as_i64().map(|val| self.heap.mk_int(Int::Literal(val)))
+                }
+                Type::Int(_) => {
+                    // `Int` is already a dimension type.
+                    Some(ty.clone())
+                }
+                Type::Quantified(q) if q.kind() == QuantifiedKind::IntVar => Some(ty.clone()),
+                Type::TypeVar(tv) if tv.kind() == QuantifiedKind::IntVar => Some(ty.clone()),
+                _ => None,
+            }
+        };
+
+        let (l_type, r_type) = (to_dim_type(lhs)?, to_dim_type(rhs)?);
+
+        // Perform the operation on the dimension types
+        let result_ty = match op {
+            Operator::Add => canonicalize(self.heap.mk_int(Int::add(l_type, r_type))),
+            Operator::Sub => canonicalize(self.heap.mk_int(Int::sub(l_type, r_type))),
+            Operator::Mult => canonicalize(self.heap.mk_int(Int::mul(l_type, r_type))),
+            Operator::FloorDiv => canonicalize(self.heap.mk_int(Int::floor_div(l_type, r_type))),
+            _ => unreachable!(),
+        };
+
+        Some(result_ty)
+    }
+
+    /// Interpret a successful call without selecting another operator or a completion rule.
+    fn interpret_operator_return(&self, ret: Type, inferred_placeholder: bool) -> OperatorReturn {
+        let is_not_implemented = |ty: &Type| matches!(ty, Type::ClassType(cls) if cls.is(KnownClass::NotImplementedType) || cls.is(KnownClass::TypesNotImplementedType));
+        match ret {
+            ret if is_not_implemented(&ret) => {
+                if inferred_placeholder {
+                    // A wrapper can inherit a sentinel inferred from a base helper, even when
+                    // a subclass overrides that helper. Its concrete result is unknown.
+                    OperatorReturn::Value(self.heap.mk_any_implicit())
+                } else {
+                    OperatorReturn::Declined
+                }
+            }
+            Type::Union(mut union) => {
+                if let Some(index) = union.members.iter().position(is_not_implemented) {
+                    union.members.remove(index);
+                    // Mixed inferred returns retain their concrete types. Identifying returns
+                    // delegated to an overridden helper requires per-return provenance.
+                    OperatorReturn::ValueOrDecline(self.unions(union.members))
+                } else {
+                    OperatorReturn::Value(Type::Union(union))
+                }
+            }
+            ret => OperatorReturn::Value(ret),
+        }
+    }
+
+    /// Report successful-call diagnostics immediately, including methods that decline.
+    fn call_operator(
+        &self,
+        dunder: &Name,
+        target: &Type,
+        arg: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+        context: &dyn Fn() -> ErrorContext,
+    ) -> OperatorCallOutcome {
+        let Some(method) = self.type_of_magic_dunder_attr(
+            target,
+            dunder,
+            range,
+            errors,
+            Some(&context),
+            "Expr::binop_infer",
+            // Operator lookup must not use __getattr__ or __getattribute__.
+            false,
+        ) else {
+            return OperatorCallOutcome::Missing;
+        };
+        let inferred_placeholder = match &method {
+            Type::Overload(_) => false,
+            Type::BoundMethod(method) if matches!(method.func, BoundMethodType::Overload(_)) => {
+                false
+            }
+            _ => method.toplevel_func_metadata().is_some_and(|metadata| {
+                metadata.flags.is_return_inferred
+                    && metadata.flags.body_kind != BodyKind::ReturnNotImplemented
+            }),
+        };
+        let callee_errors = self.error_collector();
+        let call_errors = self.error_collector();
+        let ret = self.callable_dunder_helper(
+            method,
+            range,
+            &callee_errors,
+            &call_errors,
+            &context,
+            dunder,
+            arg,
+        );
+        // Soft errors must not reject an otherwise valid signature.
+        if call_errors.has_hard() {
+            OperatorCallOutcome::SignatureError {
+                callee_errors,
+                call_errors,
+                ret,
+            }
+        } else {
+            errors.extend(callee_errors);
+            OperatorCallOutcome::Returned(self.interpret_operator_return(ret, inferred_placeholder))
+        }
+    }
+
+    /// Callers distribute operand unions and supply the existing method order.
+    /// A definite value ends dispatch. Otherwise, completion uses `unresolved_result` or
+    /// recovers the first signature error when no concrete result is possible.
+    fn try_binop_calls(
+        &self,
+        calls: &[(&Name, &Type, &Type)],
+        range: TextRange,
+        errors: &ErrorCollector,
+        context: &dyn Fn() -> ErrorContext,
+        unresolved_result: Option<Type>,
+    ) -> Type {
+        let mut first_error = None;
+        let mut concrete_result = None;
+        for (dunder, target, arg) in calls {
+            match self.call_operator(dunder, target, arg, range, errors, context) {
+                OperatorCallOutcome::Missing
+                | OperatorCallOutcome::Returned(OperatorReturn::Declined) => {}
+                OperatorCallOutcome::SignatureError {
+                    callee_errors,
+                    call_errors,
+                    ret,
+                } => {
+                    if first_error.is_none() {
+                        first_error = Some((callee_errors, call_errors, ret));
+                    }
+                }
+                OperatorCallOutcome::Returned(OperatorReturn::Value(ret)) => {
+                    return match concrete_result {
+                        Some(previous) => self.union(previous, ret),
+                        None => ret,
+                    };
+                }
+                OperatorCallOutcome::Returned(OperatorReturn::ValueOrDecline(ret)) => {
+                    concrete_result = Some(match concrete_result {
+                        Some(previous) => self.union(previous, ret),
+                        None => ret,
+                    });
+                }
+            }
+        }
+        if first_error.is_none()
+            && let Some(fallback) = unresolved_result
+        {
+            return match concrete_result {
+                Some(previous) => self.union(previous, fallback),
+                None => fallback,
+            };
+        }
+        if let Some(ret) = concrete_result {
+            ret
+        } else if let Some((callee_errors, call_errors, ret)) = first_error {
+            errors.extend(callee_errors);
+            errors.extend(call_errors);
+            ret
+        } else {
+            let dunders = calls
+                .iter()
+                .map(|(dunder, _, _)| format!("`{dunder}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            self.error_with_context(
+                errors,
+                range,
+                ErrorKind::UnsupportedOperation,
+                format!("Cannot find {dunders}"),
+                Some(&context),
+            )
+        }
+    }
+
+    fn tuple_concat(&self, l: &Tuple, r: &Tuple) -> Type {
+        match (l, r) {
+            (Tuple::Concrete(l), Tuple::Concrete(r)) => {
+                let mut elements = l.clone();
+                elements.extend(r.clone());
+                self.heap.mk_concrete_tuple(elements)
+            }
+            (Tuple::Unbounded(l), Tuple::Unbounded(r)) => self
+                .heap
+                .mk_unbounded_tuple(self.union((**l).clone(), (**r).clone())),
+            (Tuple::Concrete(l), r @ Tuple::Unbounded(_)) => {
+                self.heap
+                    .mk_unpacked_tuple(l.clone(), self.heap.mk_tuple(r.clone()), Vec::new())
+            }
+            (l @ Tuple::Unbounded(_), Tuple::Concrete(r)) => {
+                self.heap
+                    .mk_unpacked_tuple(Vec::new(), self.heap.mk_tuple(l.clone()), r.clone())
+            }
+            (Tuple::Unpacked(l), Tuple::Concrete(r)) => {
+                let (l_prefix, l_middle, l_suffix) = l.parts();
+                let mut new_suffix = l_suffix.to_vec();
+                new_suffix.extend(r.clone());
+                self.heap
+                    .mk_unpacked_tuple(l_prefix.to_vec(), l_middle.clone(), new_suffix)
+            }
+            (Tuple::Concrete(l), Tuple::Unpacked(r)) => {
+                let (r_prefix, r_middle, r_suffix) = r.parts();
+                let mut new_prefix = l.clone();
+                new_prefix.extend(r_prefix.to_vec());
+                self.heap
+                    .mk_unpacked_tuple(new_prefix, r_middle.clone(), r_suffix.to_vec())
+            }
+            (Tuple::Unbounded(l), Tuple::Unpacked(r)) => {
+                let (r_prefix, r_middle, r_suffix) = r.parts();
+                let mut middle = r_prefix.to_vec();
+                middle.push((**l).clone());
+                middle.push(
+                    self.unwrap_iterable(r_middle)
+                        .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                );
+                self.heap.mk_unpacked_tuple(
+                    Vec::new(),
+                    self.heap.mk_unbounded_tuple(self.unions(middle)),
+                    r_suffix.to_vec(),
+                )
+            }
+            (Tuple::Unpacked(l), Tuple::Unbounded(r)) => {
+                let (l_prefix, l_middle, l_suffix) = l.parts();
+                let mut middle = l_suffix.to_vec();
+                middle.push((**r).clone());
+                middle.push(
+                    self.unwrap_iterable(l_middle)
+                        .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                );
+                self.heap.mk_unpacked_tuple(
+                    l_prefix.to_vec(),
+                    self.heap.mk_unbounded_tuple(self.unions(middle)),
+                    Vec::new(),
+                )
+            }
+            (Tuple::Unpacked(l), Tuple::Unpacked(r)) => {
+                let (l_prefix, l_middle, l_suffix) = l.parts();
+                let (r_prefix, r_middle, r_suffix) = r.parts();
+                let mut middle = l_suffix.to_vec();
+                middle.extend(r_prefix.to_vec());
+                middle.push(
+                    self.unwrap_iterable(l_middle)
+                        .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                );
+                middle.push(
+                    self.unwrap_iterable(r_middle)
+                        .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                );
+                self.heap.mk_unpacked_tuple(
+                    l_prefix.to_vec(),
+                    self.heap.mk_unbounded_tuple(self.unions(middle)),
+                    r_suffix.to_vec(),
+                )
+            }
+        }
+    }
+
+    fn try_tuple_repeat(&self, lhs: &Type, rhs: &Type) -> Option<Type> {
+        let (elements, repeats) = match (lhs, rhs) {
+            (Type::Tuple(Tuple::Concrete(elts)), Type::Literal(f))
+                if let Lit::Int(n) = &f.value =>
+            {
+                (elts, n.as_i64()?)
+            }
+            (Type::Literal(f), Type::Tuple(Tuple::Concrete(elts)))
+                if let Lit::Int(n) = &f.value =>
+            {
+                (elts, n.as_i64()?)
+            }
+            _ => return None,
+        };
+        if repeats <= 0 {
+            return Some(self.heap.mk_concrete_tuple(Vec::new()));
+        }
+        if repeats == 1 {
+            return Some(self.heap.mk_concrete_tuple(elements.clone()));
+        }
+        let repeats = usize::try_from(repeats).ok()?;
+        let total_len = elements.len().checked_mul(repeats)?;
+        if total_len > MAX_TUPLE_LENGTH {
+            return None;
+        }
+        let mut repeated = Vec::with_capacity(total_len);
+        for _ in 0..repeats {
+            repeated.extend(elements.iter().cloned());
+        }
+        Some(self.heap.mk_concrete_tuple(repeated))
+    }
+
+    fn as_hint_for_display(lhs: &Type) -> Option<HintRef> {
+        // In an operation between `lhs` and a container display (e.g., `[3]`, `{"a": 0)]`), the
+        // type of the display should be inferred using `lhs` as a hint when the latter is a
+        // container type with a display syntax. Hinting is harmless when the types don't match.
+        (matches!(lhs, Type::ClassType(cls) if matches!(cls.class_object().known(), Some(KnownClass::List | KnownClass::Set | KnownClass::Dict)))).then(
+            || HintRef::soft(lhs))
+    }
+
+    pub fn binop_infer(
+        &self,
+        x: &ExprBinOp,
+        hint: Option<HintRef>,
+        errors: &ErrorCollector,
+        type_form_context: Option<TypeFormContext<'_>>,
+    ) -> Type {
+        let lhs;
+        let rhs;
+        if x.op == Operator::BitOr
+            && let Some(type_form_context) = type_form_context
+        {
+            let member_context = TypeFormContext::UnionMember(&type_form_context);
+            lhs = self
+                .expr_infer_impl(&x.left, None, errors, Some(member_context))
+                .into_ty();
+            rhs = self
+                .expr_infer_impl(&x.right, None, errors, Some(member_context))
+                .into_ty();
+        } else {
+            let left_is_display = Ast::contains_only_container_displays(&x.left);
+            let right_is_display = Ast::contains_only_container_displays(&x.right);
+            if left_is_display && right_is_display {
+                // If both operands are literal container displays, pass the contextual hint down
+                lhs = self.expr_infer_with_hint(&x.left, hint, errors);
+                rhs = self.expr_infer_with_hint(&x.right, hint, errors);
+            } else if left_is_display && x.op == Operator::Mult {
+                // If the expression is of the form [X] * Y where Y is a number, pass down the contextual
+                // type hint when evaluating [X]. Hinting non-list displays is harmless.
+                rhs = self.expr_infer(&x.right, errors);
+                if self.is_subset_eq(&rhs, &self.heap.mk_class_type(self.stdlib.int().clone())) {
+                    lhs = self.expr_infer_with_hint(&x.left, hint, errors);
+                } else {
+                    lhs = self.expr_infer(&x.left, errors);
+                }
+            } else if right_is_display {
+                lhs = self.expr_infer(&x.left, errors);
+                rhs = self.expr_infer_with_hint(&x.right, Self::as_hint_for_display(&lhs), errors);
+            } else {
+                lhs = self.expr_infer(&x.left, errors);
+                rhs = self.expr_infer(&x.right, errors);
+            }
+        }
+
+        // Optimisation: If we have `Union[a, b] | Union[c, d]`, instead of unioning
+        // (a | c) | (a | d) | (b | c) | (b | d), we can just do one union.
+        if x.op == Operator::BitOr
+            && type_form_context.is_some()
+            && let Some(l) = self.untype_opt(lhs.clone(), x.left.range(), errors)
+            && let Some(r) = self.untype_opt(rhs.clone(), x.right.range(), errors)
+        {
+            return self.heap.mk_type_of(self.union(l, r));
+        }
+
+        if matches!(x.op, Operator::Div | Operator::FloorDiv | Operator::Mod)
+            && Self::is_literal_zero(&rhs)
+        {
+            self.error(
+                errors,
+                x.range,
+                ErrorKind::DivisionByZero,
+                format!(
+                    "Cannot divide by zero: `{}` with a literal zero divisor",
+                    x.op.as_str()
+                ),
+            );
+        }
+
+        self.binop_types(x, &lhs, &rhs, errors)
+    }
+
+    /// Check if a type is exactly `Literal[0]` (either implicit or explicit).
+    fn is_literal_zero(ty: &Type) -> bool {
+        matches!(ty, Type::Literal(f) if f.value == Lit::Int(LitInt::new(0)))
+    }
+
+    /// Performs an operation `f` on a quantified `q`, which may be narrowed to a concrete type.
+    fn on_quantified(
+        &self,
+        q: &Quantified,
+        narrowed_type: Option<&Type>,
+        f: &dyn Fn(&Type) -> Type,
+    ) -> Type {
+        if let Restriction::Constraints(constraints) = &q.restriction {
+            let cur_constraints = if let Some(narrowed_type) = narrowed_type {
+                vec![narrowed_type]
+            } else {
+                constraints.iter().collect()
+            };
+            self.unions(cur_constraints.into_map(|constraint| {
+                let res = f(constraint);
+                if res == *constraint {
+                    // If f returned the constraint unchanged, preserve the quantified.
+                    intersect(
+                        vec![q.clone().to_type(self.heap), res.clone()],
+                        res,
+                        self.heap,
+                    )
+                } else {
+                    res
+                }
+            }))
+        } else if let Some(narrowed_type) = narrowed_type {
+            f(narrowed_type)
+        } else {
+            f(&q.upper_bound(self.stdlib, self.heap))
+        }
+    }
+
+    fn on_quantifieds(
+        &self,
+        left: &Type,
+        right: &Type,
+        f: &dyn Fn(&Type, &Type) -> Type,
+    ) -> Option<Type> {
+        match (left.as_quantified(), right.as_quantified()) {
+            (
+                Some((
+                    left_q @ Quantified {
+                        restriction: Restriction::Constraints(constraints),
+                        ..
+                    },
+                    left_narrow,
+                )),
+                Some((right_q, right_narrow)),
+            ) if left_q == right_q => {
+                if left_narrow.is_none() && right_narrow.is_none() {
+                    return Some(
+                        self.on_quantified(left_q, None, &|constraint| f(constraint, constraint)),
+                    );
+                }
+                let result = self.unions(
+                    constraints
+                        .iter()
+                        .map(|constraint| {
+                            let narrow_operand = |narrowed: Option<&Type>| {
+                                narrowed.map_or_else(
+                                    || constraint.clone(),
+                                    |narrowed| {
+                                        self.intersect_with_fallback(
+                                            constraint,
+                                            narrowed,
+                                            IntersectFallback::Right,
+                                        )
+                                    },
+                                )
+                            };
+                            // The constraint choice is shared; each operand's value facts are not.
+                            let left = narrow_operand(left_narrow);
+                            let right = narrow_operand(right_narrow);
+                            if left.is_never() || right.is_never() {
+                                self.heap.mk_never()
+                            } else {
+                                f(&left, &right)
+                            }
+                        })
+                        .collect(),
+                );
+                let value_refined = [left_narrow, right_narrow]
+                    .into_iter()
+                    .flatten()
+                    .any(|narrowed| matches!(narrowed, Type::Literal(_)));
+                if value_refined {
+                    // Literal input facts do not provide a result-TypeVar guarantee.
+                    Some(result)
+                } else {
+                    // Retain the existing class-level preservation check after inference.
+                    Some(
+                        self.on_quantified(left_q, left_narrow.or(right_narrow), &|_| {
+                            result.clone()
+                        }),
+                    )
+                }
+            }
+            // We skip non-union bounds to avoid accidentally erasing `Self` typevars.
+            (Some((left_q, left_narrow)), _)
+                if matches!(
+                    left_q.restriction(),
+                    Restriction::Constraints(_) | Restriction::Bound(Type::Union(_))
+                ) =>
+            {
+                Some(
+                    self.on_quantified(left_q, left_narrow, &|left_restriction| {
+                        f(left_restriction, right)
+                    }),
+                )
+            }
+            (_, Some((right_q, right_narrow)))
+                if matches!(
+                    right_q.restriction(),
+                    Restriction::Constraints(_) | Restriction::Bound(Type::Union(_))
+                ) =>
+            {
+                Some(
+                    self.on_quantified(right_q, right_narrow, &|right_restriction| {
+                        f(left, right_restriction)
+                    }),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Equal nominal classes cannot use reflected arithmetic. Unchanged ordinary methods
+    /// do not get subclass priority; protocols and dynamic callables retain the approximation.
+    fn binary_operator_order(&self, op: Operator, lhs: &Type, rhs: &Type) -> BinaryOperatorOrder {
+        if let (Type::ClassType(lhs_cls), Type::ClassType(rhs_cls)) = (lhs, rhs) {
+            let lhs_obj = lhs_cls.class_object();
+            let rhs_obj = rhs_cls.class_object();
+            if lhs_obj == rhs_obj {
+                // Equal protocol annotations do not imply equal runtime classes.
+                return if self.get_metadata_for_class(lhs_obj).is_protocol() {
+                    BinaryOperatorOrder::ForwardFirst
+                } else {
+                    BinaryOperatorOrder::ForwardOnly
+                };
+            }
+            if self.has_superclass(rhs_obj, lhs_obj) {
+                if self.get_metadata_for_class(lhs_obj).is_protocol()
+                    || self.get_metadata_for_class(rhs_obj).is_protocol()
+                {
+                    return BinaryOperatorOrder::ReflectedFirst;
+                }
+                let reflected = Name::new_static(op.reflected_dunder());
+                let Some(right) = self.get_class_member_with_defining_class(rhs_obj, &reflected)
+                else {
+                    return BinaryOperatorOrder::ForwardFirst;
+                };
+                let Some(left) = self.get_class_member_with_defining_class(lhs_obj, &reflected)
+                else {
+                    return BinaryOperatorOrder::ReflectedFirst;
+                };
+                // Classmethods and descriptors can bind differently on the two classes.
+                if !(left.value.is_ordinary_instance_method() || left.value.is_staticmethod())
+                    || !(right.value.is_ordinary_instance_method() || right.value.is_staticmethod())
+                {
+                    return BinaryOperatorOrder::ReflectedFirst;
+                }
+                let left_ty = left.value.ty();
+                let right_ty = right.value.ty();
+                if matches!(left_ty, Type::BoundMethod(_))
+                    || matches!(right_ty, Type::BoundMethod(_))
+                {
+                    return BinaryOperatorOrder::ReflectedFirst;
+                }
+                if left.defining_class == right.defining_class {
+                    return BinaryOperatorOrder::ForwardFirst;
+                }
+                // Factory calls can create distinct functions from the same nested definition.
+                if let (Some(left_meta), Some(right_meta)) = (
+                    left_ty.toplevel_func_metadata(),
+                    right_ty.toplevel_func_metadata(),
+                ) && left_meta.kind == right_meta.kind
+                    && left_meta
+                        .kind
+                        .as_func_def_id()
+                        .is_some_and(|id| id.cls.is_some() || id.qname.parent().is_toplevel())
+                {
+                    return BinaryOperatorOrder::ForwardFirst;
+                }
+                return BinaryOperatorOrder::ReflectedFirst;
+            }
+        }
+        BinaryOperatorOrder::ForwardFirst
+    }
+
+    fn binop_types(&self, x: &ExprBinOp, lhs: &Type, rhs: &Type, errors: &ErrorCollector) -> Type {
+        if let Some(result) = Self::try_literal_int_binop(x.op, lhs, rhs) {
+            return result;
+        }
+
+        let left_range = x.left.range();
+        let right_range = x.right.range();
+        let binop_call = |op: Operator, lhs: &Type, rhs: &Type, range: TextRange| -> Type {
+            let context = || {
+                ErrorContext::BinaryOp(
+                    op.as_str().to_owned(),
+                    self.for_display(lhs.clone()),
+                    self.for_display(rhs.clone()),
+                    left_range,
+                    right_range,
+                )
+            };
+            // Reflected operator implementation: This deviates from the runtime semantics by calling the reflected dunder if the regular dunder call errors.
+            // At runtime, the reflected dunder is called only if the regular dunder method doesn't exist or if it returns NotImplemented.
+            // This deviation is necessary, given that the typeshed stubs don't record when NotImplemented is returned
+            let forward = Name::new_static(op.dunder());
+            let reflected = Name::new_static(op.reflected_dunder());
+            let forward_call = (&forward, lhs, rhs);
+            let reflected_call = (&reflected, rhs, lhs);
+            let mut calls = [forward_call, reflected_call];
+            let calls_to_try = match self.binary_operator_order(op, lhs, rhs) {
+                BinaryOperatorOrder::ForwardOnly => &calls[..1],
+                BinaryOperatorOrder::ForwardFirst => &calls,
+                BinaryOperatorOrder::ReflectedFirst => {
+                    calls.swap(0, 1);
+                    &calls
+                }
+            };
+            self.try_binop_calls(calls_to_try, range, errors, &context, None)
+        };
+        self.distribute_over_union(lhs, |lhs| {
+            self.distribute_over_union(rhs, |rhs| {
+                for (side, is_lhs) in [(lhs, true), (rhs, false)] {
+                    if let Type::Overloaded(branches) = side {
+                        return self.read_overloaded_branches(
+                            branches,
+                            errors,
+                            &|branch, errors| {
+                                let (lhs, rhs) = if is_lhs { (branch, rhs) } else { (lhs, branch) };
+                                self.binop_types(x, lhs, rhs, errors)
+                            },
+                        );
+                    }
+                }
+                // If an Any appears on the RHS, do not refine the return type based on the LHS.
+                // Without loss of generality, consider e1 + e2 where e1 has type int and e2 has type Any.
+                // Then e1 + e2 should have a return type of Any since e2's __radd__  signature could be
+                // inconsistent with the signature of e1 __add__.
+                //
+                if let Some(any) = Type::merge_any_operands(lhs, rhs) {
+                    return any;
+                }
+                if x.op == Operator::BitOr
+                    && let Some(l) = self.untype_opt(lhs.clone(), x.left.range(), errors)
+                    && let Some(r) = self.untype_opt(rhs.clone(), x.right.range(), errors)
+                {
+                    self.heap.mk_type_of(self.union(l, r))
+                } else if x.op == Operator::Add
+                    && let Some(lhs_style) = lhs.lit_string_style()
+                    && let Some(rhs_style) = rhs.lit_string_style()
+                {
+                    self.heap.mk_literal_string(match (lhs_style, rhs_style) {
+                        (LitStyle::Explicit, LitStyle::Explicit) => LitStyle::Explicit,
+                        _ => LitStyle::Implicit,
+                    })
+                } else if x.op == Operator::Add
+                    && let Type::Tuple(l) = lhs
+                    && let Type::Tuple(r) = rhs
+                {
+                    self.tuple_concat(l, r)
+                } else if x.op == Operator::Mult
+                    && let Some(result) = self.try_tuple_repeat(lhs, rhs)
+                {
+                    result
+                } else if let Some(result) = self.try_int_binop(x.op, lhs, rhs) {
+                    result
+                } else if x.op == Operator::Pow
+                    && self.is_subset_eq(lhs, &self.heap.mk_class_type(self.stdlib.int().clone()))
+                    && self.is_subset_eq(rhs, &self.heap.mk_class_type(self.stdlib.int().clone()))
+                {
+                    match rhs {
+                        // Special case int ** int
+                        // if the exponent is 0, return Literal[1] (x ** 0 = 1)
+                        // if the exponent is a positive int, return int
+                        // if the exponent is a negative int, return float
+                        // if the exponent is unknown, call the `__pow__` method like normal
+                        Type::Literal(f) if let Lit::Int(n) = &f.value => {
+                            if *n == LitInt::new(0) {
+                                LitInt::new(1).to_implicit_type()
+                            } else if *n < LitInt::new(0) {
+                                self.heap.mk_class_type(self.stdlib.float().clone())
+                            } else {
+                                self.heap.mk_class_type(self.stdlib.int().clone())
+                            }
+                        }
+                        _ => binop_call(x.op, lhs, rhs, x.range),
+                    }
+                } else {
+                    self.on_quantifieds(lhs, rhs, &|left, right| {
+                        self.binop_types(x, left, right, errors)
+                    })
+                    .unwrap_or_else(|| binop_call(x.op, lhs, rhs, x.range))
+                }
+            })
+        })
+    }
+
+    pub fn augassign_infer(
+        &self,
+        ann: Option<Idx<KeyAnnotation>>,
+        x: &StmtAugAssign,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let target_range = x.target.range();
+        let value_range = x.value.range();
+        let binop_call = |op: Operator, lhs: &Type, rhs: &Type, range: TextRange| -> Type {
+            let context = || {
+                ErrorContext::InplaceBinaryOp(
+                    op.as_str().to_owned(),
+                    self.for_display(lhs.clone()),
+                    self.for_display(rhs.clone()),
+                    target_range,
+                    value_range,
+                )
+            };
+            let mut calls = [
+                (&Name::new_static(op.in_place_dunder()), lhs, rhs),
+                (&Name::new_static(op.dunder()), lhs, rhs),
+                (&Name::new_static(op.reflected_dunder()), rhs, lhs),
+            ];
+            // The inplace method precedes ordinary binary dispatch, even for subclasses.
+            let calls_to_try = match self.binary_operator_order(op, lhs, rhs) {
+                BinaryOperatorOrder::ForwardOnly => &calls[..2],
+                BinaryOperatorOrder::ForwardFirst => &calls,
+                BinaryOperatorOrder::ReflectedFirst => {
+                    calls.swap(1, 2);
+                    &calls
+                }
+            };
+            self.try_binop_calls(calls_to_try, range, errors, &context, None)
+        };
+        let base = self.expr_infer(&x.target, errors);
+        let rhs = if Ast::contains_only_container_displays(&x.value) {
+            self.expr_infer_with_hint(&x.value, Self::as_hint_for_display(&base), errors)
+        } else {
+            self.expr_infer(&x.value, errors)
+        };
+        if matches!(x.op, Operator::Div | Operator::FloorDiv | Operator::Mod)
+            && Self::is_literal_zero(&rhs)
+        {
+            self.error(
+                errors,
+                x.range,
+                ErrorKind::DivisionByZero,
+                format!(
+                    "Cannot divide by zero: `{}=` with a literal zero divisor",
+                    x.op.as_str()
+                ),
+            );
+        }
+        let tcc: &dyn Fn() -> TypeCheckContext =
+            &|| TypeCheckContext::of_kind(TypeCheckKind::AugmentedAssignment);
+        let result = self.distribute_over_union(&base, |lhs| {
+            self.distribute_over_union(&rhs, |rhs| {
+                if let Some(any) = Type::merge_any_operands(lhs, rhs) {
+                    any
+                } else if x.op == Operator::Add
+                    && let Some(lhs_style) = lhs.lit_string_style()
+                    && let Some(rhs_style) = rhs.lit_string_style()
+                {
+                    self.heap.mk_literal_string(match (lhs_style, rhs_style) {
+                        (LitStyle::Explicit, LitStyle::Explicit) => LitStyle::Explicit,
+                        _ => LitStyle::Implicit,
+                    })
+                } else if x.op == Operator::Add
+                    && let Type::Tuple(ref l) = base
+                    && let Type::Tuple(r) = rhs
+                {
+                    self.tuple_concat(l, r)
+                } else if let Some(result) = self.try_int_binop(x.op, lhs, rhs) {
+                    result
+                } else {
+                    binop_call(x.op, lhs, rhs, x.range)
+                }
+            })
+        });
+        // If we're assigning to something with an annotation, make sure the produced value is assignable to it
+        if let Some(ann) = ann.map(|k| self.get_idx(k)) {
+            self.check_final_reassignment(ann, x.range(), errors);
+            if let Some(ann_ty) = ann.ty(self.heap, self.stdlib) {
+                if result.is_any() {
+                    // Any provides no useful narrowing information, so preserve
+                    // the declared type rather than letting Any leak through.
+                    return ann_ty;
+                }
+                return self.check_and_return_type(result, &ann_ty, x.range(), errors, tcc);
+            }
+        }
+        result
+    }
+
+    pub fn compare_infer(&self, x: &ExprCompare, errors: &ErrorCollector) -> Type {
+        // For chained comparisons like `a < b < c`, Python evaluates as `(a < b) and (b < c)`.
+        // We need to track the current left operand as we iterate through the chain.
+        let mut current_left = self.expr_infer(x.first_operand(), errors);
+        let mut current_left_range = x.first_operand().range();
+        let mut results = Vec::new();
+        for (op, comparator) in x.ops.iter().zip(x.comparators()) {
+            let right = self.expr_infer(comparator, errors);
+
+            // Check for unnecessary identity comparisons (is/is not) BEFORE distribute_over_union
+            // to avoid false positives with union types.
+            self.check_unnecessary_comparison(
+                &current_left,
+                &right,
+                *op,
+                comparator.range(),
+                errors,
+            );
+            self.check_incompatible_comparison(
+                &current_left,
+                &right,
+                *op,
+                comparator.range(),
+                errors,
+            );
+
+            let right_range = comparator.range();
+            let result = self.compare_types(
+                x,
+                *op,
+                &current_left,
+                &right,
+                current_left_range,
+                right_range,
+                errors,
+            );
+            results.push(result);
+            // For next comparison, the current right becomes the new left
+            current_left = right;
+            current_left_range = comparator.range();
+        }
+        self.unions(results)
+    }
+
+    fn compare_types(
+        &self,
+        x: &ExprCompare,
+        op: CmpOp,
+        left: &Type,
+        right: &Type,
+        current_left_range: TextRange,
+        current_right_range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.distribute_over_union(left, |left| {
+            self.distribute_over_union(right, |right| {
+                for (side, is_left) in [(left, true), (right, false)] {
+                    if let Type::Overloaded(branches) = side {
+                        return self.read_overloaded_branches(
+                            branches,
+                            errors,
+                            &|branch, errors| {
+                                let (left, right) = if is_left {
+                                    (branch, right)
+                                } else {
+                                    (left, branch)
+                                };
+                                self.compare_types(
+                                    x,
+                                    op,
+                                    left,
+                                    right,
+                                    current_left_range,
+                                    current_right_range,
+                                    errors,
+                                )
+                            },
+                        );
+                    }
+                }
+                match (left, right) {
+                    // A rich comparison with an Any operand can return anything, but identity and
+                    // membership tests always produce `bool`: `is` has no dunder method, and `in`
+                    // converts the result of `__contains__` to `bool`.
+                    _ if !matches!(op, CmpOp::Is | CmpOp::IsNot | CmpOp::In | CmpOp::NotIn)
+                        && let Some(any) = Type::merge_any_operands(left, right) =>
+                    {
+                        any
+                    }
+                    // If the RHS of a containment check isn't a quantified, it may contain a
+                    // nested quantified that on_quantifieds would fail to detect.
+                    _ if (!matches!(op, CmpOp::In | CmpOp::NotIn)
+                        || right.as_quantified().is_some())
+                        && let Some(ret_if_quantified) =
+                            self.on_quantifieds(left, right, &|left, right| {
+                                self.compare_types(
+                                    x,
+                                    op,
+                                    left,
+                                    right,
+                                    current_left_range,
+                                    current_right_range,
+                                    errors,
+                                )
+                            }) =>
+                    {
+                        ret_if_quantified
+                    }
+                    _ => {
+                        let context = || {
+                            ErrorContext::BinaryOp(
+                                op.as_str().to_owned(),
+                                self.for_display(left.clone()),
+                                self.for_display(right.clone()),
+                                current_left_range,
+                                current_right_range,
+                            )
+                        };
+                        // `datetime` inherits from `date`, but their runtime ordering methods
+                        // reject the other type instead of honoring that nominal relationship.
+                        if matches!(op, CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE)
+                            && matches!(
+                                (left, right),
+                                (Type::ClassType(left), Type::ClassType(right))
+                                    if (left == self.stdlib.datetime()
+                                        && right == self.stdlib.date())
+                                        || (left == self.stdlib.date()
+                                            && right == self.stdlib.datetime())
+                            )
+                        {
+                            self.error(
+                                errors,
+                                x.range,
+                                ErrorKind::UnsupportedOperation,
+                                context().format(),
+                            );
+                            return self.heap.mk_class_type(self.stdlib.bool().clone());
+                        }
+                        match op {
+                            CmpOp::Is | CmpOp::IsNot => {
+                                // These comparisons never error.
+                                self.heap.mk_class_type(self.stdlib.bool().clone())
+                            }
+                            CmpOp::In | CmpOp::NotIn => {
+                                // See https://docs.python.org/3/reference/expressions.html#membership-test-operations.
+                                // `x in y` first tries `y.__contains__(x)`, then checks if `x` matches an element
+                                // obtained by iterating over `y`.
+                                if let Some(ret) = self.call_magic_dunder_method(
+                                    right,
+                                    &dunder::CONTAINS,
+                                    x.range,
+                                    &[CallArg::ty(left, current_left_range)],
+                                    &[],
+                                    errors,
+                                    Some(&context),
+                                ) {
+                                    self.check_dunder_bool_is_callable(&ret, x.range, errors);
+                                    self.heap.mk_class_type(self.stdlib.bool().clone())
+                                } else {
+                                    let iteration_errors = self.error_collector();
+                                    let iterables = self.iterate(
+                                        right,
+                                        x.range,
+                                        &iteration_errors,
+                                        Some(&context),
+                                    );
+                                    if iteration_errors.is_empty() {
+                                        // Make sure `x` matches the produced type.
+                                        self.check_type(
+                                            left,
+                                            &self.get_produced_type(iterables),
+                                            x.range,
+                                            errors,
+                                            &|| {
+                                                TypeCheckContext::of_kind(TypeCheckKind::Container)
+                                                    .with_context(Some(context()))
+                                            },
+                                        );
+                                    } else {
+                                        // Iterating `y` failed.
+                                        errors.extend(iteration_errors);
+                                    }
+                                    self.heap.mk_class_type(self.stdlib.bool().clone())
+                                }
+                            }
+                            _ => {
+                                // We've handled the other cases above, so we know we have a rich comparison op.
+                                let calls_to_try = [
+                                    (&dunder::rich_comparison_dunder(op).unwrap(), left, right),
+                                    (&dunder::rich_comparison_fallback(op).unwrap(), right, left),
+                                ];
+                                let identity_fallback = matches!(op, CmpOp::Eq | CmpOp::NotEq)
+                                    .then(|| self.heap.mk_class_type(self.stdlib.bool().clone()));
+                                let ret = self.try_binop_calls(
+                                    &calls_to_try,
+                                    x.range,
+                                    errors,
+                                    &context,
+                                    identity_fallback,
+                                );
+                                if ret.is_error() {
+                                    self.heap.mk_class_type(self.stdlib.bool().clone())
+                                } else {
+                                    ret
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        })
+    }
+
+    fn unop_types(&self, x: &ExprUnaryOp, t: &Type, errors: &ErrorCollector) -> Type {
+        let unop = |t: &Type, f: &dyn Fn(&Lit) -> Option<Type>, method: &Name| {
+            let operand_range = x.operand.range();
+            let context = || {
+                ErrorContext::UnaryOp(
+                    x.op.as_str().to_owned(),
+                    self.for_display(t.clone()),
+                    operand_range,
+                )
+            };
+            match t {
+                Type::Literal(lit) if let Some(ret) = f(&lit.value) => ret,
+                Type::ClassType(_)
+                | Type::Int(_)
+                | Type::SelfType(_)
+                | Type::Quantified(_)
+                | Type::DataFrame(_)
+                | Type::Series(_)
+                | Type::Intersect(_) => {
+                    self.call_method_or_error(t, method, x.range, &[], &[], errors, Some(&context))
+                }
+                Type::Literal(lit) if let Lit::Enum(lit_enum) = &lit.value => self
+                    .call_method_or_error(
+                        &self.heap.mk_class_type(lit_enum.class.clone()),
+                        method,
+                        x.range,
+                        &[],
+                        &[],
+                        errors,
+                        Some(&context),
+                    ),
+                // A unary operator on an `Any` keeps its style, like a dunder call on one.
+                Type::Any(style) => Type::Any(*style),
+                _ => self.error(
+                    errors,
+                    x.range,
+                    ErrorKind::UnsupportedOperation,
+                    context().format(),
+                ),
+            }
+        };
+        self.distribute_over_union(t, |t| {
+            if let Type::Overloaded(branches) = t {
+                return self.read_overloaded_branches(branches, errors, &|branch, errors| {
+                    self.unop_types(x, branch, errors)
+                });
+            }
+            match x.op {
+                UnaryOp::USub => {
+                    let f = |lit: &Lit| lit.negate();
+                    unop(t, &f, &dunder::NEG)
+                }
+                UnaryOp::UAdd => {
+                    let f = |lit: &Lit| lit.positive();
+                    unop(t, &f, &dunder::POS)
+                }
+                UnaryOp::Not => {
+                    self.check_dunder_bool_is_callable(t, x.range, errors);
+                    match t.as_bool() {
+                        None => self.heap.mk_class_type(self.stdlib.bool().clone()),
+                        Some(b) => Lit::Bool(!b).to_implicit_type(),
+                    }
+                }
+                UnaryOp::Invert => {
+                    let f = |lit: &Lit| lit.invert();
+                    unop(t, &f, &dunder::INVERT)
+                }
+            }
+        })
+    }
+
+    pub fn unop_infer(&self, x: &ExprUnaryOp, errors: &ErrorCollector) -> Type {
+        let t = self.expr_infer(&x.operand, errors);
+        if x.op == UnaryOp::Not {
+            self.check_implicit_bool(&t, x.operand.range(), errors);
+        }
+        self.unop_types(x, &t, errors)
+    }
+
+    /// Checks for unnecessary identity comparisons.
+    ///
+    /// Only emits warnings for identity comparisons (`is` or `is not`) whose result is
+    /// statically known.
+    /// Returns early without warnings for other comparison operators.
+    fn check_unnecessary_comparison(
+        &self,
+        left: &Type,
+        right: &Type,
+        op: CmpOp,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) {
+        // Only check identity comparisons
+        if !matches!(op, CmpOp::Is | CmpOp::IsNot) {
+            return;
+        }
+
+        let is_op = matches!(op, CmpOp::Is);
+        let is_bool_literal = |lit: &Lit| matches!(lit, Lit::Bool(_));
+        let emit_literal_warning = |left_str: &str, right_str: &str, result: &str| {
+            self.error(
+                errors,
+                range,
+                ErrorKind::UnnecessaryComparison,
+                format!(
+                    "Identity comparison `{} {} {}` is always {}",
+                    left_str,
+                    if is_op { "is" } else { "is not" },
+                    right_str,
+                    result
+                ),
+            );
+        };
+        let emit_instance_is_class_warning = |instance_str: &str, class_str: &str, is_op: bool| {
+            errors
+                .error_builder(
+                    range,
+                    ErrorKind::UnnecessaryComparison,
+                    format!(
+                        "Identity comparison between an instance of `{}` and class `{}` is always {}",
+                        instance_str,
+                        class_str,
+                        if is_op { "False" } else { "True" }
+                    ),
+                )
+                .with_detail(format!(
+                    "Did you mean to do `{}isinstance(..., {})`?",
+                    if is_op { "" } else { "not " },
+                    class_str,
+                ))
+                .emit();
+        };
+
+        match (left, right) {
+            // If both are literals/None, check for predictable results
+            (Type::Literal(l1), Type::Literal(l2)) => {
+                // Explicit/implicit literal style is typing metadata, not runtime identity.
+                if l1.value != l2.value {
+                    emit_literal_warning(
+                        &l1.value.to_string(),
+                        &l2.value.to_string(),
+                        if is_op { "False" } else { "True" },
+                    );
+                } else if is_bool_literal(&l1.value) {
+                    emit_literal_warning(
+                        &l1.value.to_string(),
+                        &l2.value.to_string(),
+                        if is_op { "True" } else { "False" },
+                    );
+                }
+            }
+            (Type::Literal(l), Type::None) => {
+                emit_literal_warning(
+                    &l.value.to_string(),
+                    "None",
+                    if is_op { "False" } else { "True" },
+                );
+            }
+            (Type::None, Type::Literal(l)) => {
+                emit_literal_warning(
+                    "None",
+                    &l.value.to_string(),
+                    if is_op { "False" } else { "True" },
+                );
+            }
+
+            // ClassDef vs ClassType - disjoint unless the class object is assignable to ClassType.
+            (cdef @ Type::ClassDef(cdef_inner), ctype @ Type::ClassType(_))
+            | (ctype @ Type::ClassType(_), cdef @ Type::ClassDef(cdef_inner))
+                if !self.is_subset_eq(cdef, ctype) =>
+            {
+                emit_instance_is_class_warning(
+                    &ctype.to_string(),
+                    cdef_inner.name().as_str(),
+                    is_op,
+                );
+            }
+
+            // All other combinations: no warning
+            _ => {}
+        }
+    }
+
+    /// Checks for incompatible equality comparisons between types that cannot overlap.
+    fn check_incompatible_comparison(
+        &self,
+        left: &Type,
+        right: &Type,
+        op: CmpOp,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) {
+        if !matches!(op, CmpOp::Eq | CmpOp::NotEq) {
+            return;
+        }
+        if left.is_any() || right.is_any() || left.is_never() || right.is_never() {
+            return;
+        }
+        let Some(left_group) = self.equality_compatibility_group(left) else {
+            return;
+        };
+        let Some(right_group) = self.equality_compatibility_group(right) else {
+            return;
+        };
+        if left_group == right_group {
+            return;
+        }
+        let left_display = self.for_display(left.clone());
+        let right_display = self.for_display(right.clone());
+        self.error(
+            errors,
+            range,
+            ErrorKind::IncompatibleComparison,
+            format!(
+                "Comparison `{}` between incompatible types `{}` and `{}`",
+                op.as_str(),
+                left_display,
+                right_display
+            ),
+        );
+    }
+
+    fn equality_class<'b>(&'b self, ty: &'b Type) -> Option<&'b Class> {
+        Some(match ty {
+            Type::ClassType(cls) => cls.class_object(),
+            Type::Literal(lit) => lit.value.general_class_type(self.stdlib).class_object(),
+            Type::LiteralString(_) => self.stdlib.str().class_object(),
+            _ => return None,
+        })
+    }
+
+    fn equality_compatibility_group(&self, ty: &Type) -> Option<EqualityCompatibilityGroup> {
+        let class = self.equality_class(ty)?;
+        match class.known()? {
+            KnownClass::Bool
+            | KnownClass::Int
+            | KnownClass::Float
+            | KnownClass::Complex
+            | KnownClass::Decimal
+            | KnownClass::FractionsFraction => Some(EqualityCompatibilityGroup::Numeric),
+            KnownClass::Bytes | KnownClass::ByteArray | KnownClass::MemoryView => {
+                Some(EqualityCompatibilityGroup::BytesLike)
+            }
+            KnownClass::Set | KnownClass::FrozenSet => Some(EqualityCompatibilityGroup::SetLike),
+            KnownClass::Str | KnownClass::CollectionsUserString => {
+                Some(EqualityCompatibilityGroup::Str)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns whether `left == right` may succeed without nominal type overlap: either side
+    /// gets `__eq__` from a module outside the standard library, or builtin equality relates
+    /// the two classes.
+    ///
+    /// This is a heuristic. It assumes that a standard library `__eq__` returns `True` only for
+    /// an operand of an overlapping class or of a class in the same compatibility group.
+    pub(crate) fn equality_can_match_disjoint(&self, left: &Type, right: &Type) -> bool {
+        let has_user_defined_eq = |ty: &Type| {
+            self.equality_class(ty).is_some_and(|class| {
+                self.get_class_member_with_defining_class(class, &dunder::EQ)
+                    .is_some_and(|eq| {
+                        !typeshed().is_ok_and(|ts| ts.has_module(eq.defining_class.module_name()))
+                    })
+            })
+        };
+        if has_user_defined_eq(left) || has_user_defined_eq(right) {
+            return true;
+        }
+        let compatibility_group = |ty: &Type| {
+            self.equality_compatibility_group(ty).or_else(|| {
+                let class = self.equality_class(ty)?;
+                self.get_mro_for_class(class)
+                    .ancestors_no_object()
+                    .iter()
+                    .find_map(|ancestor| {
+                        self.equality_compatibility_group(&Type::ClassType(ancestor.clone()))
+                    })
+            })
+        };
+        let left_class = self.equality_class(left);
+        let right_class = self.equality_class(right);
+        let left_group = compatibility_group(left);
+        left_class != right_class
+            && left_group.is_some()
+            && left_group == compatibility_group(right)
+    }
+}

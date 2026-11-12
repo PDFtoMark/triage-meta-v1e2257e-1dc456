@@ -1,0 +1,181 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::sync::Arc;
+
+use lsp_types::Uri;
+use ruff_notebook::Cell;
+use ruff_notebook::Notebook;
+use starlark_map::small_map::SmallMap;
+
+use crate::lsp::wasm::notebook::NotebookDocument;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspNotebook {
+    ruff_notebook: Arc<Notebook>,
+    notebook_document: NotebookDocument,
+    // Notebook cells have Urls of unspecified format
+    cell_url_to_index: SmallMap<Uri, usize>,
+    cell_index_to_url: Vec<Uri>,
+    /// All-cell indices of code cells, in notebook order.
+    code_cell_indices: Vec<usize>,
+    cell_versions: SmallMap<Uri, i32>,
+}
+
+impl LspNotebook {
+    pub fn new(
+        ruff_notebook: Notebook,
+        notebook_document: NotebookDocument,
+        mut cell_versions: SmallMap<Uri, i32>,
+    ) -> Self {
+        let mut cell_url_to_index = SmallMap::new();
+        let mut cell_index_to_url = Vec::new();
+        for (idx, cell) in notebook_document.cells.iter().enumerate() {
+            cell_url_to_index.insert(cell.document.clone(), idx);
+            cell_index_to_url.push(cell.document.clone());
+        }
+        let code_cell_indices = ruff_notebook
+            .cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| cell.is_code_cell().then_some(index))
+            .collect();
+        cell_versions.retain(|uri, _| cell_url_to_index.contains_key(uri));
+        Self {
+            ruff_notebook: Arc::new(ruff_notebook),
+            notebook_document,
+            cell_url_to_index,
+            cell_index_to_url,
+            code_cell_indices,
+            cell_versions,
+        }
+    }
+
+    /// Cell text versions are independent of the notebook version.
+    pub fn cell_versions(&self) -> &SmallMap<Uri, i32> {
+        &self.cell_versions
+    }
+
+    pub fn notebook_document(&self) -> &NotebookDocument {
+        &self.notebook_document
+    }
+
+    /// Returns the code-cell index for a cell URL, i.e. the index among only
+    /// code cells. This matches the indexing used by `Notebook::cell_offsets()`.
+    /// Returns `None` if the URL is not found or the cell is not a code cell.
+    ///
+    /// Note: this uses `Cell::is_code_cell()` rather than ruff's internal
+    /// `is_valid_python_code_cell()` (which also excludes cell-magic and
+    /// non-Python cells) because the latter is not public. In practice the
+    /// two filters agree for typical Python notebooks.
+    pub fn get_code_cell_index(&self, cell_url: &Uri) -> Option<usize> {
+        let all_cells_idx = *self.cell_url_to_index.get(cell_url)?;
+        self.code_cell_indices.binary_search(&all_cells_idx).ok()
+    }
+
+    /// Returns the URI at a code-cell index, excluding markdown cells.
+    pub fn get_code_cell_url(&self, cell_index: usize) -> Option<&Uri> {
+        self.cell_index_to_url
+            .get(*self.code_cell_indices.get(cell_index)?)
+    }
+
+    pub fn code_cell_urls(&self) -> &Vec<Uri> {
+        &self.cell_index_to_url
+    }
+
+    pub fn get_cell_contents(&self, cell_url: &Uri) -> Option<String> {
+        let idx = *self.cell_url_to_index.get(cell_url)?;
+        let cell = self.ruff_notebook.cells().get(idx)?;
+        if let Cell::Code(cell) = cell {
+            Some(cell.source.to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn ruff_notebook(&self) -> &Arc<Notebook> {
+        &self.ruff_notebook
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use lsp_types::Uri;
+
+    use super::*;
+    use crate::lsp::wasm::notebook::NotebookCell;
+    use crate::lsp::wasm::notebook::NotebookCellKind;
+    use crate::lsp::wasm::notebook::NotebookDocument;
+
+    #[test]
+    fn test_get_code_cell_index_returns_code_cell_index() {
+        let cell0_url = Uri::parse("vscode-notebook-cell://notebook/cell0").unwrap();
+        let cell1_url = Uri::parse("vscode-notebook-cell://notebook/cell1").unwrap();
+        let cell2_url = Uri::parse("vscode-notebook-cell://notebook/cell2").unwrap();
+
+        let notebook_doc = NotebookDocument {
+            uri: Uri::parse("file:///notebook.ipynb").unwrap(),
+            notebook_type: "jupyter-notebook".to_owned(),
+            version: 1,
+            metadata: None,
+            cells: vec![
+                NotebookCell {
+                    kind: NotebookCellKind::Code,
+                    document: cell0_url.clone(),
+                    metadata: None,
+                    execution_summary: None,
+                },
+                NotebookCell {
+                    kind: NotebookCellKind::Markup,
+                    document: cell1_url.clone(),
+                    metadata: None,
+                    execution_summary: None,
+                },
+                NotebookCell {
+                    kind: NotebookCellKind::Code,
+                    document: cell2_url.clone(),
+                    metadata: None,
+                    execution_summary: None,
+                },
+            ],
+        };
+
+        let mut cell_content = HashMap::new();
+        cell_content.insert(cell0_url.clone(), "x = 1".to_owned());
+        cell_content.insert(cell1_url.clone(), "# heading".to_owned());
+        cell_content.insert(cell2_url.clone(), "y = 2".to_owned());
+
+        let ruff_notebook = notebook_doc
+            .clone()
+            .to_ruff_notebook(&cell_content)
+            .unwrap();
+        let lsp_notebook = LspNotebook::new(ruff_notebook, notebook_doc, SmallMap::new());
+
+        // First code cell (all-cells index 0) → code-cell index 0
+        assert_eq!(lsp_notebook.get_code_cell_index(&cell0_url), Some(0));
+        // Markdown cell → None (not a code cell)
+        assert_eq!(lsp_notebook.get_code_cell_index(&cell1_url), None);
+        // Second code cell (all-cells index 2) → code-cell index 1
+        assert_eq!(lsp_notebook.get_code_cell_index(&cell2_url), Some(1));
+
+        assert_eq!(lsp_notebook.get_code_cell_url(0), Some(&cell0_url));
+        assert_eq!(lsp_notebook.get_code_cell_url(1), Some(&cell2_url));
+        assert_eq!(lsp_notebook.get_code_cell_url(2), None);
+        assert_eq!(lsp_notebook.get_code_cell_url(3), None);
+        assert_eq!(
+            lsp_notebook.code_cell_urls(),
+            &vec![cell0_url.clone(), cell1_url.clone(), cell2_url.clone()]
+        );
+        assert_eq!(lsp_notebook.get_cell_contents(&cell1_url), None);
+        assert_eq!(
+            lsp_notebook.get_cell_contents(&cell2_url).as_deref(),
+            Some("y = 2")
+        );
+    }
+}

@@ -1,0 +1,173 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use lsp_server::RequestId;
+use lsp_types::Request as _;
+use lsp_types::SymbolKind;
+use lsp_types::TypeHierarchyPrepareRequest;
+use lsp_types::TypeHierarchySubtypesRequest;
+use lsp_types::TypeHierarchySupertypesRequest;
+use lsp_types::Uri;
+use pyrefly_lsp_test::IndexingMode;
+use pyrefly_lsp_test::LspArgs;
+use pyrefly_lsp_test::Message;
+use pyrefly_lsp_test::Request;
+use pyrefly_lsp_test::object_model::InitializeSettings;
+use pyrefly_lsp_test::object_model::LspInteraction;
+use pyrefly_lsp_test::object_model::LspInteractionArgs;
+use serde_json::json;
+
+use crate::test::lsp::lsp_interaction::util::get_test_files_root;
+
+#[test]
+fn test_type_hierarchy_basic() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("type_hierarchy_test");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    interaction.client.did_open("classes.py");
+    let uri = Uri::from_file_path(root_path.join("classes.py")).unwrap();
+
+    interaction.client.send_message(Message::Request(Request {
+        id: RequestId::from(1),
+        method: TypeHierarchyPrepareRequest::METHOD.as_str().to_owned(),
+        params: json!({
+            "textDocument": {
+                "uri": uri.to_string()
+            },
+            "position": {
+                "line": 10,
+                "character": 6
+            }
+        }),
+        activity_key: None,
+    }));
+
+    interaction
+        .client
+        .expect_response_with::<TypeHierarchyPrepareRequest>(RequestId::from(1), |result| {
+            let Some(items) = result else {
+                return false;
+            };
+            items.len() == 1 && items[0].name == "B"
+        })
+        .unwrap();
+
+    let class_b_item = json!({
+        "name": "B",
+        "kind": SymbolKind::Class,
+        "uri": uri.to_string(),
+        "range": {
+            "start": {"line": 10, "character": 0},
+            "end": {"line": 11, "character": 8}
+        },
+        "selectionRange": {
+            "start": {"line": 10, "character": 6},
+            "end": {"line": 10, "character": 7}
+        }
+    });
+
+    interaction
+        .client
+        .send_request::<TypeHierarchySupertypesRequest>(json!({
+            "item": class_b_item.clone()
+        }))
+        .expect_response_with(|result| {
+            let Some(items) = result else {
+                return false;
+            };
+            items.iter().any(|item| item.name == "A")
+        })
+        .unwrap();
+
+    interaction
+        .client
+        .send_request::<TypeHierarchySubtypesRequest>(json!({
+            "item": class_b_item
+        }))
+        .expect_response_with(|result| {
+            let Some(items) = result else {
+                return false;
+            };
+            items.iter().any(|item| item.name == "C")
+        })
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+/// A subtype declared in another module must be discovered through workspace indexing.
+#[test]
+fn test_type_hierarchy_subtypes_in_another_module() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("type_hierarchy_test");
+    let scope_uri = Uri::from_file_path(&root_path).unwrap();
+    // Reverse-dependency indexing is required to discover subclasses in unopened files.
+    let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+        args: LspArgs {
+            indexing_mode: IndexingMode::LazyBlocking,
+            ..LspInteractionArgs::default().args
+        },
+        ..Default::default()
+    });
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            workspace_folders: Some(vec![("test".to_owned(), scope_uri)]),
+            configuration: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+
+    interaction.client.did_open("classes.py");
+    let classes_uri = Uri::from_file_path(root_path.join("classes.py")).unwrap();
+    let derived_uri = Uri::from_file_path(root_path.join("derived.py")).unwrap();
+
+    let class_b_item = json!({
+        "name": "B",
+        "kind": SymbolKind::Class,
+        "uri": classes_uri.to_string(),
+        "range": {
+            "start": {"line": 10, "character": 0},
+            "end": {"line": 11, "character": 8}
+        },
+        "selectionRange": {
+            "start": {"line": 10, "character": 6},
+            "end": {"line": 10, "character": 7}
+        }
+    });
+
+    interaction
+        .client
+        .send_request::<TypeHierarchySubtypesRequest>(json!({
+            "item": class_b_item
+        }))
+        .expect_response_with(|result| {
+            let Some(items) = result else {
+                return false;
+            };
+            items.len() == 2
+                && items
+                    .iter()
+                    .any(|item| item.name == "C" && item.uri == classes_uri)
+                && items
+                    .iter()
+                    .any(|item| item.name == "D" && item.uri == derived_uri)
+        })
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}

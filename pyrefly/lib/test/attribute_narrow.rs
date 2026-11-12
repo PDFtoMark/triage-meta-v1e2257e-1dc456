@@ -1,0 +1,1126 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use crate::test::util::TestEnv;
+use crate::testcase;
+
+testcase!(
+    test_conditional_attribute_reassignment_preserves_union,
+    r#"
+from typing import Literal, assert_type
+class Foo:
+    x: bool = True
+class Bar:
+    def __init__(self, flag: bool) -> None:
+        self.x: Foo | None = None
+        if flag:
+            self.x = Foo()
+        assert_type(self.x, Foo | None)
+        assert self.x is not None
+        assert_type(self.x, Foo)
+        self.x.x = False
+class Baz:
+    x: int | str
+def f(baz: Baz, flag: bool) -> None:
+    baz.x = 0
+    if flag:
+        baz.x = "a"
+    assert_type(baz.x, Literal[0, "a"])
+def g(bar: Bar, flag: bool) -> None:
+    bar.x = Foo()
+    bar.x.x = True
+    if flag:
+        bar.x.x = False
+    assert_type(bar.x.x, bool)
+"#,
+);
+
+testcase!(
+    test_one_level_simple,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar):
+        reveal_type(foo)  # E: revealed type: Foo (_.x: Bar)
+"#,
+);
+
+// The type and its narrowed facets are displayed together, so a name clash
+// between them is disambiguated with module names.
+testcase!(
+    test_facet_name_clash_is_qualified,
+    TestEnv::one("foo", "class Foo: ..."),
+    r#"
+from typing import reveal_type
+import foo
+class Foo:
+    x: object
+def f(x: Foo):
+    if isinstance(x.x, foo.Foo):
+        reveal_type(x)  # E: revealed type: main.Foo (_.x: foo.Foo)
+"#,
+);
+
+testcase!(
+    test_one_level_and,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+    y: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar) and isinstance(foo.y, Baz):
+        reveal_type(foo)  # E: revealed type: Foo (_.x: Bar, _.y: Baz)
+"#,
+);
+
+testcase!(
+    test_two_levels,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+    y: Foo
+class Bar(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x.y, Bar):
+        reveal_type(foo)  # E: revealed type: Foo (_.x.y: Bar)
+"#,
+);
+
+testcase!(
+    test_attribute_read_simple,
+    r#"
+from typing import assert_type
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar):
+        assert_type(foo.x, Bar)
+    if isinstance(foo.x.x, Bar):
+        # TODO(stroxler): At some point we should make `unions` simplify for linearly ordered types.
+        assert_type(foo.x, Bar | Foo)
+        assert_type(foo.x.x, Bar)
+        assert_type(foo.x.x.x, Foo)
+"#,
+);
+
+testcase!(
+    test_attribute_narrow_type_algebra_for_correct_narrows,
+    r#"
+from typing import assert_type
+class Foo:
+    x: Foo | None
+def f(foo: Foo):
+    if foo.x is not None:
+        assert_type(foo.x, Foo)
+    if foo.x is not None and foo.x.x is not None:
+        assert_type(foo.x, Foo)
+        assert_type(foo.x.x, Foo)
+    if foo.x is not None and foo.x.x is not None and foo.x.x.x is None:
+        assert_type(foo.x, Foo)
+        assert_type(foo.x.x, Foo)
+        assert_type(foo.x.x.x, None)
+"#,
+);
+
+testcase!(
+    test_dunder_class_attribute_narrow,
+    r#"
+from typing import assert_type
+def f(x: int | str):
+    if x.__class__ is int:
+        assert_type(x, int)
+    else:
+        assert_type(x, int | str)
+    if x.__class__ == int:
+        assert_type(x, int)
+def g(x: int | str):
+    assert x.__class__ is int
+    assert_type(x, int)
+def h(x: bool | str):
+    if x.__class__ is bool:
+        assert_type(x, bool)
+    else:
+        assert_type(x, str)
+"#,
+);
+
+// The expected behavior when narrowing an invalid attribute chain is to produce
+// type errors at the narrow site, but apply the narrowing downstream
+// (motivation: being noisy downstream could be quite frustrating for gradually
+// typed code)
+testcase!(
+    test_invalid_narrows_on_bad_attribute_access,
+    r#"
+from typing import Any, assert_type, reveal_type
+class Foo:
+    x: Foo | None
+def f(foo: Foo):
+    if foo.x is not None:
+        assert_type(foo.x, Foo)
+    if foo.x.x is not None:  # E: Object of class `NoneType` has no attribute `x`
+        assert_type(foo.x, Foo | None)
+        assert_type(foo.x.x, Foo | Any)
+        reveal_type(foo.x.x)  # E: revealed type: Foo | Unknown
+    if isinstance(foo.x.y, Foo) and foo.x.y.x is not None:  # E: Object of type `Foo | None` has no attribute `y`
+        assert_type(foo.x, Foo | None)
+        assert_type(foo.x.y, Foo)
+        assert_type(foo.x.y.x, Foo)
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_preserves_unknown,
+    r#"
+from typing import Any, reveal_type
+
+def f(x: int, y: Any | None):
+    reveal_type(x.foo)  # E: Object of class `int` has no attribute `foo`  # E: revealed type: Unknown
+    if x.foo:  # E: Object of class `int` has no attribute `foo`
+        reveal_type(x)  # E: revealed type: int (_.foo: Unknown)
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo[0]
+
+    reveal_type(y.foo)  # E: Object of class `NoneType` has no attribute `foo`  # E: revealed type: Unknown
+    if y.foo:  # E: Object of class `NoneType` has no attribute `foo`
+        reveal_type(y)  # E: revealed type: Any | None (_.foo: Unknown)
+        reveal_type(y.foo)  # E: revealed type: Unknown
+        y.foo[0]
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_branches,
+    r#"
+from typing import Any, assert_type, reveal_type
+
+def truthy(x: int):
+    if x.foo:  # E: Object of class `int` has no attribute `foo`
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo[0]
+    else:
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo[0]
+
+def not_none(x: int):
+    if x.foo is not None:  # E: Object of class `int` has no attribute `foo`
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo[0]
+    else:
+        assert_type(x.foo, None)
+        x.foo[0]  # E: `None` is not subscriptable
+
+def optional_any(y: Any | None):
+    if y.foo is not None:  # E: Object of class `NoneType` has no attribute `foo`
+        reveal_type(y.foo)  # E: revealed type: Unknown
+        y.foo[0]
+    else:
+        assert_type(y.foo, None)
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_nested_and_length,
+    r#"
+from typing import assert_type, reveal_type
+
+def nested(x: int):
+    if x.foo:  # E: Object of class `int` has no attribute `foo`
+        if x.foo is not None:
+            reveal_type(x.foo)  # E: revealed type: Unknown
+            x.foo[0].bar
+        else:
+            assert_type(x.foo, None)
+    else:
+        if x.foo:
+            reveal_type(x.foo)  # E: revealed type: Unknown
+            x.foo["key"][0]
+
+def length(x: int):
+    if len(x.foo) == 3:  # E: Object of class `int` has no attribute `foo`
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo[0]
+    else:
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        x.foo["key"]
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_preserves_valid_members,
+    r#"
+from typing import Any, assert_type, reveal_type
+
+class A:
+    foo: int | None
+    xs: list[int] | None
+class B:
+    pass
+class Dynamic:
+    def __getattr__(self, name: str) -> int | None: ...
+
+def partial(x: A | B):
+    if x.foo is not None:  # E: Object of class `B` has no attribute `foo`
+        assert_type(x.foo, int | Any)
+        reveal_type(x.foo)  # E: revealed type: int | Unknown
+        x.foo[0]  # E: Cannot index into `int`
+
+def valid(x: A):
+    if x.xs is not None:
+        assert_type(x.xs, list[int])
+        assert_type(x.xs[0], int)
+    if x.foo is not None:
+        assert_type(x.foo, int)
+        x.foo[0]  # E: Cannot index into `int`
+
+def dynamic(x: Dynamic):
+    if x.foo is not None:
+        assert_type(x.foo, int)
+        x.foo[0]  # E: Cannot index into `int`
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_positive_refinement,
+    r#"
+from typing import assert_type, reveal_type
+
+class A:
+    pass
+class B(A):
+    foo: list[int]
+
+def rebase(x: A):
+    if x.foo:  # E: Object of class `A` has no attribute `foo`
+        reveal_type(x.foo)  # E: revealed type: Unknown
+        if isinstance(x, B):
+            assert_type(x.foo, list[int])
+            assert_type(x.foo[0], int)
+
+def positive_str(x: int):
+    if isinstance(x.foo, str):  # E: Object of class `int` has no attribute `foo`
+        assert_type(x.foo, str)
+        assert_type(x.foo[0], str)
+
+def positive_int(x: int):
+    if isinstance(x.foo, int):  # E: Object of class `int` has no attribute `foo`
+        assert_type(x.foo, int)
+        x.foo[0]  # E: Cannot index into `int`
+"#,
+);
+
+// Narrowing the receiver must not let a missing-attribute fallback erase a concrete
+// refinement already established on the attribute. This is the reverse of `rebase` above:
+// there a missing attribute is replaced by a concrete type; here a concrete type must
+// survive rebasing against a base that lacks the attribute.
+testcase!(
+    test_missing_attribute_narrow_preserves_refinement_on_rebase,
+    r#"
+from typing import assert_type, final
+
+@final
+class A:
+    foo: int
+class B:
+    pass
+
+def f(x: A | B):
+    if isinstance(x.foo, int):  # E: Object of class `B` has no attribute `foo`
+        assert_type(x.foo, int)
+        if isinstance(x, B):
+            assert_type(x.foo, int)
+            x.foo[0]  # E: Cannot index into `int`
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_preserves_refinement_on_mixed_union_rebase,
+    r#"
+from typing import assert_type, final
+
+@final
+class A:
+    foo: int | str
+@final
+class B:
+    foo: int
+class C:
+    pass
+
+def f(x: A | B | C):
+    if isinstance(x.foo, int):  # E: Object of class `C` has no attribute `foo`
+        assert_type(x.foo, int)
+        if not isinstance(x, A):
+            assert_type(x.foo, int)
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_rebase_preserves_declared_errors,
+    r#"
+from typing import final, reveal_type
+
+@final
+class A:
+    foo: int
+class B:
+    foo: NotDefined  # E: Could not find name `NotDefined`
+
+def f(x: A | B):
+    if isinstance(x.foo, int):
+        if isinstance(x, B):
+            reveal_type(x.foo)  # E: revealed type: Unknown
+"#,
+);
+
+testcase!(
+    test_missing_class_attribute_narrow_preserves_access_errors,
+    r#"
+from typing import reveal_type
+
+class C:
+    def __init__(self):
+        self.present = 1
+
+def f(cls: type[C]):
+    if cls.missing:  # E: Class `C` has no class attribute `missing`
+        reveal_type(cls.missing)  # E: revealed type: Unknown
+        cls.missing[0]
+    if cls.present:  # E: Instance-only attribute `present` of class `C` is not visible on the class
+        reveal_type(cls.present)  # E: revealed type: object
+        cls.present[0]  # E: Cannot index into `object`
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_preserves_error_provenance,
+    TestEnv::new()
+        .enable_unknown_attribute_access_error()
+        .enable_unknown_from_error_error(),
+    r#"
+def f(x: int):
+    if x.foo:  # E: Object of class `int` has no attribute `foo`
+        x.foo.bar
+        x.foo.method()
+        x.foo[0]
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_union_error_provenance,
+    TestEnv::new().enable_unknown_from_error_error(),
+    r#"
+from typing import Any
+
+class Missing:
+    pass
+class Explicit:
+    foo: Any
+class Dynamic:
+    def __getattr__(self, name: str) -> Any: ...
+class Invalid:
+    foo: NotDefined  # E: Could not find name `NotDefined`
+class PartiallyInvalid:
+    foo: int | NotDefined  # E: Could not find name `NotDefined`
+
+def any_base(x: Any | None):
+    if x.foo:  # E: Object of class `NoneType` has no attribute `foo`
+        x.foo
+    x.foo
+
+def explicit(x: Explicit | Missing):
+    if x.foo:  # E: Object of class `Missing` has no attribute `foo`
+        x.foo
+    x.foo
+
+def dynamic(x: Dynamic | Missing):
+    if x.foo:  # E: Object of class `Missing` has no attribute `foo`
+        x.foo
+    x.foo
+
+def declared_error(x: Invalid | Missing):
+    if x.foo:  # E: Object of class `Missing` has no attribute `foo`
+        x.foo  # E: The type of attribute `foo` is unknown because it comes from an error
+    x.foo  # E: The type of attribute `foo` is unknown because it comes from an error
+
+def declared_union_error(x: PartiallyInvalid | Missing):
+    if not isinstance(x.foo, int):  # E: Object of class `Missing` has no attribute `foo`
+        x.foo  # E: The type of attribute `foo` is unknown because it comes from an error
+"#,
+);
+
+testcase!(
+    test_missing_attribute_narrow_preserves_other_unknown_diagnostics,
+    TestEnv::new()
+        .enable_unknown_from_error_error()
+        .enable_unknown_attribute_access_error()
+        .enable_explicit_any_use_error(),
+    r#"
+from typing import Any
+
+class C:
+    error: NotDefined  # E: Could not find name `NotDefined`
+    explicit: Any
+    def __init__(self, value):
+        self.implicit = value
+
+def f(c: C):
+    c.error  # E: The type of attribute `error` is unknown because it comes from an error
+    if c.implicit:  # E: The type of attribute `implicit` is unknown
+        c.implicit  # E: The type of attribute `implicit` is unknown
+    if c.explicit:  # E: The type of attribute `explicit` is an explicit `Any`
+        c.explicit  # E: The type of attribute `explicit` is an explicit `Any`
+    if c.error:  # E: The type of attribute `error` is unknown because it comes from an error
+        c.error  # E: The type of attribute `error` is unknown because it comes from an error
+    c.error  # E: The type of attribute `error` is unknown because it comes from an error
+"#,
+);
+
+testcase!(
+    test_missing_attribute_call_does_not_narrow,
+    r#"
+from typing import reveal_type
+def f(x: str):
+    if (
+        len(x.magic)  # E: Object of class `str` has no attribute `magic`
+        or reveal_type(  # E: revealed type: Unknown
+            x.magic  # E: Object of class `str` has no attribute `magic`
+        )
+    ):
+        pass
+"#,
+);
+
+testcase!(
+    test_missing_attribute_call_does_not_narrow_overload,
+    r#"
+from typing import overload
+class History:
+    pass
+@overload
+def open_like(path: str) -> int: ...
+@overload
+def open_like(path: bytes) -> int: ...
+def open_like(path: object) -> int:
+    return 0
+def f(history: History):
+    if (
+        len(history.filename)  # E: Object of class `History` has no attribute `filename`
+        or open_like(
+            history.filename  # E: Object of class `History` has no attribute `filename`
+        )
+    ):
+        pass
+"#,
+);
+
+testcase!(
+    test_missing_attribute_call_does_not_narrow_union,
+    r#"
+def f(x: int | str):
+    if (
+        len(x.missing)  # E: Object of type `int | str` has no attribute `missing`
+        or x.missing  # E: Object of type `int | str` has no attribute `missing`
+    ):
+        pass
+"#,
+);
+
+testcase!(
+    test_attr_assignment_introduction,
+    r#"
+from typing import Any, Literal, assert_type
+class C:
+    x: Any
+    y: int | None
+    z: C | None
+def test_introduce_narrow_with_assignment(c0: C, c1: C):
+    assert_type(c0.x, Any)
+    assert_type(c0.y, int | None)
+    assert_type(c0.z, C | None)
+    c0.x = 42
+    c0.y = 43
+    c0.z = c1
+    assert_type(c0.x, Literal[42])
+    assert_type(c0.y, Literal[43])
+    assert_type(c0.z, C)
+"#,
+);
+
+testcase!(
+    test_attr_assignment_optional_augassign,
+    r#"
+from typing import assert_type
+def question() -> bool:
+    return True
+class C:
+    x: int | None
+c = C()
+c.x = abs(int(0))
+assert_type(c.x, int)
+if question():
+    c.x += 2
+    assert_type(c.x, int)
+"#,
+);
+
+testcase!(
+    test_attr_assignment_invalidation,
+    r#"
+from typing import Any, Literal, assert_type
+class C:
+    x: Any
+    z: C | None
+def test_invalidate_narrow_with_assignment(c0: C, c1: C):
+    assert isinstance(c0.z, C)
+    assert isinstance(c0.z.x, int)
+    assert isinstance(c0.z.z, C)
+    assert isinstance(c0.z.z.x, int)
+    assert_type(c0.z, C)
+    assert_type(c0.z.x, int)
+    assert_type(c0.z.z, C)
+    assert_type(c0.z.z.x, int)
+    c0.z.z = c1
+    assert_type(c0.z, C)
+    assert_type(c0.z.x, int)
+    assert_type(c0.z.z, C)
+    assert_type(c0.z.z.x, Any)
+    c0.z = c1
+    assert_type(c0.z, C)
+    assert_type(c0.z.x, Any)
+    assert_type(c0.z.z, C | None)
+    print(c0.z.z.x)  # E: Object of class `NoneType` has no attribute `x`
+"#,
+);
+
+testcase!(
+    bug = "TODO(stroxler) We should fine-tune descriptor narrowing more; this is not high-priority",
+    test_descriptor_narrowing,
+    r#"
+from typing import Any, Literal, assert_type
+class C:
+    @property
+    def x(self) -> int | None: ...
+    @x.setter
+    def x(self, value: int) -> None: ...
+def f(c: C):
+    assert_type(c.x, int | None)
+    # No narrowing occurs on assignment to a descriptor. This is debatable, although
+    # in the case where the set type is mismatched vs get it would be absurd to narrow,
+    # and it could be very difficult in the presence of overloads.
+    c.x = 42
+    assert_type(c.x, int | None)
+    # Narrowing does occur on conditional checks. Ideally we would produce
+    # a strict-mode error on reads, that is not yet implemented.
+    assert isinstance(c.x, int)
+    assert_type(c.x, int)
+"#,
+);
+
+// This test is adapted from a Pytorch example.
+testcase!(
+    bug = "The behavior of this was changed by the fix for https://github.com/facebook/pyrefly/issues/1999",
+    test_isinstance_getitem,
+    r#"
+from typing import Any, Optional, assert_type, Never
+
+Arg = Optional[tuple["Arg", ...]]
+
+class DataType: pass
+
+class N:
+    _args: tuple["Arg", ...]
+    type: Optional[DataType]
+
+    @property
+    def args(self) -> tuple[Arg, ...]:
+        return self._args
+
+def f(n: N):
+    assert isinstance(n.args[0], N)
+    t1 = n.args[0].type
+    assert_type(t1, Never)
+"#,
+);
+
+testcase!(
+    test_attribute_access_after_narrowing_in_subclass,
+    r#"
+from typing import assert_type
+from unittest import TestCase
+
+class A:
+    def __init__(self) -> None:
+        self.id = 5
+
+class B:
+    def __init__(self, a : A | None) -> None:
+        self.a = a
+
+b = B(A())
+if b.a is not None:
+    x = b.a
+    assert_type(x, A)
+"#,
+);
+
+testcase!(
+    test_or_narrowing_one_level,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar) or isinstance(foo.x, Baz):
+        reveal_type(foo)  # E: revealed type: Foo (_.x: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_or_narrowing_with_top_level,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: object):
+    if (
+        (isinstance(foo, Bar) and isinstance(foo.x.x, Bar))
+        or (isinstance(foo, Bar) and isinstance(foo.x.x, Baz))
+    ):
+        reveal_type(foo)  # E: revealed type: Bar (_.x.x: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_join_empty_facets_vs_nonempty,
+    r#"
+from typing import reveal_type, Literal
+class A:
+    x: int | None
+def test(y: A | None) -> None:
+    if y is not None:
+        if y.x:
+            reveal_type(y)  # E: revealed type: A (_.x: int)
+        else:
+            reveal_type(y)  # E: revealed type: A (_.x: Literal[0] | None)
+    else:
+        reveal_type(y)  # E: revealed type: None
+    reveal_type(y)  # E: revealed type: A | None
+"#,
+);
+
+testcase!(
+    test_join_empty_facets_in_or,
+    r#"
+from typing import assert_type
+class A:
+    kind: str
+def test(y: A | None) -> None:
+    if not y or y.kind:
+        assert_type(y, A | None)
+"#,
+);
+
+testcase!(
+    test_or_joins_subtrees,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+    y: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if (
+        (isinstance(foo.x.x, Bar) and isinstance(foo.x.y, Bar))
+        or (isinstance(foo.x.x, Bar) and isinstance(foo.x.y, Baz))
+    ):
+        reveal_type(foo)  # E: revealed type: Foo (_.x.x: Bar, _.x.y: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_or_multiple_levels,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if (
+        (isinstance(foo.x, Bar) and isinstance(foo.x.x, Bar))
+        or (isinstance(foo.x, Bar) and isinstance(foo.x.x, Baz))
+    ):
+        reveal_type(foo)  # E: revealed type: Foo (_.x: Bar, _.x.x: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_or_join_drops_subtree,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+    y: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if (
+        (isinstance(foo.x, Bar) and isinstance(foo.x.x, Bar))
+        or (isinstance(foo.x, Baz) and isinstance(foo.x.y, Bar))
+    ):
+        reveal_type(foo)  # E: revealed type: Foo (_.x: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_or_join_drops_root,
+    r#"
+from typing import reveal_type
+class Foo:
+    x: Foo
+    y: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if (
+        (isinstance(foo.x, Bar) and isinstance(foo.x.x, Bar))
+        or isinstance(foo.x.x, Baz)
+    ):
+        reveal_type(foo)  # E: revealed type: Foo (_.x.x: Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_propagate_through_no_op_control_flow,
+    r#"
+from typing import assert_type, Callable
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+def f(foo: Foo, condition: Callable[[], bool]):
+    if isinstance(foo.x, Bar):
+        assert_type(foo.x, Bar)
+        if condition():
+            assert_type(foo.x, Bar)
+        assert_type(foo.x, Bar)
+        while condition():
+            assert_type(foo.x, Bar)
+        assert_type(foo.x, Bar)
+"#,
+);
+
+testcase!(
+    test_propagate_through_further_narrowing_control_flow,
+    r#"
+from typing import assert_type, Callable
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+class Baz(Bar):
+    pass
+def f(foo: Foo, condition: Callable[[], bool]):
+    if isinstance(foo.x, Bar):
+        assert_type(foo.x, Bar)
+        if isinstance(foo.x, Baz):
+            assert_type(foo.x, Baz)
+        assert_type(foo.x, Bar)
+        while condition():
+            assert isinstance(foo.x, Baz)
+            assert_type(foo.x, Baz)
+        assert_type(foo.x, Bar)
+"#,
+);
+
+testcase!(
+    test_join_on_branching_control_flow,
+    r#"
+from typing import assert_type, Callable
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+class Baz(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar):
+        assert_type(foo.x, Bar)
+    else:
+        assert isinstance(foo.x, Baz)
+        assert_type(foo.x, Baz)
+    assert_type(foo.x, Bar | Baz)
+"#,
+);
+
+testcase!(
+    test_assignment_to_names,
+    r#"
+from typing import assert_type, Callable
+class Foo:
+    x: Foo
+class Bar(Foo):
+    pass
+def f(foo: Foo):
+    if isinstance(foo.x, Bar) and isinstance(foo.x.x, Bar):
+        assert_type(foo.x, Bar)
+        assert_type(foo.x.x, Bar)
+        # Narrows on attributes do not propagate across assignment. This is
+        # intended - without mutation restrictions it is unsound and could lead
+        # to difficult bugs.
+        baz = foo
+        assert_type(baz.x, Foo)
+        # Types of narrowed attributes themselves do propagate, but chained
+        # attribute narrows do not.
+        qux = foo.x
+        assert_type(qux, Bar)
+        assert_type(qux.x, Foo)
+        # The behavior is the same for other styles of assignment (we use different
+        # binding kinds for "target" assignment vs bare name assignment, this test
+        # is verifying they work the same way)
+        baz, qux = foo, foo.x
+        assert_type(baz.x, Foo)
+        assert_type(qux, Bar)
+        assert_type(qux.x, Foo)
+"#,
+);
+
+testcase!(
+    test_none_to_iterable,
+    r#"
+from typing import assert_type, Callable
+class Foo:
+    xs: list[int] | None
+def f(foo: Foo):
+    if foo.xs is not None:
+        assert_type(foo.xs, list[int])
+        for x in foo.xs:
+            assert_type(x, int)
+"#,
+);
+
+testcase!(
+    test_hasattr_narrowing,
+    r#"
+from typing import assert_type, Any
+class C:
+    x: int
+
+def test(c: C):
+    if hasattr(c, "x"):
+        assert_type(c.x, int)
+    if hasattr(c, "y"):
+        assert_type(c.y, Any)
+    "#,
+);
+
+testcase!(
+    test_getattr_narrowing,
+    r#"
+from typing import assert_type, Any
+class C:
+    x: int | None
+class C2:
+    pass
+
+def test(c: C, c2: C2):
+    # if the class has the attribute declared, we do a truthy refinement if the default is statically falsy
+    if getattr(c, "x"):
+        assert_type(c.x, int)
+    if getattr(c, "x", None):
+        assert_type(c.x, int)
+    if getattr(c, "x", 1):
+        assert_type(c.x, int | None)
+
+    # if not, we infer `Any` if the default is statically falsy
+    if getattr(c2, "x"):
+        assert_type(c2.x, Any)
+    if getattr(c2, "x", None):
+        assert_type(c2.x, Any)
+    if getattr(c2, "x", 1):
+        assert_type(c2.x, Any)  # E: Object of class `C2` has no attribute `x`
+    "#,
+);
+
+testcase!(
+    test_getattr_binop_narrowing,
+    r#"
+from typing import assert_type, Any
+class C:
+    pass
+
+def test(c: C):
+    if getattr(c, "x") is not None:
+        assert_type(c.x, Any)
+    if getattr(c, "x") != None:
+        assert_type(c.x, Any)
+    if getattr(c, "x", None) is not None:
+        assert_type(c.x, Any)
+    if getattr(c, "x", None) != None:
+        assert_type(c.x, Any)
+    # these do nothing
+    if getattr(c, "x", 1) is not None:
+        assert_type(c.x, Any)  # E: Object of class `C` has no attribute `x`
+    if getattr(c, "x", 1) != 1:
+        assert_type(c.x, Any)  # E: Object of class `C` has no attribute `x`
+    "#,
+);
+
+testcase!(
+    test_hasattr_narrowing_preserves_attr_type,
+    r#"
+from typing import assert_type, Any
+
+class A:
+    x: int
+class B:
+    pass
+
+def f(v: A | B):
+    if hasattr(v, "x"):
+        # The facet should preserve `int` from A.x, not widen to bare Any.
+        assert_type(v.x, int | Any)
+    "#,
+);
+
+testcase!(
+    test_hasattr_narrowing_del,
+    r#"
+from typing import Final
+
+class Foo: pass
+
+def f(foo: Foo) -> None:
+    if hasattr(foo, "uid"):
+        before = foo.uid
+        del foo.uid
+        after = foo.uid  # E: Object of class `Foo` has no attribute `uid`
+
+def preserves_other_narrows(foo: Foo) -> None:
+    if hasattr(foo, "uid"):
+        if hasattr(foo, "name"):
+            del foo.uid
+            still_present = foo.name
+
+class Locked:
+    uid: Final[int] = 0
+
+def preserves_delete_restrictions(value: Foo | Locked) -> None:
+    if hasattr(value, "uid"):
+        del value.uid  # E: Cannot delete field `uid`
+
+class BadDelattr:
+    def __delattr__(self, name: int) -> None: ...  # E: `BadDelattr.__delattr__` overrides parent class `object` in an inconsistent manner
+
+def validates_delattr(value: BadDelattr) -> None:
+    if hasattr(value, "uid"):
+        del value.uid  # E: Argument `Literal['uid']` is not assignable to parameter `name` with type `int`
+    "#,
+);
+
+testcase!(
+    test_del_attribute_unknown_index_invalidates_narrows,
+    r#"
+from typing import assert_type
+
+class Inner:
+    uid: int | None
+
+def f(xs: list[Inner], i: int) -> None:
+    if xs[0].uid is not None:
+        assert_type(xs[0].uid, int)
+        del xs[i].uid
+        assert_type(xs[0].uid, int | None)
+    "#,
+);
+
+testcase!(
+    test_isinstance_rebases_attr,
+    r#"
+from dataclasses import dataclass
+from typing import reveal_type
+
+@dataclass(frozen=True)
+class A:
+    x: int | None
+
+@dataclass(frozen=True)
+class B(A):
+    x: int
+
+def f(o: A):
+    if o.x: pass
+    if isinstance(o, B):
+        reveal_type(o.x)  # E: revealed type: int
+"#,
+);
+
+testcase!(
+    test_or_with_unreachable_branch_keeps_attribute_narrow,
+    r#"
+from typing import assert_type
+
+class A:
+    x: int | None
+
+def f(o: A) -> None:
+    if not isinstance(o, A) or o.x is not None:
+        assert_type(o.x, int)
+    "#,
+);
+
+testcase!(
+    test_eq_narrow_int_enum_attribute_keeps_parent,
+    r#"
+from enum import IntEnum
+from typing import Literal, assert_type
+
+class E(IntEnum):
+    X = 1
+
+class A:
+    e: E
+    y: int | None
+
+def f(a: A) -> None:
+    if a.e == 1:
+        assert_type(a, A)
+        assert_type(a.e, Literal[E.X])
+    if a.e == 1 or a.y is not None:
+        assert_type(a.y, int | None)
+    "#,
+);

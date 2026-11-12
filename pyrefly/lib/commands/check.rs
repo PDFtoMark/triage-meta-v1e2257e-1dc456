@@ -1,0 +1,3952 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+mod sarif;
+
+use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Display;
+use std::fs::File;
+use std::io;
+use std::io::BufWriter;
+use std::io::Read;
+use std::io::Write;
+use std::io::stdin;
+use std::path::Path;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+use anstream::ColorChoice;
+use anstream::eprintln;
+use anstream::stderr;
+use anstream::stdout;
+use anyhow::Context as _;
+use anyhow::bail;
+use anyhow::ensure;
+use clap::Parser;
+use clap::ValueEnum;
+use dupe::Dupe as _;
+use percent_encoding::AsciiSet;
+use percent_encoding::CONTROLS;
+use percent_encoding::utf8_percent_encode;
+use pyrefly_build::handle::Handle;
+use pyrefly_config::args::ConfigOverrideArgs;
+use pyrefly_config::base::Preset;
+use pyrefly_config::config::BaselineFormat;
+use pyrefly_config::config::BaselineMatchingMode;
+use pyrefly_config::config::ConfigFile;
+use pyrefly_config::config::ConfigSource;
+use pyrefly_config::config::OutputFormat;
+use pyrefly_config::config::SynthesizedPresetReason;
+use pyrefly_config::error_kind::ErrorKind;
+use pyrefly_config::finder::ConfigError;
+use pyrefly_config::migration::run::MigratedConfigSource;
+use pyrefly_config::migration::run::MigratedFromKind;
+use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_name::ModuleNameWithKind;
+use pyrefly_python::module_path::ModulePath;
+use pyrefly_util::absolutize::Absolutize;
+use pyrefly_util::arc_id::ArcId;
+use pyrefly_util::args::clap_env;
+use pyrefly_util::demand_tree::DemandCollector;
+use pyrefly_util::demand_tree::report_json;
+use pyrefly_util::display;
+use pyrefly_util::display::count;
+use pyrefly_util::display::number_thousands;
+use pyrefly_util::events::CategorizedEvents;
+use pyrefly_util::forgetter::Forgetter;
+use pyrefly_util::fs_anyhow;
+use pyrefly_util::includes::Includes;
+use pyrefly_util::memory::MemoryUsageTrace;
+use pyrefly_util::thread_pool::ThreadCount;
+use pyrefly_util::unix_path::path_to_unix_string;
+use pyrefly_util::watcher::Watcher;
+use ruff_text_size::Ranged;
+use serde::Serialize;
+use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
+
+use self::sarif::write_error_sarif_to_console;
+use self::sarif::write_error_sarif_to_file;
+use crate::commands::config_finder::ConfigConfigurerWrapper;
+use crate::commands::files::FilesArgs;
+use crate::commands::files::UpsellDecision;
+use crate::commands::files::get_config_finder_for_snippet;
+use crate::commands::util::CommandExitStatus;
+use crate::commands::util::VersionMismatch;
+use crate::config::error_kind::Severity;
+use crate::config::finder::ConfigFinder;
+use crate::error::baseline::StaleRowScope;
+use crate::error::baseline::prepare_baseline_rows;
+use crate::error::baseline::write_baseline_file;
+use crate::error::code_climate::CodeClimateIssues;
+use crate::error::collector::CollectedDiagnostic;
+use crate::error::error::BaselineStatus;
+use crate::error::error::Error;
+use crate::error::error::ErrorRenderer;
+use crate::error::error::ReportedError;
+use crate::error::error::SerializableError;
+use crate::error::error::print_error_counts;
+use crate::error::legacy::BaselineErrors;
+use crate::error::legacy::LegacyError;
+use crate::error::legacy::LegacyErrors;
+use crate::error::legacy::severity_to_str;
+use crate::error::summarize::print_error_summary;
+use crate::error::suppress;
+use crate::error::suppress::CommentLocation;
+use crate::error::suppress::SerializedError;
+use crate::error::suppress::UnusedIgnoreKind;
+use crate::report;
+use crate::state::load::FileContents;
+use crate::state::require::Require;
+use crate::state::require::RequireLevels;
+use crate::state::state::CommittingTransaction;
+use crate::state::state::State;
+use crate::state::state::Transaction;
+use crate::state::steps::Step;
+use crate::state::subscriber::ProgressBarStyle;
+use crate::state::subscriber::TestSubscriber;
+
+/// Result data from a non-watch check run, used for telemetry logging.
+pub struct CheckResult {
+    /// The first `CheckResult::LOGGED_ERROR_LIMIT` CLI-visible diagnostics, in the legacy
+    /// JSON format, suitable for serialization.
+    pub legacy_errors: Vec<LegacyError>,
+    /// Number of CLI-visible diagnostics, including those beyond `legacy_errors`.
+    pub error_count: usize,
+    /// Number of files (modules) that were checked.
+    pub checked_file_count: usize,
+}
+
+impl CheckResult {
+    /// How many diagnostics telemetry logs. Converting every diagnostic of a large run only
+    /// to log a few would cost more than collecting them.
+    pub const LOGGED_ERROR_LIMIT: usize = 300;
+
+    fn new(
+        errors: &[CollectedDiagnostic<'_>],
+        relative_to: &Path,
+        checked_file_count: usize,
+    ) -> Self {
+        let logged = &errors[..errors.len().min(Self::LOGGED_ERROR_LIMIT)];
+        Self {
+            legacy_errors: LegacyErrors::from_errors(relative_to, logged).errors,
+            error_count: errors.len(),
+            checked_file_count,
+        }
+    }
+}
+
+/// Check the given files.
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Clone, Parser)]
+pub struct FullCheckArgs {
+    /// Which files to check.
+    #[command(flatten)]
+    pub files: FilesArgs,
+
+    /// Watch for file changes and re-check them.
+    /// (Warning: This mode is highly experimental!)
+    #[arg(long, conflicts_with_all = ["check_all", "report_scip"])]
+    watch: bool,
+
+    /// Type checking arguments and configuration
+    #[command(flatten)]
+    args: CheckArgs,
+
+    /// Configuration override options
+    #[command(flatten, next_help_heading = "Config Overrides")]
+    pub config_override: ConfigOverrideArgs,
+}
+
+impl FullCheckArgs {
+    pub async fn run(
+        self,
+        version: &str,
+        wrapper: Option<ConfigConfigurerWrapper>,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<(CommandExitStatus, Option<CheckResult>)> {
+        self.config_override.validate()?;
+        let (files_to_check, config_finder, upsell) =
+            self.files.resolve(self.config_override, wrapper)?;
+        run_check(
+            self.args,
+            version,
+            self.watch,
+            files_to_check,
+            config_finder,
+            upsell,
+            thread_count,
+        )
+        .await
+    }
+}
+
+/// Resolve the `--relative-to` argument to a concrete path for error reporting.
+fn resolve_relative_to(relative_to: Option<&String>) -> PathBuf {
+    relative_to.map_or_else(
+        || std::env::current_dir().ok().unwrap_or_default(),
+        |x| PathBuf::from_str(x.as_str()).unwrap(),
+    )
+}
+
+async fn run_check(
+    args: CheckArgs,
+    version: &str,
+    watch: bool,
+    files_to_check: Box<dyn Includes>,
+    config_finder: ConfigFinder,
+    upsell: UpsellDecision,
+    thread_count: ThreadCount,
+) -> anyhow::Result<(CommandExitStatus, Option<CheckResult>)> {
+    if watch {
+        let roots = files_to_check.roots();
+        info!(
+            "Watching for files in {}",
+            display::intersperse_iter(";", || roots.iter().map(|p| p.display()))
+        );
+        let watcher = Watcher::notify(&roots)?;
+        run_watch(
+            args,
+            watcher,
+            version,
+            files_to_check,
+            config_finder,
+            upsell,
+            thread_count,
+        )
+        .await?;
+        Ok((CommandExitStatus::Success, None))
+    } else {
+        let (status, check_result) =
+            args.run_once(version, files_to_check, config_finder, upsell, thread_count)?;
+        Ok((status, Some(check_result)))
+    }
+}
+
+/// Main arguments for Pyrefly type checker
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Parser, Clone)]
+pub struct CheckArgs {
+    /// Output related configuration options
+    #[command(flatten, next_help_heading = "Output")]
+    output: OutputArgs,
+    /// Behavior-related configuration options
+    #[command(flatten, next_help_heading = "Behavior")]
+    behavior: BehaviorArgs,
+}
+
+/// Arguments for snippet checking (excludes behavior args that don't apply to snippets)
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Parser, Clone)]
+pub struct SnippetCheckArgs {
+    /// Python code to type check. Pass '-' to read from STDIN.
+    code: String,
+
+    /// Explicitly set the Pyrefly configuration to use when type checking.
+    /// When not set, Pyrefly will perform an upward-filesystem-walk approach to find the nearest
+    /// pyrefly.toml or pyproject.toml with `tool.pyrefly` section'. If no config is found, Pyrefly exits with error.
+    /// If both a pyrefly.toml and valid pyproject.toml are found, pyrefly.toml takes precedence.
+    #[arg(long, short, value_name = "FILE", env = clap_env("CONFIG"))]
+    config: Option<PathBuf>,
+
+    /// Output related configuration options
+    #[command(flatten, next_help_heading = "Output")]
+    output: OutputArgs,
+    /// Configuration override options
+    #[command(flatten, next_help_heading = "Config Overrides")]
+    pub config_override: ConfigOverrideArgs,
+}
+
+impl SnippetCheckArgs {
+    pub async fn run(
+        self,
+        version: &str,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<(CommandExitStatus, Option<CheckResult>)> {
+        let config_finder = get_config_finder_for_snippet(self.config, self.config_override)?;
+
+        let check_args = CheckArgs {
+            output: self.output,
+            behavior: BehaviorArgs {
+                check_all: false,
+                suppress_errors: false,
+                expectations: false,
+                remove_unused_ignores: None,
+            },
+        };
+
+        let code = if self.code.trim() == "-" {
+            let mut code = String::new();
+            match stdin().read_to_string(&mut code) {
+                Ok(_) => code,
+                Err(error) => {
+                    error!("Failed to read input from stdin: {error:?}");
+                    return Ok((CommandExitStatus::UserError, None));
+                }
+            }
+        } else {
+            self.code
+        };
+
+        let (status, check_result) =
+            check_args.run_once_with_snippet(code, version, config_finder, thread_count)?;
+        Ok((status, Some(check_result)))
+    }
+}
+
+/// how/what should Pyrefly output
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Parser, Clone)]
+struct OutputArgs {
+    /// Write errors to an output destination. Repeat for multiple outputs.
+    /// Use `-` as the destination for stdout. Prefix a destination with `FORMAT:` to override `--output-format`.
+    #[arg(long, short = 'o', value_name = "[FORMAT:]DESTINATION")]
+    output: Vec<ErrorOutput>,
+    /// Set the default error output format.
+    #[arg(long, value_enum)]
+    output_format: Option<OutputFormat>,
+    /// Produce debugging information about the type checking process.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    debug_info: Option<PathBuf>,
+    /// Report the memory usage of bindings.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_binding_memory: Option<PathBuf>,
+    /// Report type traces.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_trace: Option<PathBuf>,
+    /// Experimental: generate a JSON dependency graph of all modules to the specified file. This is unstable and should only be used for debugging.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    dependency_graph: Option<PathBuf>,
+    /// Process each module individually to figure out how long each step takes.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_timings: Option<PathBuf>,
+    /// Generate a Glean-compatible JSON file for each module
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_glean: Option<PathBuf>,
+    /// Make each module's file the Glean ownership unit of its facts in the Glean report.
+    #[arg(long, requires = "report_glean")]
+    report_glean_ownership: bool,
+
+    /// Directory, relative to the working directory, holding the stdlib sources that the
+    /// typeshed stdlib stubs bundled with Pyrefly describe. Glean cross-references into the
+    /// stdlib then record those source files instead of stub paths. Affects Glean output only.
+    #[arg(long, value_name = "DIR", requires = "report_glean")]
+    glean_stdlib_root: Option<String>,
+    /// Generate a SCIP index for the project
+    #[arg(
+        long,
+        value_name = "OUTPUT_FILE",
+        conflicts_with_all = [
+            "report_glean",
+            "report_pysa",
+            "report_trace",
+            "report_demand_tree",
+            "debug_info",
+            "report_binding_memory",
+        ]
+    )]
+    report_scip: Option<PathBuf>,
+    /// Package name for the project's symbols in the SCIP index. Defaults to the name in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_name: Option<String>,
+    /// Package version for the project's symbols in the SCIP index. Defaults to the version in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_version: Option<String>,
+    /// Generate a Pysa-compatible JSON file for each module. Pysa treats every type error
+    /// as a failure, so this defaults `--min-severity` to `error`.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_pysa: Option<PathBuf>,
+    /// Format for pysa report output (json or capnp)
+    #[arg(long, value_enum, default_value_t = report::pysa::PysaFormat::Capnp)]
+    report_pysa_format: report::pysa::PysaFormat,
+    /// Report the cross-module demand tree (aggregated summary of LookupAnswer
+    /// and LookupExport calls). Useful for analyzing laziness properties.
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_demand_tree: Option<PathBuf>,
+    /// Generate a CinderX-format type report (experimental, internal-only).
+    #[arg(
+        long,
+        value_name = "OUTPUT_DIR",
+        hide = true,
+        conflicts_with = "report_scip"
+    )]
+    report_cinderx: Option<PathBuf>,
+    /// Also write human-readable .txt files alongside the CinderX JSON report.
+    /// Each .txt file inlines type-table indices so types are fully readable without
+    /// cross-referencing the JSON. Intended for debugging; mirrors view_types.py output.
+    #[arg(long, hide = true)]
+    cinderx_include_readable: bool,
+    /// Include all transitively-imported dependency modules in the CinderX report,
+    /// not just the explicitly type-checked project files.
+    #[arg(long, hide = true)]
+    cinderx_include_deps: bool,
+    /// Count the number of each error kind. Prints the top N [default=5] errors, sorted by count, or all errors if N is 0.
+    #[arg(
+        long,
+        default_missing_value = "5",
+        require_equals = true,
+        num_args = 0..=1,
+        value_name = "N",
+    )]
+    count_errors: Option<usize>,
+    /// Summarize errors by directory. The optional index argument specifies which file path segment will be used to group errors.
+    /// The default index is 0. For errors in `/foo/bar/...`, this will group errors by `/foo`. If index is 1, errors will be grouped by `/foo/bar`.
+    /// An index larger than the number of path segments will group by the final path element, i.e. the file name.
+    #[arg(
+        long,
+        default_missing_value = "0",
+        require_equals = true,
+        num_args = 0..=1,
+        value_name = "INDEX",
+    )]
+    summarize_errors: Option<usize>,
+
+    /// Filter errors to show only a specific error kind (e.g., bad-assignment, missing-return, etc.).
+    /// Can be passed multiple times or as a comma-separated list.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "ERROR_KIND",
+        hide_possible_values = true,
+        value_delimiter = ','
+    )]
+    only: Option<Vec<ErrorKind>>,
+
+    /// By default show a progress bar and the number of errors.
+    /// Pass `--summary` to additionally show information about lines checked and time/memory,
+    /// or `--summary=none` to hide the progress bar and summary line entirely.
+    #[arg(
+        long,
+        default_missing_value = "full",
+        require_equals = true,
+        num_args = 0..=1,
+        value_enum,
+        default_value_t
+    )]
+    summary: Summary,
+
+    /// Suppress the progress bar during type checking. Deprecated: use `--progress-bar=no` instead.
+    #[arg(long, hide = true)]
+    no_progress_bar: bool,
+
+    /// Set the progress bar style.
+    /// `interactive` (default) shows a visual progress bar.
+    /// `simple` prints periodic log-style progress messages (suitable for piping or non-interactive use).
+    /// `no` disables progress reporting entirely.
+    #[arg(long, value_enum)]
+    progress_bar: Option<ProgressBarStyle>,
+
+    /// When specified, strip this prefix from any paths in the output.
+    /// Pass "" to show absolute paths. When omitted, we will use the current working directory.
+    #[arg(long)]
+    relative_to: Option<String>,
+
+    /// Path to baseline file for comparing type errors
+    #[arg(long, value_name = "BASELINE_FILE")]
+    baseline: Option<PathBuf>,
+
+    /// Severity assigned to errors that match the baseline. Defaults to "ignore".
+    #[arg(long, value_enum)]
+    baseline_error_level: Option<Severity>,
+
+    /// When specified, emit a sorted/formatted JSON of the errors to the baseline file
+    #[arg(long, group = "baseline_action")]
+    update_baseline: bool,
+
+    /// Rewrite the baseline file to drop stale entries without recording new errors.
+    /// Existing entries for files outside the current check are retained.
+    #[arg(long, group = "baseline_action")]
+    prune_baseline: bool,
+
+    /// Exit with a non-zero status when the checked scope makes baseline entries stale.
+    #[arg(long, group = "baseline_action")]
+    error_stale_baseline: bool,
+
+    /// Minimum severity level for errors to be displayed and to cause a nonzero exit code.
+    /// When unset, warnings and errors are displayed, and only errors cause a nonzero exit code.
+    #[arg(long, value_enum)]
+    min_severity: Option<Severity>,
+}
+
+/// A diagnostic output format and destination requested on the CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorOutput {
+    /// An explicit format override, or `None` to use the default output format.
+    format: Option<OutputFormat>,
+    /// Where to write the formatted diagnostics.
+    destination: ErrorOutputDestination,
+}
+
+/// A destination for formatted diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ErrorOutputDestination {
+    /// Standard output.
+    Stdout,
+    /// A file created or replaced by the check.
+    File(PathBuf),
+}
+
+impl FromStr for ErrorOutput {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (format, destination) = match value.split_once(':') {
+            Some((prefix, destination)) => {
+                match <OutputFormat as ValueEnum>::from_str(prefix, false) {
+                    Ok(format) => (Some(format), destination),
+                    // An unrecognized prefix is part of the path. This preserves paths
+                    // containing `:`, including absolute Windows paths.
+                    Err(_) => (None, value),
+                }
+            }
+            None => (None, value),
+        };
+        if destination.is_empty() {
+            return Err("output destination cannot be empty".to_owned());
+        }
+        Ok(Self {
+            format,
+            destination: if destination == "-" {
+                ErrorOutputDestination::Stdout
+            } else {
+                ErrorOutputDestination::File(PathBuf::from(destination))
+            },
+        })
+    }
+}
+
+impl OutputArgs {
+    fn has_daemon_incompatible_options(&self) -> bool {
+        let Self {
+            output,
+            output_format,
+            debug_info,
+            report_binding_memory,
+            report_trace,
+            dependency_graph,
+            report_timings,
+            report_glean,
+            report_glean_ownership,
+            glean_stdlib_root,
+            report_scip,
+            report_scip_project_name,
+            report_scip_project_version,
+            report_pysa,
+            report_pysa_format,
+            report_demand_tree,
+            report_cinderx,
+            cinderx_include_readable,
+            cinderx_include_deps,
+            count_errors,
+            summarize_errors,
+            only,
+            summary,
+            no_progress_bar,
+            progress_bar,
+            relative_to,
+            baseline,
+            baseline_error_level,
+            update_baseline,
+            prune_baseline,
+            error_stale_baseline,
+            min_severity: _,
+        } = self;
+
+        let unsupported_output_format = match output_format {
+            None | Some(OutputFormat::MinText | OutputFormat::FullText | OutputFormat::Json) => {
+                false
+            }
+            Some(
+                OutputFormat::FullTextWithGithub
+                | OutputFormat::Github
+                | OutputFormat::JunitXml
+                | OutputFormat::CodeClimate
+                | OutputFormat::Sarif
+                | OutputFormat::OmitErrors,
+            ) => true,
+        };
+
+        !output.is_empty()
+            || unsupported_output_format
+            || debug_info.is_some()
+            || report_binding_memory.is_some()
+            || report_trace.is_some()
+            || dependency_graph.is_some()
+            || report_timings.is_some()
+            || report_glean.is_some()
+            || *report_glean_ownership
+            || glean_stdlib_root.is_some()
+            || report_scip.is_some()
+            || report_scip_project_name.is_some()
+            || report_scip_project_version.is_some()
+            || report_pysa.is_some()
+            || !matches!(report_pysa_format, report::pysa::PysaFormat::Capnp)
+            || report_demand_tree.is_some()
+            || report_cinderx.is_some()
+            || *cinderx_include_readable
+            || *cinderx_include_deps
+            || count_errors.is_some()
+            || summarize_errors.is_some()
+            || only.is_some()
+            || !matches!(summary, Summary::Default)
+            || *no_progress_bar
+            || progress_bar.is_some()
+            || relative_to.is_some()
+            || baseline.is_some()
+            || baseline_error_level.is_some()
+            || *update_baseline
+            || *prune_baseline
+            || *error_stale_baseline
+    }
+
+    /// Validate invariants across all requested output destinations.
+    fn validate_outputs(&self) -> anyhow::Result<()> {
+        let mut has_stdout = false;
+        let mut files = HashSet::new();
+        for output in &self.output {
+            match &output.destination {
+                ErrorOutputDestination::Stdout => {
+                    if has_stdout {
+                        bail!("standard output may only be specified once");
+                    }
+                    has_stdout = true;
+                }
+                ErrorOutputDestination::File(path) => {
+                    if !files.insert(path.absolutize()) {
+                        bail!(
+                            "output destination `{}` may only be specified once",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the settings that a project configuration can supply.
+    ///
+    /// The result depends only on the arguments, so resolving again against a changed
+    /// configuration always yields the current values.
+    fn resolve(&self, config: Option<&ConfigFile>) -> OutputDefaults {
+        let min_severity = self
+            .min_severity
+            .or_else(|| config.and_then(|config| config.min_severity))
+            .or_else(|| self.report_pysa.is_some().then_some(Severity::Error));
+        OutputDefaults {
+            baseline: self
+                .baseline
+                .clone()
+                .or_else(|| config.and_then(|config| config.baseline.clone())),
+            baseline_error_level: self
+                .baseline_error_level
+                .or_else(|| config.and_then(|config| config.baseline_error_level))
+                .unwrap_or(Severity::Ignore),
+            baseline_matching_mode: config
+                .map(|config| config.baseline_matching_mode)
+                .unwrap_or_default(),
+            baseline_format: config
+                .map(|config| config.baseline_format)
+                .unwrap_or_default(),
+            output_format: self
+                .output_format
+                .or_else(|| config.and_then(|config| config.output_format))
+                .unwrap_or_default(),
+            min_severity: min_severity.unwrap_or(Severity::Error),
+            // With no threshold set, warnings are printed but only errors make the exit
+            // code nonzero.
+            show_severity: min_severity.unwrap_or(Severity::Warn),
+            only: self
+                .only
+                .clone()
+                .or_else(|| config.and_then(|config| config.only.clone())),
+        }
+    }
+
+    /// Resolve the effective progress bar style, taking deprecated flags into account.
+    fn progress_bar_style(&self) -> ProgressBarStyle {
+        if let Some(style) = &self.progress_bar {
+            return style.clone();
+        }
+        if self.no_progress_bar || self.summary == Summary::None {
+            ProgressBarStyle::No
+        } else {
+            ProgressBarStyle::Interactive
+        }
+    }
+}
+
+/// The effective values of the output settings that a project configuration can supply.
+#[derive(Clone, Debug, PartialEq)]
+struct OutputDefaults {
+    baseline: Option<PathBuf>,
+    baseline_error_level: Severity,
+    baseline_matching_mode: BaselineMatchingMode,
+    baseline_format: BaselineFormat,
+    output_format: OutputFormat,
+    /// Diagnostics at or above this severity make the exit code nonzero, and are
+    /// the ones `--suppress-errors` and baseline updates act on.
+    min_severity: Severity,
+    /// Diagnostics at or above this severity are printed. It is never above
+    /// `min_severity`.
+    show_severity: Severity,
+    /// Diagnostics matching the specific kinds are reported.
+    /// If `None`, no filtering is applied and all error kinds are processed.
+    only: Option<Vec<ErrorKind>>,
+}
+
+#[derive(Clone, Debug, ValueEnum, Default, PartialEq, Eq)]
+enum Summary {
+    None,
+    #[default]
+    Default,
+    Full,
+}
+
+/// non-config type checker behavior
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Parser, Clone)]
+struct BehaviorArgs {
+    /// Check all reachable modules, not just the ones that are passed in explicitly on CLI positional arguments.
+    #[arg(long, short = 'a')]
+    check_all: bool,
+    /// Suppress errors found in the input files.
+    #[arg(long)]
+    suppress_errors: bool,
+    /// Check against any `E:` lines in the file.
+    #[arg(long)]
+    expectations: bool,
+    /// Remove unused ignores from the input files, optionally selecting `pyrefly`, `type`, or `all`.
+    /// Defaults to `pyrefly` when no kind is specified.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "KIND",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "pyrefly"
+    )]
+    remove_unused_ignores: Option<UnusedIgnoreKind>,
+}
+
+impl BehaviorArgs {
+    fn has_custom_options(&self) -> bool {
+        let Self {
+            check_all,
+            suppress_errors,
+            expectations,
+            remove_unused_ignores,
+        } = self;
+
+        *check_all || *suppress_errors || *expectations || remove_unused_ignores.is_some()
+    }
+}
+
+fn write_errors_to_file(
+    format: OutputFormat,
+    path: &Path,
+    version: &str,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    match format {
+        OutputFormat::MinText => write_error_text_to_file(path, relative_to, errors, false),
+        OutputFormat::FullText => write_error_text_to_file(path, relative_to, errors, true),
+        OutputFormat::FullTextWithGithub => {
+            write_error_full_text_with_github_to_file(path, relative_to, errors)
+        }
+        OutputFormat::Json => write_error_json_to_file(path, relative_to, errors),
+        OutputFormat::Github => write_error_github_to_file(path, errors),
+        OutputFormat::JunitXml => write_error_junit_xml_to_file(path, relative_to, errors),
+        OutputFormat::CodeClimate => write_error_codeclimate_to_file(path, relative_to, errors),
+        OutputFormat::Sarif => write_error_sarif_to_file(path, version, relative_to, errors),
+        OutputFormat::OmitErrors => Ok(()),
+    }
+}
+
+pub(crate) fn write_errors_to_console(
+    format: OutputFormat,
+    version: &str,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    match format {
+        OutputFormat::MinText => write_error_text_to_console(relative_to, errors, false),
+        OutputFormat::FullText => write_error_text_to_console(relative_to, errors, true),
+        OutputFormat::FullTextWithGithub => {
+            write_error_full_text_with_github_to_console(relative_to, errors)
+        }
+        OutputFormat::Json => write_error_json_to_console(relative_to, errors),
+        OutputFormat::Github => write_error_github_to_console(errors),
+        OutputFormat::JunitXml => write_error_junit_xml_to_console(relative_to, errors),
+        OutputFormat::CodeClimate => write_error_codeclimate_to_console(relative_to, errors),
+        OutputFormat::Sarif => write_error_sarif_to_console(version, relative_to, errors),
+        OutputFormat::OmitErrors => Ok(()),
+    }
+}
+
+pub fn write_serializable_errors_to_console(
+    format: OutputFormat,
+    errors: &[SerializableError],
+) -> anyhow::Result<()> {
+    match format {
+        OutputFormat::MinText => write_serializable_error_text_to_console(errors, false),
+        OutputFormat::FullText => write_serializable_error_text_to_console(errors, true),
+        OutputFormat::Json => write_serializable_error_json_to_console(errors),
+        OutputFormat::FullTextWithGithub
+        | OutputFormat::Github
+        | OutputFormat::JunitXml
+        | OutputFormat::CodeClimate
+        | OutputFormat::Sarif
+        | OutputFormat::OmitErrors => {
+            bail!("output format `{format:?}` is not supported for serialized errors")
+        }
+    }
+}
+
+fn write_serializable_error_text_to_console(
+    errors: &[SerializableError],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    fn write(
+        mut renderer: ErrorRenderer<impl Write>,
+        errors: &[SerializableError],
+        verbose: bool,
+    ) -> anyhow::Result<()> {
+        // Serialized diagnostics arrive as a complete batch, so there is no partial result to flush.
+        for error in errors {
+            renderer.write_serializable(error, verbose)?;
+        }
+        renderer.flush()?;
+        Ok(())
+    }
+
+    // See `write_error_text_to_console` for why uncolored text bypasses `anstream`.
+    match stdout().current_choice() {
+        ColorChoice::Never => write(
+            ErrorRenderer::plain(BufWriter::new(io::stdout().lock())),
+            errors,
+            verbose,
+        ),
+        color_choice => write(
+            ErrorRenderer::new(BufWriter::new(stdout().lock()), color_choice),
+            errors,
+            verbose,
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct LegacyErrorReferences<'a> {
+    errors: Vec<&'a LegacyError>,
+}
+
+fn write_serializable_error_json_to_console(errors: &[SerializableError]) -> anyhow::Result<()> {
+    let errors = errors.iter().map(SerializableError::legacy_error).collect();
+    let mut writer = BufWriter::new(io::stdout().lock());
+    serde_json::to_writer_pretty(&mut writer, &LegacyErrorReferences { errors })?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_text(
+    mut renderer: ErrorRenderer<impl Write>,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    renderer.write_all(errors, relative_to, verbose)?;
+    renderer.flush()?;
+    Ok(())
+}
+
+fn write_error_text_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    write_error_text(
+        ErrorRenderer::plain(BufWriter::new(File::create(path)?)),
+        relative_to,
+        errors,
+        verbose,
+    )
+}
+
+fn write_error_text_to_console(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    // `anstream` strips escape codes from text written to a stream that does not take
+    // colors, which means scanning every byte. Uncolored text has no escape codes, so it is
+    // written to the stream directly.
+    match stdout().current_choice() {
+        ColorChoice::Never => write_error_text(
+            ErrorRenderer::plain(BufWriter::new(io::stdout().lock())),
+            relative_to,
+            errors,
+            verbose,
+        ),
+        color_choice => write_error_text(
+            ErrorRenderer::new(BufWriter::new(stdout().lock()), color_choice),
+            relative_to,
+            errors,
+            verbose,
+        ),
+    }
+}
+
+pub(crate) fn write_errors_to_stderr(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    // See `write_error_text_to_console` for why uncolored text bypasses `anstream`.
+    match stderr().current_choice() {
+        ColorChoice::Never => write_error_text(
+            ErrorRenderer::plain(BufWriter::new(io::stderr().lock())),
+            relative_to,
+            errors,
+            verbose,
+        ),
+        color_choice => write_error_text(
+            ErrorRenderer::new(BufWriter::new(stderr().lock()), color_choice),
+            relative_to,
+            errors,
+            verbose,
+        ),
+    }
+}
+
+fn write_error_json(
+    writer: &mut impl Write,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    LegacyErrors::write_json(writer, relative_to, errors)?;
+    Ok(())
+}
+
+fn buffered_write_error_json(
+    writer: impl Write,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(writer);
+    write_error_json(&mut writer, relative_to, errors)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_json_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    fn f(path: &Path, relative_to: &Path, errors: &[impl ReportedError]) -> anyhow::Result<()> {
+        let file = File::create(path)?;
+        buffered_write_error_json(file, relative_to, errors)
+    }
+    f(path, relative_to, errors)
+        .with_context(|| format!("while writing JSON errors to `{}`", path.display()))
+}
+
+fn write_baseline_errors_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+    matching_mode: BaselineMatchingMode,
+    format: BaselineFormat,
+    min_severity: Severity,
+) -> anyhow::Result<()> {
+    // A CLI run is the authoritative writer for the whole project, so it replaces the
+    // baseline unconditionally rather than yielding to whatever else touched it.
+    write_baseline_file(
+        path,
+        &BaselineErrors::from_errors(relative_to, min_severity, errors)
+            .with_format(matching_mode, format),
+        None,
+    )
+    .map(|_| ())
+}
+
+fn write_error_json_to_console(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    buffered_write_error_json(io::stdout().lock(), relative_to, errors)
+}
+
+fn write_error_github(
+    writer: &mut impl Write,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    for error in errors {
+        if let Some(command) = github_actions_command(error) {
+            writeln!(writer, "{command}")?;
+        }
+    }
+    Ok(())
+}
+
+fn buffered_write_error_github(
+    writer: impl Write,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(writer);
+    write_error_github(&mut writer, errors)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_github_to_file(path: &Path, errors: &[impl ReportedError]) -> anyhow::Result<()> {
+    let file = File::create(path)?;
+    buffered_write_error_github(file, errors)
+}
+
+fn write_error_github_to_console(errors: &[impl ReportedError]) -> anyhow::Result<()> {
+    buffered_write_error_github(io::stdout().lock(), errors)
+}
+
+fn write_error_full_text_with_github(
+    writer: impl Write,
+    color_choice: ColorChoice,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(writer);
+    {
+        let mut renderer = ErrorRenderer::new(&mut writer, color_choice);
+        renderer.write_all(errors, relative_to, true)?;
+        renderer.flush()?;
+    }
+    write_error_github(&mut writer, errors)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_full_text_with_github_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    write_error_full_text_with_github(File::create(path)?, ColorChoice::Never, relative_to, errors)
+}
+
+fn write_error_full_text_with_github_to_console(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    // See `write_error_text_to_console` for why uncolored text bypasses `anstream`.
+    match stdout().current_choice() {
+        ColorChoice::Never => write_error_full_text_with_github(
+            io::stdout().lock(),
+            ColorChoice::Never,
+            relative_to,
+            errors,
+        ),
+        color_choice => {
+            write_error_full_text_with_github(stdout().lock(), color_choice, relative_to, errors)
+        }
+    }
+}
+
+/// True for characters allowed by the XML 1.0 `Char` production. Everything else
+/// (NUL and most other C0 controls, U+FFFE, U+FFFF) is illegal *anywhere* in an
+/// XML document — including inside CDATA, which has no escape mechanism — so such
+/// characters must be dropped or the document is not well-formed. Rust `char`
+/// already excludes surrogates, so they need no special handling here.
+fn is_xml_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            // Tabs/newlines are valid but get normalized to spaces in attribute
+            // values, so emit them as character references to preserve them.
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' => out.push_str("&#9;"),
+            c if is_xml_char(c) => out.push(c),
+            _ => {} // drop characters illegal in XML
+        }
+    }
+    out
+}
+
+fn xml_escape_cdata(s: &str) -> String {
+    // CDATA admits any valid XML character except the delimiter "]]>", which
+    // would close the section early — split it across CDATA boundaries. Illegal
+    // XML characters have no CDATA escape, so they are dropped outright.
+    s.chars()
+        .filter(|c| is_xml_char(*c))
+        .collect::<String>()
+        .replace("]]>", "]]]]><![CDATA[>")
+}
+
+/// Render diagnostics as a JUnit `<testsuites>` report. JUnit XML has no notion
+/// of severity, so every diagnostic is emitted as a `<failure>` whose `type` is
+/// the Pyrefly error kind (the conventional "failure type" slot). The caller passes
+/// only the diagnostics at or above `--min-severity`, the ones that make the exit code
+/// nonzero, so by default warnings are left out even when the text output shows them.
+fn write_error_junit_xml<W: Write>(
+    mut writer: W,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let n = errors.len();
+
+    writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
+    writeln!(writer, "<testsuites>")?;
+    writeln!(
+        writer,
+        r#"  <testsuite name="pyrefly" tests="{n}" failures="{n}" errors="0" time="0">"#
+    )?;
+
+    for err in errors {
+        let err = err.error();
+        let error_path = err.path().as_path();
+        let path = error_path
+            .strip_prefix(relative_to)
+            .unwrap_or(error_path)
+            .to_string_lossy()
+            .into_owned();
+        let line = err.display_range().start.line_within_cell().get();
+        let kind = err.error_kind().to_name();
+
+        writeln!(
+            writer,
+            r#"    <testcase classname="{}" name="{}:L{}" file="{}" line="{}" time="0">"#,
+            xml_escape_attr(&path),
+            xml_escape_attr(kind),
+            line,
+            xml_escape_attr(&path),
+            line,
+        )?;
+        writeln!(
+            writer,
+            r#"      <failure type="{}" message="{}"><![CDATA[{}]]></failure>"#,
+            xml_escape_attr(kind),
+            xml_escape_attr(err.msg_header()),
+            xml_escape_cdata(&err.msg()),
+        )?;
+        writeln!(writer, "    </testcase>")?;
+    }
+
+    writeln!(writer, "  </testsuite>")?;
+    writeln!(writer, "</testsuites>")?;
+    Ok(())
+}
+
+fn buffered_write_error_junit_xml(
+    writer: impl Write,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(writer);
+    write_error_junit_xml(&mut writer, relative_to, errors)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_junit_xml_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let file = File::create(path)?;
+    buffered_write_error_junit_xml(file, relative_to, errors)
+}
+
+fn write_error_junit_xml_to_console(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    buffered_write_error_junit_xml(io::stdout().lock(), relative_to, errors)
+}
+
+fn severity_to_github_command(severity: Severity) -> Option<&'static str> {
+    let normalized = severity_to_str(severity);
+    match normalized.as_str() {
+        "ignore" => None,
+        "warn" => Some("warning"),
+        "info" => Some("notice"),
+        "error" => Some("error"),
+        _ => None,
+    }
+}
+
+fn github_actions_command(reported: &impl ReportedError) -> Option<String> {
+    let command = severity_to_github_command(reported.severity())?;
+    let baseline_marker = reported.baseline_status().display_suffix();
+    let error = reported.error();
+    let range = error.display_range();
+    let file = path_to_unix_string(error.path().as_path());
+    let params = format!(
+        "file={},line={},col={},endLine={},endColumn={},title={}",
+        escape_workflow_property(&file),
+        range.start.line_within_file().get(),
+        range.start.column().get(),
+        range.end.line_within_file().get(),
+        range.end.column().get(),
+        escape_workflow_property(&format!(
+            "Pyrefly {}{baseline_marker}",
+            error.error_kind().to_name()
+        )),
+    );
+    let message = escape_workflow_data(&error.msg());
+    Some(format!("::{command} {params}::{message}"))
+}
+
+const WORKFLOW_DATA_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%');
+const WORKFLOW_PROPERTY_ENCODE_SET: &AsciiSet = &WORKFLOW_DATA_ENCODE_SET.add(b':').add(b',');
+
+fn escape_workflow_data(value: &str) -> String {
+    utf8_percent_encode(value, WORKFLOW_DATA_ENCODE_SET).to_string()
+}
+
+fn escape_workflow_property(value: &str) -> String {
+    utf8_percent_encode(value, WORKFLOW_PROPERTY_ENCODE_SET).to_string()
+}
+
+fn write_error_codeclimate(
+    writer: &mut impl Write,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let issues = CodeClimateIssues::from_errors(relative_to, errors);
+    serde_json::to_writer_pretty(writer, &issues)?;
+    Ok(())
+}
+
+fn buffered_write_error_codeclimate(
+    writer: impl Write,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    let mut writer = BufWriter::new(writer);
+    write_error_codeclimate(&mut writer, relative_to, errors)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_error_codeclimate_to_file(
+    path: &Path,
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    fn f(path: &Path, relative_to: &Path, errors: &[impl ReportedError]) -> anyhow::Result<()> {
+        let file = File::create(path)?;
+        buffered_write_error_codeclimate(file, relative_to, errors)
+    }
+    f(path, relative_to, errors)
+        .with_context(|| format!("while writing CodeClimate issues to `{}`", path.display()))
+}
+
+fn write_error_codeclimate_to_console(
+    relative_to: &Path,
+    errors: &[impl ReportedError],
+) -> anyhow::Result<()> {
+    buffered_write_error_codeclimate(io::stdout().lock(), relative_to, errors)
+}
+
+/// A data structure to facilitate the creation of handles for all the files we want to check.
+pub struct Handles {
+    /// A mapping from a file to all other information needed to create a `Handle`.
+    /// The value type is basically everything else in `Handle` except for the file path.
+    path_data: HashSet<ModulePath>,
+}
+
+impl Handles {
+    pub fn new(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut handles = Self {
+            path_data: HashSet::new(),
+        };
+        for file in files {
+            handles.path_data.insert(ModulePath::filesystem(file));
+        }
+        handles
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.path_data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.path_data.len()
+    }
+
+    fn with_additional_files(&self, files: &[PathBuf]) -> Self {
+        // `path_data` is a set, so explicitly requesting a configured file does not
+        // create a duplicate handle.
+        let mut path_data = self.path_data.clone();
+        path_data.extend(files.iter().cloned().map(ModulePath::filesystem));
+        Self { path_data }
+    }
+
+    pub fn all(
+        &self,
+        config_finder: &ConfigFinder,
+    ) -> (Vec<Handle>, SmallSet<ArcId<ConfigFile>>, Vec<ConfigError>) {
+        let mut configs = SmallMap::new();
+        for path in &self.path_data {
+            let unknown = ModuleName::unknown();
+            configs
+                .entry(config_finder.python_file(ModuleNameWithKind::guaranteed(unknown), path))
+                .or_insert_with(SmallSet::new)
+                .insert(path.dupe());
+        }
+
+        let mut warned_targets = HashSet::new();
+        let warnings: Vec<_> = configs
+            .keys()
+            .filter_map(|config| {
+                let warning = config.bundled_typeshed_version_warning()?;
+                // Synthetic configs have no path prefix, so repeated versions share one warning.
+                let origin = match &config.source {
+                    ConfigSource::File(path) => Some(path.clone()),
+                    _ => None,
+                };
+                warned_targets
+                    .insert((config.python_version(), origin))
+                    .then_some(warning)
+            })
+            .collect();
+        if !warnings.is_empty() {
+            config_finder.add_errors(warnings);
+        }
+        // TODO(connernilsen): wire in force logic
+        let reloaded_source_dbs = ConfigFile::query_source_db(&configs, false, None).reloaded;
+        let result = configs
+            .iter()
+            .flat_map(|(c, files)| files.iter().map(|p| c.handle_from_module_path(p.dupe())))
+            .collect();
+        let reloaded_configs = configs
+            .into_iter()
+            .map(|x| x.0)
+            .filter(|c| {
+                c.source_db
+                    .as_ref()
+                    .is_some_and(|db| reloaded_source_dbs.contains(db))
+            })
+            .collect();
+        (result, reloaded_configs, Vec::new())
+    }
+
+    /// Removals need no `covers` check because a path the include set does not cover is
+    /// never a member of `path_data`.
+    fn apply_events(&mut self, events: &CategorizedEvents, includes: &dyn Includes) {
+        for file in &events.created {
+            if includes.covers(file) {
+                self.path_data
+                    .insert(ModulePath::filesystem(file.to_path_buf()));
+            }
+        }
+        for file in &events.removed {
+            self.path_data
+                .remove(&ModulePath::filesystem(file.to_path_buf()));
+        }
+    }
+}
+
+async fn get_watcher_events(watcher: &mut Watcher) -> anyhow::Result<CategorizedEvents> {
+    loop {
+        let events = CategorizedEvents::new_notify(
+            watcher
+                .wait()
+                .await
+                .context("When waiting for watched files")?,
+        );
+        if !events.is_empty() {
+            return Ok(events);
+        }
+    }
+}
+
+/// Structure accumulating timing information.
+struct Timings {
+    /// The overall time we started.
+    start: Instant,
+    list_files: Duration,
+    type_check: Duration,
+    report_errors: Duration,
+}
+
+impl Display for Timings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const THRESHOLD: Duration = Duration::from_millis(100);
+        let total = self.start.elapsed();
+        write!(f, "{}", Self::show(total))?;
+
+        let mut steps = Vec::with_capacity(3);
+
+        // We want to show checking if it is less than total - threshold.
+        // For the others, we want to show if they exceed threshold.
+        if self.type_check + THRESHOLD < total {
+            steps.push(("checking", self.type_check));
+        }
+        if self.report_errors > THRESHOLD {
+            steps.push(("reporting", self.report_errors));
+        }
+        if self.list_files > THRESHOLD {
+            steps.push(("listing", self.list_files));
+        }
+        if !steps.is_empty() {
+            steps.sort_by_key(|x| x.1);
+            write!(
+                f,
+                " ({})",
+                display::intersperse_iter(", ", || steps
+                    .iter()
+                    .rev()
+                    .map(|(lbl, dur)| format!("{lbl} {}", Self::show(*dur))))
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Timings {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            list_files: Duration::ZERO,
+            type_check: Duration::ZERO,
+            report_errors: Duration::ZERO,
+        }
+    }
+
+    fn show(x: Duration) -> String {
+        format!("{:.2}s", x.as_secs_f32())
+    }
+}
+
+/// URL referenced from the unconfigured-config upsell. Kept as a module-level
+/// constant so the wording can stay short and tests can pin the exact string
+/// the user sees.
+const UPSELL_DOCS_URL: &str = "https://pyrefly.org/en/docs/installation/";
+
+/// Resolve an `UpsellDecision` into the concrete reason (or `None` for
+/// "stay silent"). The `Determine` case walks handles with a
+/// short-circuit on the first config mismatch; the other variants are
+/// O(1).
+fn decide_upsell(
+    decision: UpsellDecision,
+    handles: &[Handle],
+    transaction: &Transaction,
+) -> Option<SynthesizedPresetReason> {
+    match decision {
+        UpsellDecision::Skip => None,
+        UpsellDecision::Show(reason) => Some(reason),
+        UpsellDecision::Determine => {
+            let mut iter = handles.iter().filter_map(|h| transaction.get_config(h));
+            let first = iter.next()?;
+            if iter.any(|c| c != first) {
+                return None;
+            }
+            first.synthesized_preset_reason
+        }
+    }
+}
+
+/// Write the "no pyrefly.toml found" upsell for a single
+/// `SynthesizedPresetReason`. Pure function of the reason — trivial to
+/// unit-test against a `Vec<u8>` without spinning up a real check run.
+///
+/// `UserOverride` is intentionally suppressed: the user chose the
+/// preset themselves (via `--preset` or the IDE `typeCheckingMode`
+/// setting), so nagging them to configure pyrefly would be noise.
+fn write_unconfigured_upsell<W: Write>(
+    reason: SynthesizedPresetReason,
+    out: &mut W,
+) -> std::io::Result<()> {
+    match reason {
+        SynthesizedPresetReason::Migrated(kind) => {
+            let (location, preset) = match kind {
+                MigratedFromKind::Mypy(MigratedConfigSource::DedicatedFile) => {
+                    ("your `mypy.ini`", Preset::Legacy)
+                }
+                MigratedFromKind::Mypy(MigratedConfigSource::PyprojectToml) => {
+                    ("`[tool.mypy]` in your `pyproject.toml`", Preset::Legacy)
+                }
+                MigratedFromKind::Pyright(MigratedConfigSource::DedicatedFile) => {
+                    ("your `pyrightconfig.json`", Preset::Default)
+                }
+                MigratedFromKind::Pyright(MigratedConfigSource::PyprojectToml) => {
+                    ("`[tool.pyright]` in your `pyproject.toml`", Preset::Default)
+                }
+                MigratedFromKind::BasedPyright(MigratedConfigSource::DedicatedFile, _) => {
+                    unreachable!("no such thing as basedpyrightconfig.json")
+                }
+                MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, preset) => {
+                    ("`[tool.basedpyright]` in your `pyproject.toml`", preset)
+                }
+            };
+            writeln!(
+                out,
+                "No `pyrefly.toml` found — using settings imported from {location} (preset: {preset}).",
+            )?;
+            writeln!(out, "Run `pyrefly init` to continue setting up Pyrefly.")?;
+            writeln!(out, "Docs: {UPSELL_DOCS_URL}")?;
+        }
+        SynthesizedPresetReason::NoNearbyConfig => {
+            writeln!(out, "No `pyrefly.toml` found — using preset `basic`.")?;
+            writeln!(out, "Run `pyrefly init` to continue setting up Pyrefly.")?;
+            writeln!(out, "Docs: {UPSELL_DOCS_URL}")?;
+        }
+        SynthesizedPresetReason::UserOverride => {}
+    }
+    Ok(())
+}
+
+/// A checker that preserves type-checking state across caller-supplied filesystem events.
+pub struct IncrementalChecker {
+    require_levels: RequireLevels,
+    files_to_check: Box<dyn Includes>,
+
+    handles: Handles,
+    state: State,
+}
+
+/// The diagnostics produced by an incremental check.
+pub struct IncrementalCheckResult {
+    /// Type-checking diagnostics for the configured file set.
+    pub diagnostics: Vec<Error>,
+    /// Configuration errors discovered while resolving or checking the file set.
+    pub config_errors: Vec<ConfigError>,
+}
+
+/// An incremental transaction that runs before exposing results and commits afterward.
+struct IncrementalCheckTransaction<'a> {
+    state: &'a State,
+    transaction: CommittingTransaction<'a>,
+    handles: Vec<Handle>,
+    sourcedb_errors: Vec<ConfigError>,
+    require: Require,
+}
+
+impl IncrementalCheckTransaction<'_> {
+    fn run<T>(
+        mut self,
+        finish: impl FnOnce(&mut Transaction, &[Handle], Vec<ConfigError>) -> T,
+    ) -> T {
+        self.transaction
+            .as_mut()
+            .run(&self.handles, self.require, None);
+        let result = finish(
+            self.transaction.as_mut(),
+            &self.handles,
+            self.sourcedb_errors,
+        );
+        self.state.commit_transaction(self.transaction, None);
+        result
+    }
+}
+
+impl IncrementalChecker {
+    /// Initialize a checker without running a check.
+    pub fn new(
+        require_levels: RequireLevels,
+        files_to_check: Box<dyn Includes>,
+        config_finder: ConfigFinder,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<Self> {
+        let handles = {
+            let expanded_file_list = config_finder.checkpoint(files_to_check.files_iter())?;
+            Handles::new(expanded_file_list)
+        };
+        Ok(Self {
+            require_levels,
+            files_to_check,
+            handles,
+            state: State::new(config_finder, thread_count),
+        })
+    }
+
+    /// Run a check after applying the filesystem events supplied by the caller.
+    pub fn check(&mut self, events: &CategorizedEvents) -> IncrementalCheckResult {
+        self.check_with_additional_files(events, &[])
+    }
+
+    /// Run a check with additional files without adding them to the configured file set.
+    pub fn check_with_additional_files(
+        &mut self,
+        events: &CategorizedEvents,
+        additional_files: &[PathBuf],
+    ) -> IncrementalCheckResult {
+        self.prepare_check(events, additional_files).run(
+            |transaction, handles, mut sourcedb_errors| {
+                let diagnostics = transaction
+                    .get_errors(handles)
+                    .collect_display_errors_with_unused_ignores();
+                let mut config_errors = transaction.get_config_errors();
+                config_errors.append(&mut sourcedb_errors);
+                IncrementalCheckResult {
+                    diagnostics,
+                    config_errors,
+                }
+            },
+        )
+    }
+
+    /// Return the number of configured files checked by this checker.
+    pub fn checked_file_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Return whether every file is already in the configured handle set.
+    pub fn all_files_are_configured(&self, files: &[PathBuf]) -> bool {
+        files.iter().all(|file| {
+            self.handles
+                .path_data
+                .contains(&ModulePath::filesystem(file.clone()))
+        })
+    }
+
+    fn prepare_check(
+        &mut self,
+        events: &CategorizedEvents,
+        additional_files: &[PathBuf],
+    ) -> IncrementalCheckTransaction<'_> {
+        let resolved_events;
+        let events = if events.unknown.is_empty() {
+            events
+        } else {
+            // Handles need explicit creation and removal events. Classifying an existing
+            // file as modified also avoids invalidating module lookup unnecessarily.
+            let mut resolved = CategorizedEvents {
+                created: events.created.clone(),
+                modified: events.modified.clone(),
+                removed: events.removed.clone(),
+                unknown: Vec::new(),
+            };
+            for path in &events.unknown {
+                let module_path = ModulePath::filesystem(path.clone());
+                if !path.exists() {
+                    resolved.removed.push(path.clone());
+                } else if self.handles.path_data.contains(&module_path) {
+                    resolved.modified.push(path.clone());
+                } else {
+                    resolved.created.push(path.clone());
+                }
+            }
+            resolved_events = resolved;
+            &resolved_events
+        };
+
+        let mut transaction = self
+            .state
+            .new_committable_transaction(self.require_levels.default, None);
+        transaction.as_mut().invalidate_events(events);
+        self.handles
+            .apply_events(events, self.files_to_check.as_ref());
+
+        let (loaded_handles, reloaded_configs, sourcedb_errors) = if additional_files.is_empty() {
+            self.handles.all(self.state.config_finder())
+        } else {
+            self.handles
+                .with_additional_files(additional_files)
+                .all(self.state.config_finder())
+        };
+
+        transaction
+            .as_mut()
+            .invalidate_find_for_configs(reloaded_configs);
+        IncrementalCheckTransaction {
+            state: &self.state,
+            transaction,
+            handles: loaded_handles,
+            sourcedb_errors,
+            require: self.require_levels.specified,
+        }
+    }
+}
+
+/// Adapts incremental checking to the existing CLI reporting and source-mutation behavior.
+struct IncrementalCheckCommand {
+    args: CheckArgs,
+    checker: IncrementalChecker,
+}
+
+impl IncrementalCheckCommand {
+    fn new(
+        args: CheckArgs,
+        files_to_check: Box<dyn Includes>,
+        config_finder: ConfigFinder,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<Self> {
+        args.output.validate_outputs()?;
+        let require_levels = args.get_required_levels();
+        Ok(Self {
+            args,
+            checker: IncrementalChecker::new(
+                require_levels,
+                files_to_check,
+                config_finder,
+                thread_count,
+            )?,
+        })
+    }
+
+    fn check(
+        &mut self,
+        version: &str,
+        events: &CategorizedEvents,
+        upsell: UpsellDecision,
+    ) -> anyhow::Result<CommandExitStatus> {
+        let timings = Timings::new();
+        let args = &self.args;
+        let mut check = self.checker.prepare_check(events, &[]);
+        let transaction = check.transaction.as_mut();
+        let handles = &check.handles;
+        let config = handles.first().map(|handle| {
+            transaction.config_finder().python_file(
+                ModuleNameWithKind::guaranteed(handle.module()),
+                handle.path(),
+            )
+        });
+        let defaults = args.output.resolve(config.as_deref());
+        let run = args.prepare_cli_run(timings, transaction, version, handles, &defaults)?;
+        check.run(|transaction, handles, sourcedb_errors| {
+            let result = args.finish_cli_run(
+                run,
+                transaction,
+                version,
+                handles,
+                &defaults,
+                sourcedb_errors,
+                upsell,
+                |_, _| (),
+            );
+            transaction.discard_queued_steps();
+            result.map(|(status, ())| status)
+        })
+    }
+}
+
+async fn run_watch(
+    args: CheckArgs,
+    mut watcher: Watcher,
+    version: &str,
+    files_to_check: Box<dyn Includes>,
+    config_finder: ConfigFinder,
+    upsell: UpsellDecision,
+    thread_count: ThreadCount,
+) -> anyhow::Result<()> {
+    // TODO: We currently make 1 unrealistic assumptions, which should be fixed in the future:
+    // - Config search is stable across incremental runs.
+    let mut command =
+        IncrementalCheckCommand::new(args, files_to_check, config_finder, thread_count)?;
+    if let Err(e) = command.check(version, &CategorizedEvents::default(), upsell) {
+        eprintln!("{e:#}");
+    }
+    loop {
+        let events = get_watcher_events(&mut watcher).await?;
+        if let Err(e) = command.check(version, &events, UpsellDecision::Skip) {
+            eprintln!("{e:#}");
+        }
+    }
+}
+
+/// CLI-owned state that must remain live across a type-checking run.
+struct PreparedCliRun {
+    timings: Timings,
+    memory_trace: MemoryUsageTrace,
+    demand_tree_subscriber: Option<TestSubscriber>,
+    type_check_start: Instant,
+    scip: Option<Arc<report::scip::ScipWriter<BufWriter<File>>>>,
+}
+
+impl CheckArgs {
+    /// Whether the invocation uses an option unsupported by daemon checks.
+    pub fn has_daemon_incompatible_options(&self) -> bool {
+        self.output.has_daemon_incompatible_options() || self.behavior.has_custom_options()
+    }
+
+    /// Return the output format selected by the client, configuration, or built-in default.
+    pub fn output_format(&self, config: Option<&ConfigFile>) -> OutputFormat {
+        self.output.resolve(config).output_format
+    }
+
+    /// Return the minimum severity selected by the client, configuration, or built-in default.
+    pub fn min_severity(&self, config: Option<&ConfigFile>) -> Severity {
+        self.output.resolve(config).min_severity
+    }
+
+    /// Run a one-shot type check. Returns the exit status and a `CheckResult` suitable for
+    /// telemetry logging.
+    pub fn run_once(
+        self,
+        version: &str,
+        files_to_check: Box<dyn Includes>,
+        config_finder: ConfigFinder,
+        upsell: UpsellDecision,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<(CommandExitStatus, CheckResult)> {
+        let (status, checked_file_count, check_result) = self.run_once_with(
+            version,
+            files_to_check,
+            config_finder,
+            upsell,
+            thread_count,
+            |errors, relative_to| CheckResult::new(errors, relative_to, 0),
+        )?;
+        Ok((
+            status,
+            CheckResult {
+                checked_file_count,
+                ..check_result
+            },
+        ))
+    }
+
+    /// Run a one-shot type check. Returns the exit status, the number of files checked,
+    /// and what `inspect` makes of the displayed diagnostics, given the path they are
+    /// displayed relative to.
+    pub(crate) fn run_once_with<R>(
+        self,
+        version: &str,
+        files_to_check: Box<dyn Includes>,
+        config_finder: ConfigFinder,
+        upsell: UpsellDecision,
+        thread_count: ThreadCount,
+        inspect: impl FnOnce(&[CollectedDiagnostic<'_>], &Path) -> R,
+    ) -> anyhow::Result<(CommandExitStatus, usize, R)> {
+        self.output.validate_outputs()?;
+        let mut timings = Timings::new();
+        let list_files_start = Instant::now();
+        let expanded_file_list = config_finder.checkpoint(files_to_check.files_iter())?;
+        timings.list_files = list_files_start.elapsed();
+        let handles = Handles::new(expanded_file_list);
+        debug!(
+            "Checking {} files (listing took {})",
+            handles.len(),
+            Timings::show(timings.list_files),
+        );
+        if handles.is_empty() {
+            let relative_to = resolve_relative_to(self.output.relative_to.as_ref());
+            return Ok((CommandExitStatus::Success, 0, inspect(&[], &relative_to)));
+        }
+
+        let state = Forgetter::new(State::new(config_finder, thread_count), true);
+        let require_levels = self.get_required_levels();
+        let mut transaction = Forgetter::new(
+            state.as_ref().new_transaction(require_levels.default, None),
+            true,
+        );
+        let (loaded_handles, _, sourcedb_errors) = handles.all(state.as_ref().config_finder());
+
+        // With several files to check, config errors are not fatal when the configs are found,
+        // but a check by the wrong Pyrefly version reports errors that the required version
+        // might not, so stop here.
+        let config_errors = state.as_ref().config_finder().errors();
+        if config_errors.iter().any(ConfigError::is_version_mismatch) {
+            for error in &config_errors {
+                error.print();
+            }
+            return Err(VersionMismatch.into());
+        }
+        state.as_ref().config_finder().add_errors(config_errors);
+
+        let config = loaded_handles.first().map(|handle| {
+            state.as_ref().config_finder().python_file(
+                ModuleNameWithKind::guaranteed(handle.module()),
+                handle.path(),
+            )
+        });
+        let defaults = self.output.resolve(config.as_deref());
+
+        let checked_file_count = loaded_handles.len();
+        let (status, inspected) = self.run_inner(
+            timings,
+            transaction.as_mut(),
+            version,
+            &loaded_handles,
+            &defaults,
+            sourcedb_errors,
+            require_levels.specified,
+            upsell,
+            inspect,
+        )?;
+        Ok((status, checked_file_count, inspected))
+    }
+
+    pub fn run_once_with_snippet(
+        self,
+        code: String,
+        version: &str,
+        config_finder: ConfigFinder,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<(CommandExitStatus, CheckResult)> {
+        self.output.validate_outputs()?;
+        // Create a virtual module path for the snippet
+        let path = PathBuf::from_str("snippet")?;
+        let module_path = ModulePath::memory(path);
+        let module_name = ModuleName::from_str("__main__");
+
+        let holder = Forgetter::new(State::new(config_finder, thread_count), true);
+
+        // Create a single handle for the virtual module
+        let config = holder
+            .as_ref()
+            .config_finder()
+            .python_file(ModuleNameWithKind::guaranteed(module_name), &module_path);
+        if let Some(warning) = config.bundled_typeshed_version_warning() {
+            holder.as_ref().config_finder().add_errors(vec![warning]);
+        }
+        let sys_info = config.get_sys_info();
+        let handle = Handle::new(module_name, module_path.clone(), sys_info);
+
+        let defaults = self.output.resolve(Some(&config));
+
+        let require_levels = self.get_required_levels();
+        let mut transaction = Forgetter::new(
+            holder
+                .as_ref()
+                .new_transaction(require_levels.default, None),
+            true,
+        );
+
+        // Add the snippet source to the transaction's memory
+        transaction.as_mut().set_memory(vec![(
+            PathBuf::from(module_path.as_path()),
+            Some(Arc::new(FileContents::from_source(code))),
+        )]);
+
+        let (status, check_result) = self.run_inner(
+            Timings::new(),
+            transaction.as_mut(),
+            version,
+            &[handle],
+            &defaults,
+            vec![],
+            require_levels.specified,
+            // Snippet checks are interactive ad-hoc inputs — never upsell.
+            UpsellDecision::Skip,
+            |errors, relative_to| CheckResult::new(errors, relative_to, 1),
+        )?;
+        Ok((status, check_result))
+    }
+
+    fn get_required_levels(&self) -> RequireLevels {
+        let retain = self.output.report_binding_memory.is_some()
+            || self.output.debug_info.is_some()
+            || self.output.report_trace.is_some();
+        RequireLevels {
+            // The SCIP and Glean reports need the AST and type traces of each checked file until
+            // it is written. The definitions they find in imported modules only need exports.
+            specified: if retain
+                || self.output.report_scip.is_some()
+                || self.output.report_glean.is_some()
+            {
+                Require::Everything
+            } else {
+                Require::Errors
+            },
+            default: if retain {
+                Require::Everything
+            } else if self.behavior.check_all
+                || self.output.report_pysa.is_some()
+                || self.output.report_cinderx.is_some()
+            {
+                Require::Errors
+            } else {
+                Require::Exports
+            },
+        }
+    }
+
+    fn run_inner<R>(
+        &self,
+        timings: Timings,
+        transaction: &mut Transaction,
+        version: &str,
+        handles: &[Handle],
+        defaults: &OutputDefaults,
+        sourcedb_errors: Vec<ConfigError>,
+        require: Require,
+        upsell: UpsellDecision,
+        inspect: impl FnOnce(&[CollectedDiagnostic<'_>], &Path) -> R,
+    ) -> anyhow::Result<(CommandExitStatus, R)> {
+        let run = self.prepare_cli_run(timings, transaction, version, handles, defaults)?;
+        transaction.run(handles, require, None);
+        self.finish_cli_run(
+            run,
+            transaction,
+            version,
+            handles,
+            defaults,
+            sourcedb_errors,
+            upsell,
+            inspect,
+        )
+    }
+
+    fn prepare_cli_run(
+        &self,
+        timings: Timings,
+        transaction: &mut Transaction,
+        version: &str,
+        handles: &[Handle],
+        defaults: &OutputDefaults,
+    ) -> anyhow::Result<PreparedCliRun> {
+        // Baseline maintenance actions are mutually exclusive.
+        let baseline_action = if self.output.update_baseline {
+            Some("--update-baseline")
+        } else if self.output.prune_baseline {
+            Some("--prune-baseline")
+        } else if self.output.error_stale_baseline {
+            Some("--error-stale-baseline")
+        } else {
+            None
+        };
+        if let Some(flag) = baseline_action {
+            ensure!(
+                defaults.baseline.is_some(),
+                "`{flag}` requires a baseline file set by `--baseline` or configuration"
+            );
+        }
+        // `--update-baseline` regenerates the baseline from the current run, so a
+        // missing file is fine. The other actions operate on the existing baseline,
+        // so a missing file is a user error (typically a
+        // wrong `--baseline` path) rather than a silent success.
+        if let Some(flag) = baseline_action
+            && !self.output.update_baseline
+            && let Some(baseline_path) = defaults.baseline.as_deref()
+        {
+            ensure!(
+                baseline_path.exists(),
+                "`{flag}` requires an existing baseline file, but `{}` does not exist",
+                baseline_path.display()
+            );
+        }
+        let memory_trace = MemoryUsageTrace::start(Duration::from_secs_f32(0.1));
+
+        if let Some(pysa_directory) = &self.output.report_pysa {
+            let reporter = report::pysa::PysaReporter::new(
+                pysa_directory,
+                handles,
+                self.output.report_pysa_format,
+            )?;
+            transaction.set_pysa_reporter(Some(reporter));
+        }
+        if let Some(cinderx_directory) = &self.output.report_cinderx {
+            let cinderx_reporter = if self.output.cinderx_include_deps {
+                report::cinderx::CinderxReporter::new(
+                    cinderx_directory,
+                    None,
+                    self.output.cinderx_include_readable,
+                )?
+            } else {
+                report::cinderx::CinderxReporter::new(
+                    cinderx_directory,
+                    Some(handles),
+                    self.output.cinderx_include_readable,
+                )?
+            };
+            transaction.set_cinderx_reporter(Some(cinderx_reporter));
+        }
+
+        // Each indexed file is written as soon as it is solved, while its answers are still in
+        // memory, so they don't have to be kept for the whole run.
+        let scip = match &self.output.report_scip {
+            Some(path) => {
+                let relative_to = match &self.output.relative_to {
+                    Some(path) => PathBuf::from(path),
+                    None => std::env::current_dir()
+                        .context("while determining the SCIP project root")?,
+                };
+                let project = report::scip::Package::project(
+                    &relative_to,
+                    self.output.report_scip_project_name.clone(),
+                    self.output.report_scip_project_version.clone(),
+                )?;
+                let scip = report::scip::ScipWriter::new(
+                    BufWriter::new(File::create(path)?),
+                    handles,
+                    &relative_to,
+                    project,
+                    version,
+                )?
+                .start(transaction);
+                Some(scip)
+            }
+            None => None,
+        };
+
+        let type_check_start = Instant::now();
+        let demand_tree_subscriber = if self.output.report_demand_tree.is_some() {
+            transaction.set_demand_collector(Some(DemandCollector::new()));
+            let sub = TestSubscriber::new();
+            transaction.set_subscriber(Some(Box::new(sub.dupe())));
+            Some(sub)
+        } else {
+            transaction.set_subscriber(self.output.progress_bar_style().make_subscriber());
+            None
+        };
+
+        Ok(PreparedCliRun {
+            timings,
+            memory_trace,
+            demand_tree_subscriber,
+            type_check_start,
+            scip,
+        })
+    }
+
+    /// Report the diagnostics of a run, and return what `inspect` makes of the diagnostics
+    /// it displays, given the path they are displayed relative to.
+    fn finish_cli_run<R>(
+        &self,
+        run: PreparedCliRun,
+        transaction: &mut Transaction,
+        version: &str,
+        handles: &[Handle],
+        defaults: &OutputDefaults,
+        mut sourcedb_errors: Vec<ConfigError>,
+        upsell: UpsellDecision,
+        inspect: impl FnOnce(&[CollectedDiagnostic<'_>], &Path) -> R,
+    ) -> anyhow::Result<(CommandExitStatus, R)> {
+        let PreparedCliRun {
+            mut timings,
+            mut memory_trace,
+            demand_tree_subscriber,
+            type_check_start,
+            scip,
+        } = run;
+        transaction.set_subscriber(None);
+
+        let loads = if self.behavior.check_all {
+            transaction.get_all_errors()
+        } else {
+            transaction.get_errors(handles)
+        };
+        timings.type_check = type_check_start.elapsed();
+
+        let report_errors_start = Instant::now();
+        let mut config_errors = transaction.get_config_errors();
+        config_errors.append(&mut sourcedb_errors);
+        let mut config_errors_count = 0;
+        for error in config_errors {
+            error.print();
+            if error.severity() >= Severity::Error {
+                config_errors_count += 1;
+            }
+        }
+
+        let relative_to = resolve_relative_to(self.output.relative_to.as_ref());
+        let output_format = defaults.output_format;
+
+        // Every diagnostic below borrows its error, from `loads` or from `unused_ignores`.
+        // Collation and writing the report run on the state's thread pool, which the check has
+        // finished with, so that they can work in parallel on the configured threads.
+        let (collected, unused_ignores) =
+            transaction.install(|| loads.collect_error_refs_with_unused_ignores());
+        let shown_unused_ignores = loads.shown_unused_ignore_errors(&unused_ignores);
+        let mut ordinary = collected.ordinary;
+        ordinary.reserve_exact(shown_unused_ignores.len() + collected.hints.len());
+        ordinary.extend(shown_unused_ignores);
+        // Hints go through baselines and `--min-severity` like other diagnostics.
+        ordinary.extend(collected.hints);
+        let mut baseline = Vec::new();
+
+        let baseline_apply_result = loads.apply_baseline(
+            &mut ordinary,
+            &mut baseline,
+            defaults.baseline.as_deref(),
+            relative_to.as_path(),
+            defaults.baseline_matching_mode,
+            // A CLI check covers the whole project, so a row whose file is gone really is
+            // stale rather than merely out of scope.
+            (self.output.prune_baseline || self.output.error_stale_baseline)
+                .then_some(StaleRowScope::CheckedOrMissing),
+        );
+
+        let (baseline_status, unused_baseline_entries, retained_baseline_entries) =
+            baseline_apply_result.resolve(self.output.update_baseline)?;
+        let only_filter = defaults
+            .only
+            .as_ref()
+            .map(|only| only.iter().collect::<SmallSet<&ErrorKind>>());
+
+        let shown_kind = |e: &CollectedDiagnostic| {
+            only_filter
+                .as_ref()
+                .is_none_or(|only| only.contains(&e.error().error_kind()))
+        };
+        let with_status = |errors: Vec<_>, status: BaselineStatus| {
+            errors
+                .into_iter()
+                .filter(shown_kind)
+                .map(|e| e.with_baseline_status(status))
+                .collect::<Vec<_>>()
+        };
+
+        let directives = with_status(collected.directives, baseline_status);
+        let mut ordinary_errors = with_status(ordinary, baseline_status);
+
+        // Baseline matches are displayed at a capped severity. Baseline maintenance uses
+        // the original severity and baseline representation.
+        let baseline_error_level = defaults.baseline_error_level;
+        let mut baseline_errors = if baseline_error_level == Severity::Ignore {
+            Vec::new()
+        } else {
+            baseline
+                .iter()
+                .filter(|e| shown_kind(e))
+                .map(|e| {
+                    e.with_severity(e.severity().min(baseline_error_level))
+                        .with_baseline_status(BaselineStatus::Matched)
+                })
+                .collect()
+        };
+
+        // Filter by the shown severity. Directives are not subject to this
+        // filter — they are merged separately in the output step below.
+        // Suppression, the baseline and the exit code act only on diagnostics
+        // at or above `min_severity`: a finding the user didn't ask to fail on
+        // should not get a suppression comment written into source.
+        let min_severity = defaults.min_severity;
+        let show_severity = defaults.show_severity;
+        let hidden = |e: &mut CollectedDiagnostic| e.severity() < show_severity;
+        let mut hidden_errors: Vec<_> = ordinary_errors.extract_if(.., hidden).collect();
+        hidden_errors.extend(baseline_errors.extract_if(.., hidden));
+        let fails = |e: &&CollectedDiagnostic| e.severity() >= min_severity;
+
+        // Suppress operates on ordinary diagnostics only — directives are
+        // structurally excluded since they live in `directives`, not `ordinary_errors`.
+        if self.behavior.suppress_errors {
+            // TODO: Deprecate this in favor of `pyrefly suppress`
+            let serialized_errors: Vec<SerializedError> = ordinary_errors
+                .iter()
+                .filter(fails)
+                .filter(|e| e.error().error_kind().is_suppressable())
+                .filter_map(|e| SerializedError::from_error(e.error()))
+                .collect();
+            suppress::suppress_errors(serialized_errors, CommentLocation::LineBefore);
+        }
+        if let Some(kind) = self.behavior.remove_unused_ignores {
+            // TODO: Deprecate this in favor of `pyrefly suppress`
+            suppress::remove_unused_ignores(&unused_ignores, kind)?;
+        }
+
+        // We update the baseline file if requested, after reporting any new
+        // errors using the old baseline. Directives are structurally excluded
+        // — they live in `directives`, not `ordinary_errors`.
+        // `--prune-baseline` rewrites the file only when there is something to drop.
+        let rewriting_baseline = self.output.prune_baseline && unused_baseline_entries > 0;
+        if self.output.update_baseline {
+            let baseline_path = defaults
+                .baseline
+                .as_ref()
+                .expect("a baseline action requires a baseline path");
+            // The baseline only tracks errors that meet the min-severity threshold.
+            let mut new_baseline = baseline;
+            new_baseline.retain(|e| e.severity() >= min_severity);
+            new_baseline.extend(ordinary_errors.iter().filter(fails).copied());
+            prepare_baseline_rows(&mut new_baseline, defaults.baseline_matching_mode);
+            write_baseline_errors_to_file(
+                baseline_path,
+                relative_to.as_path(),
+                &new_baseline,
+                defaults.baseline_matching_mode,
+                defaults.baseline_format,
+                min_severity,
+            )?;
+        } else if rewriting_baseline {
+            let baseline_path = defaults
+                .baseline
+                .as_ref()
+                .expect("a baseline action requires a baseline path");
+            // Pruning removes entries and preserves the format of remaining ones.
+            write_baseline_file(baseline_path, &retained_baseline_entries, None)?;
+        }
+        if rewriting_baseline {
+            info!(
+                "Removed {} from the baseline file",
+                count(unused_baseline_entries, "unused suppression")
+            );
+        } else if self.output.prune_baseline {
+            // `--prune-baseline` was requested but there was nothing to drop, so no
+            // file was rewritten. Confirm the no-op so scripted/CI runs are not left
+            // wondering whether the flag took effect.
+            info!("Baseline file has no unused suppressions to remove");
+        }
+        let stale_baseline = self.output.error_stale_baseline && unused_baseline_entries > 0;
+        if stale_baseline {
+            error!(
+                "Baseline file has {}; rerun with `--prune-baseline` to update it",
+                count(unused_baseline_entries, "unused suppression")
+            );
+        }
+
+        // Directives always display, but only affect the exit code when they
+        // meet the user's severity threshold.
+        let baselined_diagnostics_count = baseline_errors.len();
+        let diagnostics_count = config_errors_count
+            + ordinary_errors.iter().filter(fails).count()
+            + baseline_errors.iter().filter(fails).count()
+            + directives
+                .iter()
+                .filter(|e| e.severity() >= min_severity)
+                .count();
+
+        // Merge directives into the display list, re-sorting by module
+        // name, path, and source range so output preserves file/line
+        // interleaving across modules.
+        let mut output_errors = ordinary_errors;
+        output_errors.extend(baseline_errors);
+        output_errors.extend(directives);
+        output_errors.sort_by_cached_key(|e| {
+            let e = e.error();
+            (
+                e.module().name(),
+                e.path().dupe(),
+                e.range().start(),
+                e.range().end(),
+            )
+        });
+
+        // A JUnit failure means a nonzero exit code, so the report lists only the diagnostics
+        // that make the exit code nonzero; a shown warning that doesn't is left out.
+        let failing_errors: Vec<CollectedDiagnostic> = output_errors
+            .iter()
+            .filter(|e| e.severity() >= min_severity)
+            .copied()
+            .collect();
+        let errors_for = |format: OutputFormat| match format {
+            OutputFormat::JunitXml => failing_errors.as_slice(),
+            _ => output_errors.as_slice(),
+        };
+        transaction.install(|| -> anyhow::Result<()> {
+            if self.output.output.is_empty() {
+                write_errors_to_console(
+                    output_format,
+                    version,
+                    relative_to.as_path(),
+                    errors_for(output_format),
+                )?;
+            } else {
+                for output in &self.output.output {
+                    let format = output.format.unwrap_or(output_format);
+                    match &output.destination {
+                        ErrorOutputDestination::Stdout => write_errors_to_console(
+                            format,
+                            version,
+                            relative_to.as_path(),
+                            errors_for(format),
+                        )?,
+                        ErrorOutputDestination::File(path) => write_errors_to_file(
+                            format,
+                            path,
+                            version,
+                            relative_to.as_path(),
+                            errors_for(format),
+                        )?,
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        memory_trace.stop();
+        if let Some(limit) = self.output.count_errors {
+            print_error_counts(&output_errors, limit);
+        }
+        if self.output.summarize_errors.is_some() {
+            print_error_summary(&output_errors);
+        }
+        timings.report_errors = report_errors_start.elapsed();
+
+        if self.output.summary != Summary::None {
+            // A suppressed hint was never going to be shown, so it isn't counted either.
+            let suppress_count = collected
+                .suppressed
+                .iter()
+                .filter(|e| e.severity() != Severity::Hint)
+                .count();
+            let label = if min_severity < Severity::Error {
+                "diagnostic"
+            } else {
+                "error"
+            };
+            let mut parts = vec![count(diagnostics_count, label)];
+            let (mut shown_warnings, mut shown_info) = (0, 0);
+            for e in &output_errors {
+                if e.error().error_kind().is_directive() || e.severity() >= min_severity {
+                    continue;
+                }
+                match e.severity() {
+                    Severity::Error => unreachable!("an error always meets `min_severity`"),
+                    Severity::Warn => shown_warnings += 1,
+                    Severity::Info => shown_info += 1,
+                    Severity::Hint | Severity::Ignore => {}
+                }
+            }
+            if shown_warnings > 0 {
+                parts.push(count(shown_warnings, "warning"));
+            }
+            if shown_info > 0 {
+                parts.push(count(shown_info, "info message"));
+            }
+            if suppress_count > 0 {
+                parts.push(format!("{} suppressed", number_thousands(suppress_count)));
+            }
+            let reports_omit_errors = if self.output.output.is_empty() {
+                output_format == OutputFormat::OmitErrors
+            } else {
+                self.output.output.iter().any(|output| {
+                    output.format.unwrap_or(output_format) == OutputFormat::OmitErrors
+                })
+            };
+            if reports_omit_errors && baselined_diagnostics_count > 0 {
+                parts.push(format!(
+                    "{} baselined",
+                    number_thousands(baselined_diagnostics_count)
+                ));
+            }
+            let mut hidden_warnings = 0;
+            let mut hidden_info = 0;
+            for e in hidden_errors {
+                match e.severity() {
+                    Severity::Error => panic!("Error-level findings can never be hidden"),
+                    Severity::Warn => hidden_warnings += 1,
+                    Severity::Info => hidden_info += 1,
+                    // Hints are meant for the IDE, so a hidden hint is not worth mentioning.
+                    Severity::Hint | Severity::Ignore => {}
+                }
+            }
+            if hidden_warnings + hidden_info > 0 {
+                let mut hidden_parts = Vec::new();
+                if hidden_warnings > 0 {
+                    hidden_parts.push(count(hidden_warnings, "warning"));
+                }
+                if hidden_info > 0 {
+                    hidden_parts.push(count(hidden_info, "info message"));
+                }
+                let reveal_severity = if hidden_info > 0 { "info" } else { "warn" };
+                let pronoun = if hidden_warnings + hidden_info == 1 {
+                    "it"
+                } else {
+                    "them"
+                };
+                parts.push(format!(
+                    "{} not shown, use `--min-severity={reveal_severity}` to see {pronoun}",
+                    hidden_parts.join(" and ")
+                ));
+            }
+            if parts.len() == 1 {
+                info!("{}", parts[0]);
+            } else {
+                info!("{} ({})", parts[0], parts[1..].join(", "));
+            }
+        }
+        if self.output.summary == Summary::Full {
+            let user_handles: HashSet<&Handle> = handles.iter().collect();
+            let (user_lines, dep_lines) = transaction.split_line_count(&user_handles);
+            info!(
+                "{} ({}); {} ({} in your project, {} in dependencies); \
+                took {timings}; memory ({})",
+                count(handles.len(), "module"),
+                count(
+                    transaction.module_count() - handles.len(),
+                    "dependent module"
+                ),
+                count(user_lines + dep_lines, "line"),
+                count(user_lines, "line"),
+                count(dep_lines, "line"),
+                memory_trace.peak()
+            );
+        }
+
+        // Upsell users without a `pyrefly.toml` to run `pyrefly init`.
+        // Routed to stderr unconditionally so machine-readable output
+        // formats on stdout (json, omit-errors, …) stay clean.
+        //
+        // Treated as part of the summary: `--summary=none` suppresses
+        // it alongside the error-count line.
+        //
+        // The decision was largely made up front (see `UpsellDecision`):
+        // project mode and explicit `--config` short-circuit without
+        // walking handles. Only the `Determine` case — file-args
+        // without `--config` — needs a per-handle check, and even then
+        // it's bounded by the user's explicit args (not a project
+        // expansion) and short-circuits on the first config mismatch.
+        if self.output.summary != Summary::None
+            && let Some(reason) = decide_upsell(upsell, handles, transaction)
+        {
+            let _ = write_unconfigured_upsell(reason, &mut std::io::stderr());
+        }
+        if let Some(output_path) = &self.output.report_timings {
+            eprintln!("Computing timing information");
+            transaction.set_subscriber(self.output.progress_bar_style().make_subscriber());
+            transaction.report_timings(output_path)?;
+            transaction.set_subscriber(None);
+        }
+        if let Some(debug_info) = &self.output.debug_info {
+            let is_javascript = debug_info.extension() == Some("js".as_ref());
+            fs_anyhow::write(
+                debug_info,
+                report::debug_info::debug_info(transaction, handles, is_javascript),
+            )?;
+        }
+        if let Some(glean) = &self.output.report_glean {
+            fs_anyhow::create_dir_all(glean)?;
+            for handle in handles {
+                let naming = report::glean::GleanNaming::new(
+                    transaction
+                        .get_config(handle)
+                        .and_then(|config| config.module_names.dupe()),
+                    self.output.glean_stdlib_root.clone(),
+                );
+                // Generate a safe filename using hash to avoid OS filename length limits
+                let module_hash = blake3::hash(handle.path().to_string().as_bytes());
+                fs_anyhow::write(
+                    &glean.join(format!("{}.json", module_hash)),
+                    report::glean::glean(
+                        transaction,
+                        handle,
+                        self.output.report_glean_ownership,
+                        &naming,
+                    ),
+                )?;
+            }
+        }
+        if let Some(scip) = scip
+            && let Some(path) = &self.output.report_scip
+        {
+            scip.finish(transaction)
+                .and_then(|mut writer| Ok(writer.flush()?))
+                .with_context(|| format!("while writing SCIP index to `{}`", path.display()))?;
+        }
+        if let Some(pysa_reporter) = transaction.take_pysa_reporter() {
+            report::pysa::write_project_file(&pysa_reporter, transaction, handles, &output_errors)?;
+        }
+        if let Some(cinderx_reporter) = transaction.take_cinderx_reporter() {
+            cinderx_reporter.write_project_files(transaction)?;
+        }
+        if let Some(path) = &self.output.report_binding_memory {
+            fs_anyhow::write(path, report::binding_memory::binding_memory(transaction))?;
+        }
+        if let Some(path) = &self.output.report_trace {
+            fs_anyhow::write(path, report::trace::trace(transaction))?;
+        }
+        if let Some(path) = &self.output.dependency_graph {
+            fs_anyhow::write(
+                path,
+                report::dependency_graph::dependency_graph(transaction, handles),
+            )?;
+        }
+        if let Some(path) = &self.output.report_demand_tree {
+            let roots = transaction.take_demand_roots();
+            let module_steps: Vec<(String, &'static str)> = demand_tree_subscriber
+                .expect("demand_tree_subscriber is set when report_demand_tree is Some")
+                .finish_detailed()
+                .into_iter()
+                .map(|(handle, info)| {
+                    let label = info.last_step.map_or("Nothing", Step::label);
+                    (handle.module().as_str().to_owned(), label)
+                })
+                .collect();
+            let output = report_json(&roots, &module_steps);
+            fs_anyhow::write(path, output)?;
+        }
+        let status = if self.behavior.expectations {
+            loads.check_against_expectations()?;
+            CommandExitStatus::Success
+        } else if diagnostics_count > 0 || stale_baseline {
+            CommandExitStatus::UserError
+        } else {
+            CommandExitStatus::Success
+        };
+        Ok((status, inspect(&output_errors, &relative_to)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use clap::error::ErrorKind as ClapErrorKind;
+    use protobuf::Message as _;
+    use pyrefly_config::config::ConfigScope;
+    use pyrefly_config::module_names::ModuleNames;
+    use pyrefly_config::module_names::ModuleNamesSourceDatabase;
+    use pyrefly_python::module::Module;
+    use pyrefly_python::module_name::ModuleName;
+    use pyrefly_python::module_path::ModulePath;
+    use ruff_text_size::TextRange;
+    use ruff_text_size::TextSize;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    struct TestIncludes {
+        root: PathBuf,
+        initial_files: Vec<PathBuf>,
+    }
+
+    impl Includes for TestIncludes {
+        fn roots(&self) -> Vec<PathBuf> {
+            vec![self.root.clone()]
+        }
+
+        fn files_iter(&self) -> anyhow::Result<Box<dyn Iterator<Item = PathBuf> + '_>> {
+            Ok(Box::new(self.initial_files.clone().into_iter()))
+        }
+
+        fn covers(&self, path: &Path) -> bool {
+            path.starts_with(&self.root)
+                && matches!(
+                    path.extension().and_then(|x| x.to_str()),
+                    Some("py" | "pyi")
+                )
+        }
+
+        fn covers_ignoring_excludes(&self, path: &Path) -> bool {
+            self.covers(path)
+        }
+
+        fn errors(&mut self) -> Vec<anyhow::Error> {
+            Vec::new()
+        }
+    }
+
+    /// A config finder that resolves everything under `root` without querying an
+    /// interpreter, so tests do not depend on the machine's Python environment.
+    fn test_config_finder(root: &Path) -> ConfigFinder {
+        ConfigFinder::new_constant(ArcId::new(test_config(root)))
+    }
+
+    /// A config like `test_config_finder`'s, as `--module-names` sets it up.
+    fn test_config_finder_with_module_names(
+        root: &Path,
+        module_names: ModuleNames,
+    ) -> ConfigFinder {
+        let mut config = test_config(root);
+        let module_names = ArcId::new(module_names);
+        let source_db = ModuleNamesSourceDatabase::new(module_names.dupe(), config.get_sys_info());
+        config.fallback_source_db = Some(ArcId::new(Box::new(source_db)));
+        config.module_names = Some(module_names);
+        ConfigFinder::new_constant(ArcId::new(config))
+    }
+
+    fn test_config(root: &Path) -> ConfigFile {
+        let mut config = ConfigFile::default();
+        config.python_environment.set_empty_to_default();
+        config.interpreters.skip_interpreter_query = true;
+        config.search_path_from_file = vec![root.to_path_buf()];
+        config.disable_search_path_heuristics = true;
+        config.configure();
+        config
+    }
+
+    fn incremental_checker(root: &Path, initial_files: Vec<PathBuf>) -> IncrementalChecker {
+        IncrementalChecker::new(
+            RequireLevels {
+                specified: Require::Errors,
+                default: Require::Exports,
+            },
+            Box::new(TestIncludes {
+                root: root.to_path_buf(),
+                initial_files,
+            }),
+            test_config_finder(root),
+            ThreadCount::Inline,
+        )
+        .unwrap()
+    }
+
+    fn check(
+        checker: &mut IncrementalChecker,
+        events: &CategorizedEvents,
+    ) -> IncrementalCheckResult {
+        let result = checker.check(events);
+        assert!(
+            result.config_errors.is_empty(),
+            "unexpected config errors:\n{}",
+            result
+                .config_errors
+                .iter()
+                .map(ConfigError::get_message)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        result
+    }
+
+    fn sample_error(msg: String) -> Error {
+        let module = Module::new(
+            ModuleName::from_str("sample"),
+            ModulePath::filesystem(PathBuf::from("/repo/foo.py")),
+            Arc::new("x = 1\n".to_owned()),
+        );
+        Error::new(
+            module,
+            TextRange::new(TextSize::from(0), TextSize::from(1)),
+            msg,
+            Vec::new(),
+            ErrorKind::BadAssignment,
+        )
+    }
+
+    #[test]
+    fn uv_workspace_editable_source_is_excluded_from_project_check() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source_root = root.join("packages/my-lib/src");
+        let source = source_root.join("my_lib/main.py");
+        let site_packages = root.join("interpreter/lib/python3.13/site-packages");
+        let dependency = site_packages.join("dependency.py");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+        fs::write(root.join("main.py"), "root_int: int = 1\n").unwrap();
+        fs::write(&source, "my_int: int = \"not int\"\n").unwrap();
+        fs::write(&dependency, "dependency_int: int = \"not int\"\n").unwrap();
+
+        let config_path = root.join("pyproject.toml");
+        fs::write(
+            &config_path,
+            "[tool.pyrefly]\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n",
+        )
+        .unwrap();
+        let (mut config, parse_errors) = ConfigFile::from_file(&config_path);
+        assert!(
+            parse_errors.is_empty(),
+            "{}",
+            parse_errors
+                .iter()
+                .map(ConfigError::get_message)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        config.interpreters.skip_interpreter_query = true;
+        config.python_environment.interpreter_site_package_path =
+            vec![source_root.clone(), site_packages];
+        config.python_environment.interpreter_editable_path = vec![source_root];
+        let configure_errors = config.configure();
+        assert!(
+            configure_errors.is_empty(),
+            "{}",
+            configure_errors
+                .iter()
+                .map(ConfigError::get_message)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let files = config.get_filtered_globs(None, ConfigScope::Default);
+        let config_finder = ConfigFinder::new_constant(ArcId::new(config));
+
+        let (_, check_result) = CheckArgs::parse_from([
+            "check",
+            "--summary=none",
+            "--relative-to",
+            root.to_str().unwrap(),
+        ])
+        .run_once(
+            "test",
+            Box::new(files),
+            config_finder,
+            UpsellDecision::Skip,
+            ThreadCount::Inline,
+        )
+        .unwrap();
+        let errors = &check_result.legacy_errors;
+        let bad_assignments = errors
+            .iter()
+            .filter(|error| error.name == ErrorKind::BadAssignment.to_name())
+            .map(|error| error.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(check_result.checked_file_count, 2);
+        assert_eq!(
+            bad_assignments,
+            vec!["packages/my-lib/src/my_lib/main.py"],
+            "the editable workspace source is now checked: {errors:#?}",
+        );
+    }
+
+    /// Asking for two reports in one run must produce both of them in full.
+    /// See https://github.com/facebook/pyrefly/issues/4683: the CinderX report
+    /// dropped the ASTs that the Glean report reads once the check is done, so
+    /// the run died partway through writing its output.
+    /// A module that a build system imports under a name its path doesn't give is found through
+    /// `--module-names`. The type of a value from it is then known, so a method call on a
+    /// parameter annotated with its class refers to that method.
+    #[test]
+    fn module_names_resolve_imports() {
+        let temp = TempDir::new().unwrap();
+        // Canonical, so that the listed path and the checked file's path agree.
+        let root = fs::canonicalize(temp.path()).unwrap().join("project");
+        fs::create_dir_all(root.join("lib").join("src")).unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        let platform = root.join("lib").join("src").join("platform.py");
+        fs::write(
+            &platform,
+            "class Platform:\n    def chat(self) -> None: ...\n",
+        )
+        .unwrap();
+        let main = root.join("app").join("main.py");
+        fs::write(
+            &main,
+            r#"from platform_api.platform import Platform
+
+
+def go(p: Platform) -> None:
+    p.chat()
+"#,
+        )
+        .unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+        let listed = platform
+            .strip_prefix(&cwd)
+            .unwrap_or(&platform)
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        let module_names = ModuleNames::new(
+            HashMap::from([(listed, "platform_api.platform".to_owned())]),
+            &cwd,
+        );
+        let args = CheckArgs::parse_from(["check", "--report-glean", glean_dir.to_str().unwrap()]);
+        let (_, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![platform, main],
+                }),
+                test_config_finder_with_module_names(&root, module_names),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "the import should resolve: {errors:#?}");
+
+        let facts: String = fs::read_dir(&glean_dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(
+            facts.contains("\"platform_api.platform.Platform.chat\""),
+            "the declaration and the method call should both name the method after the given module"
+        );
+        assert!(!facts.contains("<locals>.p.chat"));
+        assert!(!facts.contains("lib.src.platform"));
+    }
+
+    #[test]
+    fn check_writes_cinderx_and_glean_reports_together() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let module = root.join("main.py");
+        fs::write(
+            &module,
+            r#"class Widget:
+    def apply(self, n: int) -> int:
+        return n + 1
+
+
+def go(w: Widget) -> int:
+    return w.apply(1)
+"#,
+        )
+        .unwrap();
+        let cinderx_dir = temp.path().join("cinderx");
+        let glean_dir = temp.path().join("glean");
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--report-cinderx",
+            cinderx_dir.to_str().unwrap(),
+            "--report-glean",
+            glean_dir.to_str().unwrap(),
+        ]);
+        let (status, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![module],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+        assert!(matches!(status, CommandExitStatus::Success));
+
+        // The CinderX report is only complete with its two project-level files
+        // beside `types/`; a consumer that sees `types/` alone cannot tell a
+        // truncated report from a report over a smaller codebase.
+        assert!(cinderx_dir.join("types").join("main.json").is_file());
+        assert!(cinderx_dir.join("index.json").is_file());
+        assert!(cinderx_dir.join("class_metadata.json").is_file());
+
+        // Glean names each file after a hash of the module path, so look for
+        // any non-empty file rather than a fixed name.
+        let glean_files: Vec<_> = fs::read_dir(&glean_dir)
+            .expect("glean output directory should exist")
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(glean_files.len(), 1, "expected one Glean file per module");
+        let facts = fs::read_to_string(&glean_files[0]).unwrap();
+        assert!(facts.contains("main.Widget"));
+    }
+
+    /// The Glean report keeps only the checked files in full. An imported module that isn't
+    /// checked is kept at the exports level, which is still enough to find the definitions that
+    /// the checked files refer to.
+    #[test]
+    fn glean_report_finds_definitions_in_unchecked_imports() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("lib.py"),
+            "class Widget:\n    def apply(self, n: int) -> int:\n        return n + 1\n",
+        )
+        .unwrap();
+        let main = root.join("main.py");
+        fs::write(
+            &main,
+            "from lib import Widget\n\n\ndef go(w: Widget) -> int:\n    return w.apply(1)\n",
+        )
+        .unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let args = CheckArgs::parse_from(["check", "--report-glean", glean_dir.to_str().unwrap()]);
+        let levels = args.get_required_levels();
+        assert_eq!(levels.specified, Require::Everything);
+        assert_eq!(levels.default, Require::Exports);
+        let (_, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![main],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+
+        let glean_files: Vec<_> = fs::read_dir(&glean_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            glean_files.len(),
+            1,
+            "only the checked file should be reported"
+        );
+        let facts = fs::read_to_string(&glean_files[0]).unwrap();
+        assert!(
+            facts.contains("\"lib.Widget.apply\""),
+            "the method call should refer to the method's definition in the unchecked module"
+        );
+    }
+
+    #[test]
+    fn scip_rejects_incompatible_options() {
+        assert!(FullCheckArgs::try_parse_from(["check", "--report-scip", "index.scip"]).is_ok());
+        for options in [
+            &["--watch"][..],
+            &["--debug-info", "debug.json"][..],
+            &["--report-binding-memory", "memory.csv"][..],
+        ] {
+            assert!(
+                FullCheckArgs::try_parse_from(["check"].into_iter().chain(options.iter().copied()))
+                    .is_ok(),
+                "standalone options should remain valid: {options:?}"
+            );
+            let error = FullCheckArgs::try_parse_from(
+                ["check", "--report-scip", "index.scip"]
+                    .into_iter()
+                    .chain(options.iter().copied()),
+            )
+            .expect_err("SCIP must reject options requiring retained state");
+            assert_eq!(error.kind(), ClapErrorKind::ArgumentConflict);
+            let message = error.to_string();
+            assert!(message.contains("--report-scip"), "{message}");
+            assert!(message.contains(options[0]), "{message}");
+        }
+    }
+
+    #[test]
+    fn check_writes_scip_report() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let module = root.join("main.py");
+        fs::write(&module, "x = 1\n").unwrap();
+        let scip_path = temp.path().join("index.scip");
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--report-scip",
+            scip_path.to_str().unwrap(),
+            "--report-scip-project-name",
+            "demo",
+            "--relative-to",
+            root.to_str().unwrap(),
+        ]);
+        let (status, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![module],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+        assert!(matches!(status, CommandExitStatus::Success));
+
+        let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
+        assert_eq!(index.documents.len(), 1);
+        assert_eq!(index.documents[0].relative_path, "main.py");
+        assert_eq!(
+            index.documents[0].occurrences[0].symbol,
+            "scip-python python demo . main/__init__:"
+        );
+        let metadata = index.metadata.unwrap();
+        assert_eq!(metadata.tool_info.name, "scip-pyrefly");
+        assert_eq!(metadata.tool_info.version, "test");
+        assert!(
+            metadata.project_root.starts_with("file://")
+                && metadata.project_root.ends_with("/project/"),
+            "unexpected project root: {}",
+            metadata.project_root
+        );
+    }
+
+    #[test]
+    fn incremental_check_commits_after_glean_loads_source_dependency() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let main = root.join("main.py");
+        fs::write(&main, "from dependency import value\nresult = value\n").unwrap();
+        fs::write(root.join("dependency.py"), "value = 1\n").unwrap();
+        fs::write(root.join("dependency.pyi"), "value: int\n").unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--summary=none",
+            "--report-glean",
+            glean_dir.to_str().unwrap(),
+        ]);
+        let mut command = IncrementalCheckCommand::new(
+            args,
+            Box::new(TestIncludes {
+                root: root.clone(),
+                initial_files: vec![main],
+            }),
+            test_config_finder(&root),
+            ThreadCount::Inline,
+        )
+        .unwrap();
+
+        command
+            .check("test", &CategorizedEvents::default(), UpsellDecision::Skip)
+            .unwrap();
+        assert_eq!(fs::read_dir(glean_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn incremental_checker_rechecks_modified_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("main.py");
+        fs::write(&path, "x: int = 'bad'\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![path.clone()]);
+
+        let errors = check(&mut checker, &CategorizedEvents::default()).diagnostics;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path().as_path(), path);
+
+        fs::write(&path, "x: int = 1\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                modified: vec![path],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn incremental_checker_resolves_unknown_events() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let initial = root.join("initial.py");
+        fs::write(&initial, "x: int = 1\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![initial.clone()]);
+
+        fs::write(&initial, "x: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![initial.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the existing file should be rechecked");
+
+        let created = root.join("created.py");
+        fs::write(&created, "y: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![created.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 2, "the new file should be added");
+        assert!(
+            checker.all_files_are_configured(std::slice::from_ref(&created)),
+            "the new file should be configured"
+        );
+
+        fs::remove_file(&initial).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![initial.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the missing file should be removed");
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&initial)),
+            "the missing file should not remain configured"
+        );
+
+        let renamed = root.join("renamed.py");
+        fs::rename(&created, &renamed).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![created.clone(), renamed.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1, "the renamed file should be checked");
+        assert_eq!(errors[0].path().as_path(), renamed);
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&created)),
+            "the old rename path should not remain configured"
+        );
+        assert!(
+            checker.all_files_are_configured(std::slice::from_ref(&renamed)),
+            "the new rename path should be configured"
+        );
+
+        let transient = root.join("transient.py");
+        fs::write(&transient, "z: int = 'bad'\n").unwrap();
+        fs::remove_file(&transient).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![transient.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(
+            errors.len(),
+            1,
+            "a file created and removed before the check should remain absent"
+        );
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&transient)),
+            "the transient file should not be configured"
+        );
+    }
+
+    #[test]
+    fn incremental_checker_does_not_configure_unknown_files_outside_includes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let outside = temp.path().join("outside.py");
+        fs::write(&outside, "x: int = 'bad'\n").unwrap();
+        let mut checker = incremental_checker(&root, Vec::new());
+
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                unknown: vec![outside.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+
+        assert!(errors.is_empty(), "the excluded file should not be checked");
+        assert!(
+            !checker.all_files_are_configured(std::slice::from_ref(&outside)),
+            "the excluded file should not be configured"
+        );
+    }
+
+    #[test]
+    fn incremental_checker_checks_additional_files_without_retaining_them() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let configured = root.join("configured.py");
+        let additional = root.join("excluded.py");
+        fs::write(&configured, "x: int = 1\n").unwrap();
+        fs::write(&additional, "x: int = 'bad'\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![configured]);
+
+        let result = checker.check_with_additional_files(
+            &CategorizedEvents::default(),
+            std::slice::from_ref(&additional),
+        );
+        assert!(result.config_errors.is_empty());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].path().as_path(), additional);
+
+        assert!(
+            check(&mut checker, &CategorizedEvents::default())
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn incremental_checker_updates_checked_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let initial = root.join("main.py");
+        fs::write(&initial, "x: int = 1\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![initial]);
+        assert!(
+            check(&mut checker, &CategorizedEvents::default())
+                .diagnostics
+                .is_empty()
+        );
+
+        let outside = temp.path().join("outside.py");
+        fs::write(&outside, "x: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                created: vec![outside],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert!(errors.is_empty());
+
+        let created = root.join("created.py");
+        fs::write(&created, "x: int = 'bad'\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                created: vec![created.clone()],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path().as_path(), created);
+
+        fs::remove_file(&created).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                removed: vec![created],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn incremental_checker_rechecks_dependents() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let dependency = root.join("dependency.py");
+        let dependent = root.join("dependent.py");
+        fs::write(&dependency, "value: str = 'ok'\n").unwrap();
+        fs::write(
+            &dependent,
+            "from dependency import value\nresult: str = value\n",
+        )
+        .unwrap();
+        let mut checker = incremental_checker(&root, vec![dependency.clone(), dependent.clone()]);
+        assert!(
+            check(&mut checker, &CategorizedEvents::default())
+                .diagnostics
+                .is_empty()
+        );
+
+        fs::write(&dependency, "value: int = 1\n").unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                modified: vec![dependency],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path().as_path() == dependent)
+        );
+    }
+
+    #[test]
+    fn incremental_checker_reports_removed_imports() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let dependency = root.join("dependency.py");
+        let dependent = root.join("dependent.py");
+        fs::write(&dependency, "value = 1\n").unwrap();
+        fs::write(&dependent, "from dependency import value\n").unwrap();
+        let mut checker = incremental_checker(&root, vec![dependency.clone(), dependent.clone()]);
+        assert!(
+            check(&mut checker, &CategorizedEvents::default())
+                .diagnostics
+                .is_empty()
+        );
+
+        fs::remove_file(&dependency).unwrap();
+        let errors = check(
+            &mut checker,
+            &CategorizedEvents {
+                removed: vec![dependency],
+                ..Default::default()
+            },
+        )
+        .diagnostics;
+        assert!(errors.iter().any(|error| {
+            error.path().as_path() == dependent && error.error_kind() == ErrorKind::MissingImport
+        }));
+    }
+
+    #[test]
+    fn github_actions_command_includes_full_path_and_metadata() {
+        let cmd = github_actions_command(&sample_error("bad".into())).expect("should emit command");
+        assert!(cmd.starts_with("::error "), "{cmd}");
+        assert!(
+            cmd.contains("file=/repo/foo.py"),
+            "full path expected, got {cmd}"
+        );
+        assert!(
+            cmd.contains("title=Pyrefly bad-assignment"),
+            "title missing, got {cmd}"
+        );
+        assert!(cmd.ends_with("::bad"));
+    }
+
+    #[test]
+    fn github_actions_command_respects_severity_mapping() {
+        let warning = sample_error("bad".into()).with_severity(Severity::Warn);
+        let notice = sample_error("bad".into()).with_severity(Severity::Info);
+        let ignored = sample_error("bad".into()).with_severity(Severity::Ignore);
+        assert!(
+            github_actions_command(&warning)
+                .unwrap()
+                .starts_with("::warning "),
+            "warning severity not mapped"
+        );
+        assert!(
+            github_actions_command(&notice)
+                .unwrap()
+                .starts_with("::notice "),
+            "info severity not mapped"
+        );
+        assert!(github_actions_command(&ignored).is_none());
+    }
+
+    #[test]
+    fn github_actions_command_marks_baselined_errors() {
+        let error = sample_error("bad".into())
+            .with_severity(Severity::Warn)
+            .with_baseline_status(BaselineStatus::Matched);
+        let command = github_actions_command(&error).unwrap();
+        assert!(command.starts_with("::warning "), "{command}");
+        assert!(
+            command.contains("title=Pyrefly bad-assignment [baselined]"),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn escape_helpers_follow_workflow_spec() {
+        assert_eq!(
+            escape_workflow_data("line1\nline2\r% done"),
+            "line1%0Aline2%0D%25 done"
+        );
+        assert_eq!(escape_workflow_property("file:name,py"), "file%3Aname%2Cpy");
+    }
+
+    #[test]
+    fn github_output_format_writes_commands() {
+        let errors = vec![sample_error("bad".into())];
+        let mut buf = Vec::new();
+        write_error_github(&mut buf, &errors).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("::error file=/repo/foo.py"));
+        assert!(output.ends_with("::bad\n"));
+    }
+
+    #[test]
+    fn full_text_with_github_output_format_writes_both() {
+        let errors = vec![sample_error("bad".into()).with_baseline_status(BaselineStatus::Matched)];
+        let mut buf = Vec::new();
+        write_error_full_text_with_github(&mut buf, ColorChoice::Never, Path::new("/"), &errors)
+            .unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("ERROR bad [bad-assignment] [baselined]"));
+        assert!(output.contains("title=Pyrefly bad-assignment [baselined]"));
+        assert!(output.ends_with("::bad\n"));
+    }
+
+    #[test]
+    fn junit_xml_output_format_writes_well_formed_xml() {
+        let errors = vec![
+            sample_error("first error".into()),
+            sample_error("second error".into()),
+        ];
+        let mut buf = Vec::new();
+        write_error_junit_xml(&mut buf, Path::new("/"), &errors).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#),
+            "missing XML declaration: {output}"
+        );
+        assert!(
+            output.contains(r#"<testsuite name="pyrefly" tests="2" failures="2""#),
+            "missing testsuite element: {output}"
+        );
+        assert!(
+            output.contains("<failure type="),
+            "missing failure element: {output}"
+        );
+        assert!(
+            output.contains("repo/foo.py"),
+            "missing file path: {output}"
+        );
+        assert!(
+            output.ends_with("</testsuites>\n"),
+            "missing closing tag: {output}"
+        );
+    }
+
+    #[test]
+    fn junit_xml_escapes_special_chars_in_messages() {
+        let errors = vec![sample_error(r#"a < b & c > d "e" 'f'"#.into())];
+        let mut buf = Vec::new();
+        write_error_junit_xml(&mut buf, Path::new("/"), &errors).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("&lt;"), "< not escaped: {output}");
+        assert!(output.contains("&amp;"), "& not escaped: {output}");
+        assert!(output.contains("&gt;"), "> not escaped: {output}");
+        assert!(output.contains("&quot;"), "\" not escaped: {output}");
+        assert!(output.contains("&apos;"), "' not escaped: {output}");
+
+        // CDATA split for ]]>
+        let errors2 = vec![sample_error("x ]]> y".into())];
+        let mut buf2 = Vec::new();
+        write_error_junit_xml(&mut buf2, Path::new("/"), &errors2).unwrap();
+        let output2 = String::from_utf8(buf2).unwrap();
+        assert!(
+            output2.contains("]]]]><![CDATA["),
+            "CDATA ]]> was not split across CDATA boundaries: {output2}"
+        );
+    }
+
+    #[test]
+    fn junit_xml_strips_invalid_control_chars() {
+        // NUL and other C0 control characters are illegal in XML even inside a
+        // CDATA section, so they must be dropped (not just escaped) to keep the
+        // document well-formed. The surrounding text must survive.
+        let errors = vec![sample_error("bad\u{0}\u{8}\u{1f}msg".into())];
+        let mut buf = Vec::new();
+        write_error_junit_xml(&mut buf, Path::new("/"), &errors).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output
+                .chars()
+                .any(|c| !matches!(c, '\n' | '\t') && (c as u32) < 0x20),
+            "illegal control char leaked into output: {output:?}"
+        );
+        assert!(
+            output.contains("badmsg"),
+            "surrounding message text was lost: {output}"
+        );
+    }
+
+    #[test]
+    fn output_args_parse_multiple_destinations() {
+        let output = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output",
+            "full-text:-",
+            "--output=json:diagnostics.json",
+            "--output",
+            "sarif:diagnostics.sarif",
+        ]);
+
+        assert_eq!(
+            output.output,
+            vec![
+                ErrorOutput {
+                    format: Some(OutputFormat::FullText),
+                    destination: ErrorOutputDestination::Stdout,
+                },
+                ErrorOutput {
+                    format: Some(OutputFormat::Json),
+                    destination: ErrorOutputDestination::File(PathBuf::from("diagnostics.json")),
+                },
+                ErrorOutput {
+                    format: Some(OutputFormat::Sarif),
+                    destination: ErrorOutputDestination::File(PathBuf::from("diagnostics.sarif",)),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn output_args_preserve_colons_and_literal_dash_paths() {
+        let output = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output",
+            r"C:\tmp\report.json",
+            "--output",
+            "full-text:json:report.txt",
+            "--output",
+            "./-",
+        ]);
+
+        assert_eq!(
+            output.output,
+            vec![
+                ErrorOutput {
+                    format: None,
+                    destination: ErrorOutputDestination::File(
+                        PathBuf::from(r"C:\tmp\report.json",)
+                    ),
+                },
+                ErrorOutput {
+                    format: Some(OutputFormat::FullText),
+                    destination: ErrorOutputDestination::File(PathBuf::from("json:report.txt")),
+                },
+                ErrorOutput {
+                    format: None,
+                    destination: ErrorOutputDestination::File(PathBuf::from("./-")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn output_args_reject_empty_destinations() {
+        for value in ["", "json:"] {
+            let error = OutputArgs::try_parse_from(["pyrefly-check", "--output", value])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("output destination cannot be empty"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_args_require_unique_destinations() {
+        let duplicate_stdout =
+            OutputArgs::parse_from(["pyrefly-check", "--output=-", "--output=json:-"]);
+        assert_eq!(
+            duplicate_stdout.validate_outputs().unwrap_err().to_string(),
+            "standard output may only be specified once"
+        );
+
+        let duplicate_file = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output=diagnostics.json",
+            "--output=sarif:./diagnostics.json",
+        ]);
+        assert_eq!(
+            duplicate_file.validate_outputs().unwrap_err().to_string(),
+            "output destination `./diagnostics.json` may only be specified once"
+        );
+
+        let unique = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output=json:first.json",
+            "--output=json:second.json",
+        ]);
+        unique.validate_outputs().unwrap();
+    }
+
+    #[test]
+    fn output_args_inherit_output_format_from_config() {
+        let output = OutputArgs::parse_from(["pyrefly-check"]);
+        let config = ConfigFile {
+            output_format: Some(OutputFormat::MinText),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            output.resolve(Some(&config)).output_format,
+            OutputFormat::MinText
+        );
+    }
+
+    #[test]
+    fn output_args_fall_back_to_built_in_defaults() {
+        let output = OutputArgs::parse_from(["pyrefly-check"]);
+        let defaults = output.resolve(None);
+
+        assert_eq!(defaults.baseline, None);
+        assert_eq!(defaults.baseline_error_level, Severity::Ignore);
+        assert_eq!(
+            defaults.baseline_matching_mode,
+            BaselineMatchingMode::Column
+        );
+        assert_eq!(defaults.baseline_format, BaselineFormat::Full);
+        assert_eq!(defaults.output_format, OutputFormat::default());
+        assert_eq!(defaults.min_severity, Severity::Error);
+        assert_eq!(defaults.show_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn report_pysa_defaults_min_severity_to_error() {
+        let pysa = OutputArgs::parse_from(["pyrefly-check", "--report-pysa", "out"]);
+        let defaults = pysa.resolve(None);
+        assert_eq!(defaults.min_severity, Severity::Error);
+        assert_eq!(defaults.show_severity, Severity::Error);
+
+        let warn_config = ConfigFile {
+            min_severity: Some(Severity::Warn),
+            ..Default::default()
+        };
+        assert_eq!(
+            pysa.resolve(Some(&warn_config)).show_severity,
+            Severity::Warn
+        );
+        let warn_flag = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--report-pysa",
+            "out",
+            "--min-severity",
+            "warn",
+        ]);
+        assert_eq!(warn_flag.resolve(None).show_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn output_args_inherit_baseline_matching_and_format() {
+        let output = OutputArgs::parse_from(["pyrefly-check"]);
+        let config = ConfigFile {
+            baseline_matching_mode: BaselineMatchingMode::ConciseDescription,
+            baseline_format: BaselineFormat::Minimal,
+            ..Default::default()
+        };
+        let defaults = output.resolve(Some(&config));
+
+        assert_eq!(
+            defaults.baseline_matching_mode,
+            BaselineMatchingMode::ConciseDescription
+        );
+        assert_eq!(defaults.baseline_format, BaselineFormat::Minimal);
+    }
+
+    #[test]
+    fn baseline_error_level_cli_and_config_precedence() {
+        let inherited = OutputArgs::parse_from(["pyrefly-check"]);
+        assert_eq!(
+            inherited.resolve(None).baseline_error_level,
+            Severity::Ignore
+        );
+        let warn = ConfigFile {
+            baseline_error_level: Some(Severity::Warn),
+            ..Default::default()
+        };
+        assert_eq!(
+            inherited.resolve(Some(&warn)).baseline_error_level,
+            Severity::Warn
+        );
+
+        let info = ConfigFile {
+            baseline_error_level: Some(Severity::Info),
+            ..Default::default()
+        };
+        assert_eq!(
+            inherited.resolve(Some(&info)).baseline_error_level,
+            Severity::Info
+        );
+
+        let overridden = OutputArgs::parse_from(["pyrefly-check", "--baseline-error-level=error"]);
+        assert_eq!(
+            overridden.resolve(Some(&warn)).baseline_error_level,
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn only_cli_and_config_precedence() {
+        let inherited = OutputArgs::parse_from(["pyrefly-check"]);
+        assert_eq!(inherited.resolve(None).only, None);
+        let config = ConfigFile {
+            only: Some(vec![ErrorKind::BadClassDefinition]),
+            ..Default::default()
+        };
+        assert_eq!(
+            inherited.resolve(Some(&config)).only,
+            Some(vec![ErrorKind::BadClassDefinition])
+        );
+
+        let overridden = OutputArgs::parse_from(["pyrefly-check", "--only", "bad-return"]);
+        assert_eq!(
+            overridden.resolve(None).only,
+            Some(vec![ErrorKind::BadReturn])
+        );
+
+        assert_eq!(
+            overridden.resolve(Some(&config)).only,
+            Some(vec![ErrorKind::BadReturn])
+        );
+    }
+
+    #[test]
+    fn cli_output_format_overrides_config_output_format() {
+        let output = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output-format",
+            "json",
+            "--output=diagnostics.json",
+        ]);
+        let config = ConfigFile {
+            output_format: Some(OutputFormat::MinText),
+            ..Default::default()
+        };
+        let defaults = output.resolve(Some(&config));
+
+        assert_eq!(defaults.output_format, OutputFormat::Json);
+        assert_eq!(
+            output.output[0].format.unwrap_or(defaults.output_format),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn explicit_output_formats_override_the_reloadable_default() {
+        let output = OutputArgs::parse_from([
+            "pyrefly-check",
+            "--output=json:explicit.json",
+            "--output=default.txt",
+        ]);
+        let min_text = output
+            .resolve(Some(&ConfigFile {
+                output_format: Some(OutputFormat::MinText),
+                ..Default::default()
+            }))
+            .output_format;
+
+        assert_eq!(
+            output.output[0].format.unwrap_or(min_text),
+            OutputFormat::Json
+        );
+        assert_eq!(
+            output.output[1].format.unwrap_or(min_text),
+            OutputFormat::MinText
+        );
+
+        let sarif = output
+            .resolve(Some(&ConfigFile {
+                output_format: Some(OutputFormat::Sarif),
+                ..Default::default()
+            }))
+            .output_format;
+        assert_eq!(output.output[0].format.unwrap_or(sarif), OutputFormat::Json);
+        assert_eq!(
+            output.output[1].format.unwrap_or(sarif),
+            OutputFormat::Sarif
+        );
+    }
+
+    #[test]
+    fn remove_unused_ignores_cli_values() {
+        for (argument, expected) in [
+            (None, None),
+            (
+                Some("--remove-unused-ignores"),
+                Some(UnusedIgnoreKind::Pyrefly),
+            ),
+            (
+                Some("--remove-unused-ignores=pyrefly"),
+                Some(UnusedIgnoreKind::Pyrefly),
+            ),
+            (
+                Some("--remove-unused-ignores=type"),
+                Some(UnusedIgnoreKind::Type),
+            ),
+            (
+                Some("--remove-unused-ignores=all"),
+                Some(UnusedIgnoreKind::All),
+            ),
+        ] {
+            let args = argument.map_or_else(
+                || CheckArgs::parse_from(["check"]),
+                |argument| CheckArgs::parse_from(["check", argument]),
+            );
+            assert_eq!(args.behavior.remove_unused_ignores, expected);
+        }
+    }
+
+    fn upsell_string(reason: SynthesizedPresetReason) -> String {
+        let mut buf = Vec::new();
+        write_unconfigured_upsell(reason, &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn upsell_for_no_nearby_config() {
+        let s = upsell_string(SynthesizedPresetReason::NoNearbyConfig);
+        assert!(s.contains("preset `basic`"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+        assert!(s.contains(UPSELL_DOCS_URL), "{s}");
+    }
+
+    #[test]
+    fn upsell_for_migrated_from_mypy_ini() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(MigratedFromKind::Mypy(
+            MigratedConfigSource::DedicatedFile,
+        )));
+        assert!(s.contains("your `mypy.ini`"), "{s}");
+        assert!(s.contains("preset: legacy"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    #[test]
+    fn upsell_for_migrated_from_mypy_pyproject() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(MigratedFromKind::Mypy(
+            MigratedConfigSource::PyprojectToml,
+        )));
+        assert!(s.contains("`[tool.mypy]` in your `pyproject.toml`"), "{s}");
+        // Make sure the dedicated-file phrasing isn't accidentally
+        // reused here.
+        assert!(!s.contains("your `mypy.ini`"), "{s}");
+        assert!(s.contains("preset: legacy"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    #[test]
+    fn upsell_for_migrated_from_pyrightconfig() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::Pyright(MigratedConfigSource::DedicatedFile),
+        ));
+        assert!(s.contains("your `pyrightconfig.json`"), "{s}");
+        assert!(s.contains("preset: default"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    #[test]
+    fn upsell_for_migrated_from_pyright_pyproject() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::Pyright(MigratedConfigSource::PyprojectToml),
+        ));
+        assert!(
+            s.contains("`[tool.pyright]` in your `pyproject.toml`"),
+            "{s}"
+        );
+        assert!(!s.contains("your `pyrightconfig.json`"), "{s}");
+        assert!(s.contains("preset: default"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    /// The basedpyright variant reports the preset the migration actually
+    /// produced, so a `[tool.basedpyright]` with no explicit
+    /// `typeCheckingMode` surfaces as `all`, not a hardcoded `default`.
+    #[test]
+    fn upsell_for_migrated_from_basedpyright_pyproject() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, Preset::All),
+        ));
+        assert!(
+            s.contains("`[tool.basedpyright]` in your `pyproject.toml`"),
+            "{s}"
+        );
+        assert!(s.contains("preset: all"), "{s}");
+        assert!(s.contains("`pyrefly init`"), "{s}");
+    }
+
+    /// An explicit `typeCheckingMode` pins no preset, which the migration
+    /// records as `Default` — the same wording the plain pyright path uses.
+    #[test]
+    fn upsell_for_migrated_from_basedpyright_with_explicit_mode() {
+        let s = upsell_string(SynthesizedPresetReason::Migrated(
+            MigratedFromKind::BasedPyright(MigratedConfigSource::PyprojectToml, Preset::Default),
+        ));
+        assert!(s.contains("preset: default"), "{s}");
+    }
+
+    /// `UserOverride` is suppressed: the user explicitly chose a
+    /// preset via the IDE setting or `--preset` flag.
+    #[test]
+    fn upsell_is_silent_for_user_override() {
+        let s = upsell_string(SynthesizedPresetReason::UserOverride);
+        assert!(s.is_empty(), "expected no upsell, got {s:?}");
+    }
+}

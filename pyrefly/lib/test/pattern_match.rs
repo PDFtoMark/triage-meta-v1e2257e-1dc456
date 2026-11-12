@@ -1,0 +1,2643 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use crate::test::util::TestEnv;
+use crate::testcase;
+
+testcase!(
+    test_double_name_match,
+    r#"
+match 42:
+    case x:  # E: name capture `x` makes remaining patterns unreachable
+        pass
+    case y:
+        pass
+print(y)  # E: `y` may be uninitialized
+    "#,
+);
+
+testcase!(
+    test_capture_narrowing,
+    r#"
+from typing import assert_type
+def f(o: object) -> None:
+    match o:
+        case y:
+            if isinstance(y, int):
+                assert_type(y, int)
+def g(xs: list[int | str]) -> None:
+    match xs:
+        case [head, *tail]:
+            assert_type(head, int | str)
+            assert_type(tail, list[int | str])
+"#,
+);
+
+testcase!(
+    test_guard_narrowing_in_match,
+    r#"
+from typing import assert_type
+def test(x: int | bytes | str):
+    match x:
+        case int():
+            assert_type(x, int)
+        case _ if isinstance(x, str):
+            assert_type(x, str)
+    "#,
+);
+
+testcase!(
+    test_pattern_crash,
+    r#"
+# Used to crash, see https://github.com/facebook/pyrefly/issues/490
+match None: # E: Missing cases: None
+    case {a: 1}: # E: # E: # E:
+        pass
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/4631.
+testcase!(
+    test_recursive_alias_mapping_pattern_does_not_overflow,
+    r#"
+from typing import Mapping
+
+def fn(obj: U):
+    match obj:
+        case {'a': {'b': []}}:
+            pass
+
+T = 'T' | str | Mapping[str, 'T']  # E: `|` union syntax does not work with string literals # E: Found cyclic self-reference in `T`
+U = Mapping[str, T]
+"#,
+);
+
+testcase!(
+    test_match_case_unreachable_for_disjoint_subject_type,
+    r#"
+from typing import Any
+
+def bad(x: list[int]) -> None:
+    match x:
+        case 1:  # E: Case pattern can never match subject of type `list[int]`
+            pass
+        case 2:  # E: Case pattern can never match subject of type `list[int]`
+            pass
+
+def bad_or(x: list[int]) -> None:
+    match x:
+        case 1 | 2:  # E: Case pattern can never match subject of type `list[int]`
+            pass
+
+class Obj:
+    field: list[int]
+
+def bad_facet(obj: Obj) -> None:
+    match obj.field:
+        case 1:  # E: Case pattern can never match subject of type `list[int]`
+            pass
+
+def bad_none(x: int) -> None:
+    match x:
+        case None:  # E: Case pattern can never match subject of type `int`
+            pass
+
+def ok(x: int) -> None:
+    match x:
+        case 1:
+            pass
+
+def ok_union(x: int | list[int]) -> None:
+    match x:
+        case 1:
+            pass
+
+def ok_any(x: Any) -> None:
+    match x:
+        case 1:
+            pass
+
+class SomeClass: ...
+
+def ok_class_pattern(x: int) -> None:
+    match x:
+        case SomeClass():
+            pass
+"#,
+);
+
+testcase!(
+    test_match_case_unreachable_exhausted_expression_subject,
+    r#"
+class A:
+    x: int
+
+class B:
+    y: int
+
+def make_a() -> A:
+    return A()
+
+def make_union(flag: bool) -> A | B:
+    return A() if flag else B()
+
+def constructor_subject() -> None:
+    match A():
+        case A():
+            pass
+        case A(x=1):  # E: Case pattern can never match subject of type `A`
+            pass
+
+def factory_subject() -> None:
+    match make_a():
+        case A():
+            pass
+        case A(x=1):  # E: Case pattern can never match subject of type `A`
+            pass
+
+def exhausted_or_subject(flag: bool) -> None:
+    match make_union(flag):
+        case A() | B():
+            pass
+        case A(x=1) | B(y=2):  # E: Case pattern can never match subject of type `A | B`
+            pass
+"#,
+);
+
+testcase!(
+    test_match_case_reachable_expression_subject_partial_patterns,
+    r#"
+class A:
+    x: int
+
+class B:
+    y: int
+
+def make_a() -> A:
+    return A()
+
+def make_union(flag: bool) -> A | B:
+    return A() if flag else B()
+
+def partial_alone() -> None:
+    match make_a():
+        case A(x=1):
+            pass
+
+def guarded_predecessor(flag: bool) -> None:
+    match make_a():
+        case A() if flag:
+            pass
+        case A(x=1):
+            pass
+
+def partial_predecessor() -> None:
+    match make_a():
+        case A(x=1):
+            pass
+        case A(x=2):
+            pass
+
+def live_or_subject(flag: bool) -> None:
+    match make_union(flag):
+        case A():
+            pass
+        case A(x=1) | B():
+            pass
+"#,
+);
+
+testcase!(
+    test_match_case_unreachable_after_prior_case_exhausts_type,
+    r#"
+from typing import assert_type
+
+def prior_case_exhausts_union_branch(x: int | str) -> None:
+    match x:
+        case int():
+            pass
+        case str():
+            pass
+        case int():  # E: Case pattern can never match subject of type
+            pass
+
+def duplicate_literal(x: bool) -> None:
+    match x:  # E: Missing cases: False
+        case True:
+            pass
+        case True:  # E: Case pattern can never match subject of type `Literal[False]`
+            pass
+"#,
+);
+
+testcase!(
+    test_match_case_unreachable_subclass_shadowing,
+    r#"
+def shadowed_by_parent_class(x: int) -> None:
+    match x:
+        case int():
+            pass
+        case 1:  # E: Case pattern can never match subject of type
+            pass
+
+def ok_subclass_first(x: int) -> None:
+    match x:
+        case bool():
+            pass
+        case int():
+            pass
+
+def class_shadowed_by_parent(x: int | str) -> None:
+    match x:
+        case int():
+            pass
+        case bool():  # E: Case pattern can never match subject of type
+            pass
+        case str():
+            pass
+
+def class_shadowed_by_parent_finite(x: int) -> None:
+    match x:
+        case int():
+            pass
+        case bool():  # E: Case pattern can never match subject of type
+            pass
+
+def no_cascade_after_wildcard(x: int) -> None:
+    match x:
+        case _:  # E: wildcard makes remaining patterns unreachable
+            pass
+        case 1:
+            pass
+        case int():
+            pass
+"#,
+);
+
+// Reachability is not checked on `object` subjects, because structural patterns can narrow
+// `object` to `Never` incorrectly.
+testcase!(
+    bug = "`case bool()` after `case int()` on an `object` subject is not reported",
+    test_match_case_unreachable_subsumed_object,
+    r#"
+def f(x: object) -> None:
+    match x:
+        case int():
+            pass
+        case bool():
+            pass
+"#,
+);
+
+testcase!(
+    test_match_case_unreachable_subsumed_by_sibling_pattern,
+    r#"
+from typing import Any
+
+def shadowed_after_parent_any(x: Any) -> None:
+    match x:
+        case int():
+            pass
+        case bool():  # E: Case pattern can never match subject of type
+            pass
+
+def ok_subclass_first_any(x: Any) -> None:
+    match x:
+        case bool():
+            pass
+        case int():
+            pass
+
+def ok_guarded_predecessor_any(x: Any, flag: bool) -> None:
+    match x:
+        case int() if flag:
+            pass
+        case bool():
+            pass
+
+class A:
+    x: int
+
+class B(A):
+    pass
+
+# A partial class pattern does not subsume its subclass pattern.
+def ok_partial_class_predecessor_any(x: Any) -> None:
+    match x:
+        case A(x=1):
+            pass
+        case B():
+            pass
+
+def duplicate_literal_any(x: Any) -> None:
+    match x:
+        case 1:
+            pass
+        case 1:  # E: Case pattern can never match subject of type
+            pass
+
+def or_pattern_any(x: Any) -> None:
+    match x:
+        case int() | str():
+            pass
+        case bool():  # E: Case pattern can never match subject of type
+            pass
+
+class Holder:
+    a: Any
+
+def attribute_any(h: Holder) -> None:
+    match h.a:
+        case int():
+            pass
+        case bool():  # E: Case pattern can never match subject of type
+            pass
+
+"#,
+);
+
+// Regression test for https://github.com/meta/pyrefly/issues/5549.
+testcase!(
+    test_match_case_gradual_base,
+    r#"
+from typing import Any, assert_type
+
+def make_base() -> Any:
+    return object
+
+class Mul: ...
+class FloorDiv(make_base()): ...
+
+def f(x: Any) -> str:
+    match x:
+        case Mul():
+            assert_type(x, Mul)
+            return "mul"
+        case FloorDiv():
+            assert_type(x, FloorDiv)
+            return "floordiv"
+        case str():
+            assert_type(x, str)
+            return "str"
+    assert_type(x, Any)
+    return "other"
+
+def gradual_predecessor(x: Any) -> None:
+    match x:
+        case FloorDiv():
+            assert_type(x, FloorDiv)
+        case str():
+            assert_type(x, str)
+"#,
+);
+
+testcase!(
+    test_pattern_dict_key_enum,
+    r#"
+from enum import StrEnum
+
+class MyEnumType(StrEnum):
+    A = "a"
+    B = "b"
+
+def my_func(x: dict[MyEnumType, int]) -> int:
+    match x:
+        case {MyEnumType.A: a, MyEnumType.B: b}:
+            return a + b
+        case _:
+            return 0
+"#,
+);
+
+testcase!(
+    test_mapping_pattern_typed_dict_preserves_literal_value_type,
+    r#"
+from dataclasses import dataclass
+from typing import Literal, TypeAlias, TypedDict, TypeVar, assert_never
+
+T = TypeVar("T")
+Pair: TypeAlias = tuple[T, T]
+PairSpec: TypeAlias = T | Pair[T]
+BoundaryStr: TypeAlias = Literal["closed", "periodic"]
+
+class BoundaryDictSpec(TypedDict):
+    x: PairSpec[BoundaryStr]
+    y: PairSpec[BoundaryStr]
+
+BoundarySpec: TypeAlias = BoundaryStr | BoundaryDictSpec
+
+def as_pair(b: PairSpec[BoundaryStr], /) -> Pair[BoundaryStr]:
+    match b:
+        case str():
+            return (b, b)
+        case (str(b1), str(b2)):
+            return (b1, b2)
+        case _ as unreachable:
+            assert_never(unreachable)
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BoundarySet:
+    x: Pair[BoundaryStr]
+    y: Pair[BoundaryStr]
+
+    @staticmethod
+    def from_spec(spec: BoundarySpec, /) -> "BoundarySet | None":
+        match spec:
+            case str() as b:
+                return BoundarySet(x=as_pair(b), y=as_pair(b))
+            case {
+                "x": (str() | (str(), str())) as bx,
+                "y": (str() | (str(), str())) as by,
+            } if len(spec) == 2:
+                return BoundarySet(x=as_pair(bx), y=as_pair(by))
+            case _:
+                raise TypeError
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_flow_merging,
+    r#"
+from typing import assert_type, Literal
+def foo(x: Literal['A'] | Literal['B']):
+    match x: # E: Match on `Literal['A', 'B']` is not exhaustive
+        case 'A':
+            raise ValueError()
+    assert_type(x, Literal['B'])
+    "#,
+);
+
+testcase!(
+    test_negation_of_guarded_pattern,
+    r#"
+from typing import assert_type, Literal
+def condition() -> bool: ...
+def foo(x: Literal['A'] | Literal['B']):
+    match x: # E: Match on `Literal['A', 'B']` is not exhaustive
+        case 'A' if condition():
+            raise ValueError()
+    assert_type(x, Literal['A', 'B'])
+    "#,
+);
+
+testcase!(
+    test_guarded_irrefutable_pattern_is_not_exhaustive,
+    r#"
+def f(x: int, guard: bool) -> int:
+    match x:
+        case _ if guard:
+            return 1
+    return 2
+    "#,
+);
+
+testcase!(
+    test_negated_exhaustive_class_match,
+    r#"
+from typing import assert_type
+
+def f0(x: int | str):
+    match x:
+        case int():
+            pass
+        case _:
+            assert_type(x, str)
+"#,
+);
+
+testcase!(
+    test_match_alias_narrows_subject,
+    r#"
+from typing import assert_never, assert_type
+
+def my_method(str_or_int: str | int) -> str:
+    match str_or_int:
+        case str() as str_data:
+            assert_type(str_or_int, str)
+            return str_data
+        case int() as int_data:
+            assert_type(str_or_int, int)
+            return str(int_data)
+        case _:
+            assert_never(str_or_int)
+"#,
+);
+
+testcase!(
+    test_match_exhaustive_user_classes_assert_never,
+    r#"
+from typing import assert_never, assert_type
+
+class A: ...
+
+class B: ...
+
+def f0(x: A | B):
+    match x:
+        case A():
+            assert_type(x, A)
+        case B():
+            assert_type(x, B)
+        case _:
+            assert_never(x)
+"#,
+);
+
+testcase!(
+    test_match_await_exhaustive_no_implicit_return,
+    r#"
+from typing import NoReturn
+
+class Ok[T]:
+    __match_args__ = ("value",)
+    value: T
+
+class Err[E]:
+    __match_args__ = ("value",)
+    value: E
+
+class NotFound:
+    pass
+
+def handle_error(error: NotFound) -> NoReturn:
+    raise Exception()
+
+async def get_result() -> Ok[list[int]] | Err[NotFound]:
+    raise Exception()
+
+async def f() -> list[int]:
+    match await get_result():
+        case Ok(value):
+            return value
+        case Err(error):
+            handle_error(error)
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_match_call_subject_diagnostic,
+    r#"
+from typing import final
+
+@final
+class Ok[T]:
+    __match_args__ = ("value",)
+    value: T
+
+@final
+class Err[E]:
+    __match_args__ = ("value",)
+    value: E
+
+@final
+class NotFound:
+    pass
+
+def get_result() -> Ok[int] | Err[NotFound]:
+    raise Exception()
+
+def f() -> None:
+    match get_result():  # E: get_result()
+        case Ok(value):
+            pass
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_match_await_subject_diagnostic,
+    r#"
+from typing import final
+
+@final
+class Ok[T]:
+    __match_args__ = ("value",)
+    value: T
+
+@final
+class Err[E]:
+    __match_args__ = ("value",)
+    value: E
+
+@final
+class NotFound:
+    pass
+
+async def get_result() -> Ok[int] | Err[NotFound]:
+    raise Exception()
+
+async def f() -> None:
+    match await get_result():  # E: await get_result()
+        case Ok(value):
+            pass
+"#,
+);
+
+testcase!(
+    test_match_sequence_pattern_narrows_tuple_out_of_union,
+    r#"
+from typing import assert_never
+
+def f(value: float | tuple[float, float]) -> None:
+    match value:
+        case (_, _):
+            pass
+        case float():
+            pass
+        case _ as unreachable:
+            assert_never(unreachable)
+"#,
+);
+
+testcase!(
+    test_match_sequence_star_pattern_narrows,
+    r#"
+from typing import assert_never
+
+def f(value: int | list[int]) -> None:
+    match value:
+        case [*_]:
+            pass
+        case int():
+            pass
+        case _ as unreachable:
+            assert_never(unreachable)
+"#,
+);
+
+testcase!(
+    test_match_sequence_star_pattern_narrows_tuple_subject,
+    r#"
+from typing import assert_never
+
+def star_pattern(x: int, y: str) -> None:
+    match (x, y):
+        case [*_]:
+            pass
+        case _ as never:
+            assert_never(never)
+
+def star_capture_pattern(x: int, y: str) -> None:
+    match (x, y):
+        case [*rest]:
+            pass
+        case _ as never:
+            assert_never(never)
+
+def star_pattern_is_exhaustive_return(x: int, y: str) -> int:
+    match (x, y):
+        case [*_]:
+            return 1
+
+def star_pattern_after_refutable_case(x: int | None, y: str | None) -> None:
+    match (x, y):
+        case (int(), str()):
+            pass
+        case [*_]:
+            pass
+        case _ as never:
+            assert_never(never)
+"#,
+);
+
+testcase!(
+    test_match_sequence_refutable_star_pattern_not_exhaustive,
+    r#"
+from typing import assert_type
+
+def f(x: int, y: str) -> None:
+    match (x, y):
+        case [1, *_]:
+            pass
+        case _ as reachable:
+            assert_type(reachable, tuple[int, str])
+"#,
+);
+
+testcase!(
+    test_match_sequence_refutable_subpattern_no_strip,
+    r#"
+from typing import assert_type
+
+def f(value: float | tuple[float, float]) -> float | tuple[float, float]:
+    match value:
+        case (1.0, 2.0):
+            return value
+        case _:
+            # The (1.0, 2.0) case is refutable, so tuple[float, float] must still be possible here.
+            assert_type(value, float | tuple[float, float])
+            return value
+"#,
+);
+
+testcase!(
+    test_match_exhaustive_call_subject_assert_never,
+    r#"
+from dataclasses import dataclass
+from typing import assert_never
+
+@dataclass
+class A: ...
+
+@dataclass
+class B: ...
+
+def f(x: A | B) -> A | B:
+    return x
+
+def test(x: A | B):
+    match f(x):
+        case A():
+            pass
+        case B():
+            pass
+        case y:
+            assert_never(y)
+"#,
+);
+
+testcase!(
+    test_match_call_subject_class_args_not_exhaustive,
+    r#"
+from typing import assert_never
+
+class C:
+    val: int
+
+def f(x: C) -> C:
+    return x
+
+def test(x: C):
+    match f(x):
+        case C(val=1):
+            pass
+        case y:
+            assert_never(y)  # E: Argument `C` is not assignable to parameter `arg` with type `Never`
+"#,
+);
+
+testcase!(
+    test_match_call_subject_guarded_alias_not_exhaustive,
+    r#"
+from typing import assert_type
+
+class A: ...
+class B: ...
+
+def f(x: A | B) -> A | B:
+    return x
+
+def test(x: A | B):
+    # A guard does not narrow the fallthrough for a synthetic subject, matching the named-subject
+    # behavior in test_negation_of_guarded_pattern / test_class_match_with_guard_not_exhaustive.
+    match f(x):
+        case value if isinstance(value, A):
+            pass
+        case y:
+            assert_type(y, A | B)
+"#,
+);
+
+testcase!(
+    test_match_exhaustive_enum_assign,
+    r#"
+from enum import IntEnum
+
+class Rating(IntEnum):
+    Again = 1
+    Hard = 2
+    Good = 3
+    Easy = 4
+
+def foo() -> Rating: ...
+
+def f0():
+    x = foo()
+    match x:
+        case Rating.Again:
+            y = 1
+        case Rating.Easy | Rating.Good | Rating.Hard:
+            y = 2
+    print(y)
+"#,
+);
+
+testcase!(
+    test_class_match_with_args_not_exhaustive,
+    r#"
+from typing import assert_type
+
+class C:
+    val: int
+
+def f0(x: C):
+    match x:
+        case C(val=1):
+            pass
+        case _:
+            assert_type(x, C)
+"#,
+);
+
+testcase!(
+    test_class_match_with_guard_not_exhaustive,
+    r#"
+from typing import assert_type
+
+def condition() -> bool: ...
+
+def f0(x: int):
+    match x:
+        case int() if condition():
+            pass
+        case _:
+            assert_type(x, int)
+"#,
+);
+
+testcase!(
+    test_class_match_with_positional_args_not_exhaustive,
+    r#"
+from typing import assert_type
+
+class C:
+    val: int
+    __match_args__ = ("val",)
+    def __init__(self, val: int):
+        self.val = val
+
+def f0(x: C):
+    match x:
+        case C(1):
+            pass
+        case _:
+            assert_type(x, C)
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_enum_match_warning,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+def describe(color: Color):
+    match color:  # E: Missing cases: Color.BLUE
+        case Color.RED:
+            print("danger")
+
+def describe_ok(color: Color):
+    match color:
+        case Color.RED:
+            print("danger")
+        case Color.BLUE:
+            print("ok")
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_literal_union_match_warning,
+    r#"
+from typing import Literal
+
+def describe(color: Literal["red", "blue"]):
+    match color:  # E: Missing cases: 'blue'
+        case "red":
+            print("danger")
+
+def describe_ok(color: Literal["red", "blue"]):
+    match color:
+        case "red":
+            print("danger")
+        case "blue":
+            print("ok")
+"#,
+);
+
+testcase!(
+    test_enum_member_as_class_pattern,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+
+def describe(color: Color) -> None:
+    match color:  # E: Match on `Color` is not exhaustive
+        case Color.RED():  # E: Expected class object, got `Literal[Color.RED]`
+            pass
+"#,
+);
+
+testcase!(
+    test_protocol_class_pattern,
+    r#"
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+
+def describe(x: object) -> None:
+    match x:
+        case Drawable():  # E: Protocol `Drawable` is not decorated with @runtime_checkable and cannot be used with isinstance()
+            pass
+        case _:
+            pass
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_enum_match_facet_subject,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+class X:
+    color: Color
+
+def describe(x: X):
+    match x.color: # E: Missing cases: Color.BLUE
+        case Color.RED:
+            print("danger")
+
+def describe_ok(x: X):
+    match x.color:
+        case Color.RED:
+            print("danger")
+        case Color.BLUE:
+            print("ok")
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_literal_union_match_facet_subject,
+    r#"
+from typing import Literal
+
+class X:
+    color: Literal["red", "blue"]
+
+def describe(x: X):
+    match x.color:  # E: Missing cases: 'blue'
+        case "red":
+            print("danger")
+
+def describe_ok(x: X):
+    match x.color:
+        case "red":
+            print("danger")
+        case "blue":
+            print("ok")
+
+def describe_ok_2(x: X):
+    match x.color:
+        case "red":
+            print("danger")
+        case _:
+            print("default")
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_star_capture,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type
+
+def test_seq_pattern(x: Sequence[int]) -> None:
+    match x:
+        case [*values]:
+            assert_type(values, list[int])
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_union,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type
+
+def test_union_seq(x: int | Sequence[int]) -> None:
+    match x:
+        case int(value):
+            assert_type(value, int)
+        case [*values]:
+            assert_type(values, list[int])
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_fixed_length,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type
+
+def test_fixed_len(x: Sequence[int]) -> None:
+    match x:
+        case [a, b]:
+            assert_type(a, int)
+            assert_type(b, int)
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_mixed,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type
+
+def test_mixed(x: Sequence[int]) -> None:
+    match x:
+        case [first, *middle, last]:
+            assert_type(first, int)
+            assert_type(middle, list[int])
+            assert_type(last, int)
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_str_excluded,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type
+
+def test_str_not_sequence(x: str | Sequence[int]) -> None:
+    # str is NOT matched by sequence patterns per PEP 634
+    match x:
+        case [*values]:
+            # If we get here, x must be Sequence[int], not str
+            assert_type(values, list[int])
+        case _:
+            # This is str since sequences are matched by the first case
+            assert_type(x, str)
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_list,
+    r#"
+from typing import assert_type
+
+def test_list_pattern(x: list[int]) -> None:
+    match x:
+        case [*values]:
+            assert_type(values, list[int])
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_tuple,
+    r#"
+from typing import assert_type
+
+def test_tuple_pattern(x: tuple[int, ...]) -> None:
+    match x:
+        case [*values]:
+            assert_type(values, list[int])
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_exhaustive_assert_never,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type, assert_never
+
+def test_seq_pattern(x: Sequence[int]) -> None:
+    match x:
+        case [*values]:
+            assert_type(values, list[int])
+        case _:
+            # This should be unreachable since all sequences match [*values]
+            assert_never(x)
+"#,
+);
+
+testcase!(
+    test_sequence_pattern_union_exhaustive,
+    r#"
+from collections.abc import Sequence
+from typing import assert_type, assert_never
+
+def test_seq_pat_with_union(x: int | Sequence[int]) -> None:
+    match x:
+        case int(value):
+            assert_type(value, int)
+        case [*values]:
+            assert_type(values, list[int])
+        case _:
+            # This should be unreachable since we've covered int and Sequence[int]
+            assert_never(x)
+"#,
+);
+
+testcase!(
+    test_exhaustive_bool_match_warning,
+    r#"
+def describe(flag: bool):
+    match flag:
+        case True:
+            return "yes"
+        case False:
+            return "no"
+    # This should NOT warn about missing return (Phase 2 will fix this)
+    # For now, we're just ensuring the NonExhaustiveMatch error doesn't fire
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_bool_match_warning,
+    r#"
+def describe(flag: bool):
+    match flag: # E: Match on `bool` is not exhaustive
+        case True:
+            pass
+    # Missing False case
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/3294
+testcase!(
+    test_open_domain_match_not_checked_by_default,
+    r#"
+def describe_int(x: int):
+    match x:
+        case 1:
+            pass
+        case 2:
+            pass
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_match_open_type_reports_open_domains,
+    TestEnv::new().enable_non_exhaustive_match_open_type_error(),
+    r#"
+def describe_int(x: int):
+    match x: # E: Match on `int` is not exhaustive
+        case 1:
+            pass
+
+def describe_str(x: str):
+    match x: # E: Match on `str` is not exhaustive
+        case "a":
+            pass
+        case "b":
+            pass
+
+def describe_list(x: list[int]):
+    match x: # E: Match on `list[int]` is not exhaustive
+        case [1]:
+            pass
+        case [2]:
+            pass
+
+def describe_object(x: object):
+    match x: # E: Match on `object` is not exhaustive
+        case int():
+            pass
+
+def describe_guarded(x: int | bytes | str):
+    match x: # E: Match on `bytes | int | str` is not exhaustive
+        case int():
+            pass
+        case _ if isinstance(x, str):
+            pass
+
+def get_int() -> int:
+    return 0
+
+match get_int(): # E: Match on `get_int()` is not exhaustive
+    case 0:
+        pass
+"#,
+);
+
+testcase!(
+    test_exhaustive_union_with_none,
+    r#"
+def process(x: int | None):
+    match x:
+        case int():
+            pass
+        case None:
+            pass
+    # Should not warn - union is exhausted
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_union_with_none,
+    r#"
+from typing import final
+
+@final
+class A:
+    pass
+
+@final
+class B:
+    pass
+
+def process(x: A | B | None):
+    match x: # E: Match on `A | B | None` is not exhaustive
+        case A():
+            pass
+        case B():
+            pass
+    # Missing None case
+"#,
+);
+
+testcase!(
+    test_exhaustive_enum_no_missing_return,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+def describe(color: Color) -> str:
+    match color:
+        case Color.RED:
+            return "It's red"
+        case Color.BLUE:
+            return "It's blue"
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_enum_missing_return,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+    GREEN = "green"
+
+def describe(color: Color) -> str: # E: Function declared to return `str`, but one or more paths are missing an explicit `return`
+    match color: # E: Match on `Color` is not exhaustive
+        case Color.RED:
+            return "It's red"
+        case Color.BLUE:
+            return "It's blue"
+    #   (Missing GREEN case here)
+"#,
+);
+
+testcase!(
+    test_exhaustive_literal_union_no_missing_return,
+    r#"
+from typing import Literal
+
+def describe(status: Literal["pending", "done"]) -> str:
+    match status:
+        case "pending":
+            return "Still working"
+        case "done":
+            return "Finished"
+"#,
+);
+
+// Test that an exhaustive match with a branch that doesn't return is correctly
+// identified as having an implicit None return.
+testcase!(
+    test_exhaustive_enum_with_branch_missing_return,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+def describe(color: Color) -> str: # E: Function declared to return `str`, but one or more paths are missing an explicit `return`
+    match color:
+        case Color.RED:
+            return "It's red"
+        case Color.BLUE:
+            pass  # Exhaustive but no return here
+"#,
+);
+
+testcase!(
+    test_exhaustive_literal_with_branch_missing_return,
+    r#"
+from typing import Literal
+
+def describe(status: Literal["pending", "done"]) -> str: # E: Function declared to return `str`, but one or more paths are missing an explicit `return`
+    match status:
+        case "pending":
+            return "Still working"
+        case "done":
+            pass  # Exhaustive but no return here
+"#,
+);
+
+// A folded literal expression makes the match exhaustive even though the
+// expression is not a narrowing subject.
+testcase!(
+    test_match_on_folded_literal_expr_is_exhaustive,
+    r#"
+def foo() -> str:
+    match 1 + 1:
+        case 2:
+            return "two"
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_match_shows_missing_none,
+    r#"
+from typing import final
+
+@final
+class A:
+    pass
+
+def process(x: A | None):
+    match x: # E: Match on `A | None` is not exhaustive
+        case A():
+            pass
+"#,
+);
+
+testcase!(
+    test_non_exhaustive_match_shows_missing_class,
+    r#"
+from typing import final
+
+@final
+class A:
+    pass
+
+@final
+class B:
+    pass
+
+@final
+class C:
+    pass
+
+def process(x: A | B | C):
+    match x: # E: Match on `A | B | C` is not exhaustive
+        case A():
+            pass
+"#,
+);
+
+testcase!(
+    test_exhaustiveness_in_enum_method,
+    r#"
+from enum import Enum
+
+class E(Enum):
+    X = 1
+    Y = 2
+
+    def f_exhaustive(self) -> str:
+        match self:
+            case E.X:
+                return "X"
+            case E.Y:
+                return "Y"
+
+    def f_nonexhaustive(self) -> str:  # E: missing an explicit `return`
+        match self:  # E: Missing cases: E.Y
+            case E.X:
+                return "X"
+    "#,
+);
+
+testcase!(
+    test_match_mapping_after_none,
+    r#"
+from typing import Any, assert_type
+
+def test_dict_or_none(dict_or_none: dict[str, Any] | None):
+    match dict_or_none:
+        case None:
+            pass
+        case {"a": "b"}:
+            # After matching None, dict_or_none is narrowed to dict[str, Any]
+            assert_type(dict_or_none, dict[str, Any])
+        case _:
+            assert_type(dict_or_none, dict[str, Any])
+
+def test_sequence_after_none(seq_or_none: list[int] | None):
+    match seq_or_none:
+        case None:
+            pass
+        case [first, *rest]:
+            # After matching None, seq_or_none is narrowed to list[int]
+            assert_type(seq_or_none, list[int])
+        case _:
+            assert_type(seq_or_none, list[int])
+"#,
+);
+
+testcase!(
+    test_match_mapping_before_none,
+    r#"
+from typing import Any, assert_type
+
+def test_dict_first(dict_or_none: dict[str, Any] | None):
+    match dict_or_none:
+        case {"a": "b"}:
+            # IsMapping narrows dict_or_none to dict[str, Any]
+            assert_type(dict_or_none, dict[str, Any])
+        case None:
+            pass
+        case _:
+            pass
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/1708
+testcase!(
+    test_match_exhaustive_literal_no_unbound,
+    r#"
+from typing import assert_never, Literal
+
+def func(x: Literal[1, 2]) -> None:
+    match x:
+        case 1:
+            y = 1
+        case 2:
+            y = 1
+        case _:
+            assert_never(x)
+
+    print(y)
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/1369
+testcase!(
+    test_match_object_with_tuple_pattern,
+    r#"
+def handle(o: object) -> int:
+    match o:
+        case ("a", 1): return 1
+        case ("b", 1): return 2
+        case ("c", 1): return 3
+    return 1
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/2826
+testcase!(
+    test_match_sequence_pattern_on_attribute,
+    r#"
+from __future__ import annotations
+from typing import assert_type
+
+class C:
+    items: list[C]
+    def __init__(self, items: list[C]) -> None:
+        self.items = items
+
+def handle(c: C) -> None:
+    match c.items:
+        case [_]:
+            assert_type(c, C)
+    assert_type(c, C)
+"#,
+);
+
+testcase!(
+    test_match_multi_subject_with_tuple_pattern,
+    r#"
+def test_multi_match1(o1: object, o2: object) -> None:
+    match o1, o2:
+        case _, ("a", 1): pass
+        case _, ("b", 1): pass
+        case _, ("c", 1): pass
+
+def test_multi_match2(o1: object, o2: object) -> None:
+    match o1, o2:
+        case ("a", 1), _: pass
+        case ("b", 1), _: pass
+        case ("c", 1), _: pass
+"#,
+);
+
+testcase!(
+    test_exhaustive_enum_or_pattern_no_missing_return,
+    r#"
+from enum import StrEnum
+
+class ParamKind(StrEnum):
+    POSITIONAL_ONLY = "positional-only"
+    POSITIONAL_OR_KEYWORD = "positional or keyword"
+    VAR_POSITIONAL = "variadic positional"
+    KEYWORD_ONLY = "keyword-only"
+    VAR_KEYWORD = "variadic keyword"
+
+class Param:
+    kind: ParamKind
+    name: str
+
+    def key(self, index: int) -> int | str:
+        match self.kind:
+            case ParamKind.POSITIONAL_ONLY:
+                return index
+            case ParamKind.KEYWORD_ONLY | ParamKind.POSITIONAL_OR_KEYWORD:
+                return self.name
+            case ParamKind.VAR_POSITIONAL:
+                return "*"
+            case ParamKind.VAR_KEYWORD:
+                return "**"
+"#,
+);
+
+testcase!(
+    test_match_alias_capture_uninitialized_in_other_branch,
+    r#"
+def f(items: list[object]) -> None:
+    for item in items:
+        match item:
+            case str() as inner:
+                print(inner)
+            case _:
+                print(inner)  # E: `inner` is uninitialized
+"#,
+);
+
+testcase!(
+    test_match_alias_does_not_leak,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+y: Color
+
+def describe(color: Color) -> str: # E: missing an explicit `return`
+    match color: # E: Missing cases: Color.GREEN
+        case Color.RED as y:
+            return "red"
+"#,
+);
+
+testcase!(
+    test_exhaustive_match_nested_facet_subject,
+    r#"
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+class Inner:
+    color: Color
+
+class Outer:
+    inner: Inner
+
+def describe(o: Outer) -> str:
+    match o.inner.color:
+        case Color.RED:
+            return "red"
+        case Color.GREEN:
+            return "green"
+"#,
+);
+
+testcase!(
+    test_match_alias_no_leak_when_no_narrowing_subject,
+    r#"
+from enum import Enum
+from typing import assert_type
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+def make_color() -> Color: ...
+
+def f(y: Color) -> None:
+    match make_color():  # E: Missing cases: Color.GREEN
+        case Color.RED as y:
+            return
+    assert_type(y, Color)
+"#,
+);
+
+testcase!(
+    test_indirect_match_mapping_or_patterns_do_not_over_narrow,
+    r#"
+from typing import TypedDict, Literal, assert_type
+
+class Config(TypedDict, total=False):
+    skip: bool
+    ci_platforms: list[str]
+    ignore_missing_stub: bool
+
+def get_config() -> Config: ...
+
+def test() -> Literal["skipped", "ignored", "error"]:
+    match get_config():
+        case {"skip": True} | {"ci_platforms": []}:
+            return "skipped"
+        case {"ignore_missing_stub": True} as config:
+            assert_type(config["ignore_missing_stub"], Literal[True])
+            return "ignored"
+        case _:
+            return "error"
+"#,
+);
+
+testcase!(
+    test_match_multi_subject_with_mapping_pattern,
+    r#"
+from typing import Any
+
+def test_multi_match_mapping1(o1: object, o2: dict[str, Any]) -> None:
+    match o1, o2:
+        case _, {"a": 1}: pass
+        case _, {"b": 1}: pass
+        case _, {"c": 1}: pass
+
+def test_multi_match_mapping2(o1: dict[str, Any], o2: object) -> None:
+    match o1, o2:
+        case {"a": 1}, _: pass
+        case {"b": 1}, _: pass
+        case {"c": 1}, _: pass
+"#,
+);
+
+testcase!(
+    test_match_tuple_subject_narrowing,
+    r#"
+from dataclasses import dataclass
+from typing import assert_type
+
+@dataclass
+class A: ...
+@dataclass
+class B: ...
+
+def test(x: A | B, y: A | B):
+    match x, y:
+        case A(), B():
+            assert_type(x, A)
+            assert_type(y, B)
+    "#,
+);
+
+testcase!(
+    test_match_tuple_subject_narrowing_with_literal,
+    r#"
+from dataclasses import dataclass
+from typing import assert_type
+
+@dataclass
+class A: ...
+@dataclass
+class B: ...
+
+def test(x: A | B, y: A | B):
+    match x, 1, y:
+        case A(), 1, B():
+            assert_type(x, A)
+            assert_type(y, B)
+    "#,
+);
+
+testcase!(
+    test_match_tuple_subject_narrowing_with_star,
+    r#"
+from dataclasses import dataclass
+from typing import assert_type
+
+@dataclass
+class A: ...
+@dataclass
+class B: ...
+
+def test(w: A | B, x: A | B, y: A | B, z: A | B):
+    match w, x, y, z:
+        case A(), *rest, B():
+            assert_type(w, A)
+            assert_type(rest, list[A | B])
+            assert_type(z, B)
+    "#,
+);
+
+// https://github.com/facebook/pyrefly/issues/3731
+testcase!(
+    test_nested_class_pattern_exhaustive,
+    r#"
+from typing import assert_never
+class Ok[T]:
+    __match_args__ = ("value",)
+    value: T
+class Err[E]:
+    __match_args__ = ("value",)
+    value: E
+class NotFound:
+    pass
+def f(r: Ok[int] | Err[NotFound]) -> int:
+    match r:
+        case Ok(value):
+            return value
+        case Err(NotFound()):
+            raise Exception()
+def g(r: Ok[int] | Err[NotFound]) -> int:
+    match r:
+        case Ok(value):
+            return value
+        case Err(NotFound()):
+            raise Exception()
+        case _:
+            assert_never(r)
+"#,
+);
+
+testcase!(
+    test_match_multi_slot_class_pattern_exhaustive,
+    r#"
+from typing import assert_never
+class Leaf:
+    pass
+class Node:
+    __match_args__ = ("left", "right")
+    left: Leaf
+    right: Leaf
+def f(n: Node) -> int:
+    match n:
+        case Node(Leaf(), Leaf()):
+            return 1
+def g(n: Node) -> int:
+    match n:
+        case Node(Leaf(), Leaf()):
+            return 1
+        case _:
+            assert_never(n)
+"#,
+);
+
+testcase!(
+    test_match_multi_slot_class_pattern_partial_not_exhaustive,
+    r#"
+class A:
+    pass
+class B:
+    pass
+class Rec:
+    __match_args__ = ("first", "second")
+    first: A
+    second: A | B
+def f(r: Rec) -> int:  # E: one or more paths are missing an explicit
+    # Only `first` is exhausted by `A()`; `second` still admits `B`, so the class
+    # is not covered and the match is not exhaustive.
+    match r:
+        case Rec(A(), A()):
+            return 1
+"#,
+);
+
+testcase!(
+    test_match_multi_slot_class_pattern_capture_and_refutable_exhaustive,
+    r#"
+from typing import assert_never
+class Leaf:
+    pass
+class Node:
+    __match_args__ = ("left", "right")
+    left: Leaf
+    right: Leaf
+def f(n: Node) -> int:
+    match n:
+        case Node(x, Leaf()):
+            return 1
+        case _:
+            assert_never(n)
+"#,
+);
+
+testcase!(
+    test_match_keyword_class_pattern_exhaustive,
+    r#"
+from typing import assert_never
+class Leaf:
+    pass
+class Box:
+    item: Leaf
+def f(b: Box) -> int:
+    match b:
+        case Box(item=Leaf()):
+            return 1
+def g(b: Box) -> int:
+    match b:
+        case Box(item=Leaf()):
+            return 1
+        case _:
+            assert_never(b)
+"#,
+);
+
+// An irrefutable keyword sub-pattern (a bare capture) fully exhausts its slot, so the
+// class must be subtracted from later cases -- mirroring the positional irrefutable case.
+testcase!(
+    test_match_irrefutable_keyword_class_pattern_exhaustive,
+    r#"
+from typing import assert_never
+class Box:
+    item: int
+def f(b: Box) -> int:
+    match b:
+        case Box(item=x):
+            return x
+        case _:
+            assert_never(b)
+"#,
+);
+
+testcase!(
+    test_match_mixed_positional_keyword_class_pattern_exhaustive,
+    r#"
+class A:
+    pass
+class Pair:
+    __match_args__ = ("first",)
+    first: A
+    tag: A
+def f(p: Pair) -> int:
+    match p:
+        case Pair(A(), tag=A()):
+            return 1
+"#,
+);
+
+testcase!(
+    test_match_keyword_class_pattern_partial_not_exhaustive,
+    r#"
+class A:
+    pass
+class B:
+    pass
+class Holder:
+    val: A | B
+def f(h: Holder) -> int:  # E: one or more paths are missing an explicit
+    # `val` still admits `B` after `A()`, so the class is not covered.
+    match h:
+        case Holder(val=A()):
+            return 1
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/3805
+testcase!(
+    test_match_tuple_union_narrowing,
+    r#"
+def foo(b: bool) -> tuple[str, int] | tuple[int, str]:
+    if b:
+        return "foo", 1
+    else:
+        return 2, "bar"
+def bar(b: bool) -> int:
+    match foo(b):
+        case (str() as x, y):
+            return y
+        case (x, str() as y):
+            return x
+"#,
+);
+
+testcase!(
+    test_match_tuple_union_relational_element_reads,
+    r#"
+from typing import assert_type
+def foo(b: bool) -> tuple[str, int] | tuple[int, str]:
+    if b:
+        return "foo", 1
+    else:
+        return 2, "bar"
+def named(t: tuple[str, int] | tuple[int, str]) -> None:
+    match t:
+        case (str() as x, y):
+            assert_type(x, str)
+            assert_type(y, int)
+        case (x2, y2):
+            assert_type(x2, int)
+            assert_type(y2, str)
+    match t:
+        case (x2, str() as y2):
+            assert_type(x2, int)
+            assert_type(y2, str)
+def synthetic() -> None:
+    match foo(True):
+        case (str() as x, y):
+            assert_type(x, str)
+            assert_type(y, int)
+        case (x2, y2):
+            assert_type(x2, int)
+            assert_type(y2, str)
+    match foo(True):
+        case (x2, str() as y2):
+            assert_type(x2, int)
+            assert_type(y2, str)
+"#,
+);
+
+testcase!(
+    test_match_sequence_union_exhaustive,
+    r#"
+def f(t: tuple[int, str] | tuple[str, int]) -> int:
+    match t:
+        case (int(), str()):
+            return 1
+        case (str(), int()):
+            return 2
+"#,
+);
+
+testcase!(
+    test_match_sequence_union_partial_not_exhaustive,
+    r#"
+def f(t: tuple[int, str] | tuple[str, int]) -> int:  # E: one or more paths are missing an explicit
+    match t:
+        case (int(), str()):
+            return 1
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/4066
+testcase!(
+    test_match_tuple_subject_exhaustive_rows,
+    r#"
+from typing import assert_never
+class RQ: pass
+class QQ: pass
+class RA: pass
+class QA: pass
+def f(q: RQ | QQ, a: RA | QA) -> None:
+    match q, a:
+        case RQ(), RA(): return
+        case RQ(), _: return
+        case QQ(), QA(): return
+        case QQ(), _: return
+        case unreachable:
+            assert_never(unreachable)
+
+def guarded(q: RQ | QQ, a: RA | QA, flag: bool) -> None:
+    match q, a:
+        case RQ(), RA(): return
+        case RQ(), _ if flag: return
+        case QQ(), QA(): return
+        case QQ(), _: return
+        case reachable:
+            assert_never(reachable)  # E: not assignable to parameter `arg` with type `Never`
+"#,
+);
+
+testcase!(
+    test_match_sequence_nested_element_not_exhaustive,
+    r#"
+def f(t: tuple[tuple[int], str] | tuple[str, int]) -> int:  # E: one or more paths are missing an explicit
+    match t:
+        case ([a], str()):
+            return 1
+        case (str(), int()):
+            return 2
+"#,
+);
+
+// A class-pattern facet narrow (`isinstance`) now filters the parent union down to the
+// matching member. Per-element narrowing of sibling captures and exhaustiveness for
+// these patterns remain follow-ups (relational narrowing).
+testcase!(
+    test_match_tuple_union_parent_narrows,
+    r#"
+from typing import assert_type
+def f(t: tuple[str, int] | tuple[int, str]) -> None:
+    match t:
+        case (str(), _):
+            assert_type(t, tuple[str, int])
+        case (_, str()):
+            assert_type(t, tuple[int, str])
+"#,
+);
+
+testcase!(
+    test_match_tuple_union_invalid_class_pattern_reports_once,
+    r#"
+from typing import Final
+def f(t: tuple[object, int] | tuple[object, str]) -> None:
+    match t:
+        case (Final(), _):  # E: Expected class object, got special form `Final`
+            pass
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/3883
+testcase!(
+    test_match_sequence_literal_element,
+    r#"
+from typing import Literal, Never, assert_type
+type MyUnion = Literal["a"] | tuple[Literal["b"], int] | tuple[Literal["c"], int]
+def exhaustive(value: MyUnion) -> str:
+    match value:
+        case "a":
+            return "a"
+        case "b", v:
+            return "b"
+        case "c", v:
+            return "c"
+    assert_type(value, Never)
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/2474
+testcase!(
+    test_match_mapping_pattern_else_narrow,
+    r#"
+from typing import assert_type, reveal_type
+def empty_pattern(x: dict | int) -> None:
+    match x:
+        case {}:
+            reveal_type(x)  # E: revealed type: dict[Unknown, Unknown]
+        case _:
+            assert_type(x, int)
+def keyed_pattern_does_not_narrow_else(x: dict | int) -> None:
+    # `case {"k": _}` is refutable on key presence: a dict without `"k"` falls through, so
+    # the `else` must keep `dict` (only `{}` / `{**rest}` match every mapping).
+    match x:
+        case {"k": _}:
+            reveal_type(x)  # E: revealed type: dict[Unknown, Unknown]
+        case _:
+            reveal_type(x)  # E: revealed type: dict[Unknown, Unknown] | int
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/4972
+testcase!(
+    test_match_tuple_optional_captures,
+    r#"
+from typing import assert_type
+def get_present_value(left: int | None, right: str | None) -> int | str:
+    match left, right:
+        case None, None:
+            raise ValueError("Both values are missing")
+        case value, None:
+            assert_type(value, int)
+            return value
+        case None, value:
+            assert_type(value, str)
+            return value
+        case _:
+            raise ValueError("Both values are present")
+
+def both_present(left: int | None, right: str | None) -> None:
+    match left, right:
+        case None, None:
+            pass
+        case value, None:
+            assert_type(value, int)
+            assert_type(left, int)
+        case None, value:
+            assert_type(value, str)
+            assert_type(right, str)
+        case a, b:
+            assert_type(a, int)
+            assert_type(b, str)
+            assert_type(left, int)
+            assert_type(right, str)
+    assert_type(left, int | None)
+    assert_type(right, str | None)
+
+def guarded(left: int | None, right: str | None, flag: bool) -> None:
+    match left, right:
+        case None, None if flag:
+            pass
+        case value, None:
+            assert_type(value, int | None)
+            assert_type(left, int | None)
+        case None, value:
+            assert_type(value, str)
+            assert_type(right, str)
+
+def incomplete(left: int | None, right: str | None) -> None:
+    match left, right:
+        case value, None:
+            assert_type(value, int | None)
+            assert_type(left, int | None)
+        case None, value:
+            assert_type(value, str)
+            assert_type(right, str)
+
+def three_elements(a: int | None, b: str | None, c: bytes | None) -> None:
+    match a, b, c:
+        case None, None, None:
+            pass
+        case x, None, None:
+            assert_type(x, int)
+            assert_type(a, int)
+        case None, y, None:
+            assert_type(y, str)
+            assert_type(b, str)
+        case None, None, z:
+            assert_type(z, bytes)
+            assert_type(c, bytes)
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/3213
+testcase!(
+    test_match_tuple_none_cases_narrow,
+    r#"
+from typing import assert_type
+
+def example(a: list[int] | None, b: list[int] | None) -> list[int]:
+    match (a, b):
+        case (None, None):
+            return []
+        case (_, None):
+            assert_type(a, list[int])
+            return a
+        case (None, _):
+            assert_type(b, list[int])
+            return b
+        case _:
+            assert_type(a, list[int])
+            assert_type(b, list[int])
+            return a + b
+"#,
+);
+
+testcase!(
+    test_match_tuple_none_cases_alias,
+    r#"
+from typing import assert_type
+
+def f(a: str | None, b: int | None) -> str:
+    match a, b:
+        case None, None:
+            return ""
+        case (_, None) as pair:
+            assert_type(a, str)
+            assert_type(b, None)
+            assert_type(pair, tuple[str, None])
+            return a.upper()
+        case _:
+            assert_type(b, int)
+            return ""
+
+def all_cases(a: str | None, b: int | None) -> None:
+    match a, b:
+        case (None, None) as pair:
+            assert_type(pair, tuple[None, None])
+        case ((_, None) as pair) as other:
+            assert_type(a, str)
+            assert_type(b, None)
+            assert_type(pair, tuple[str, None])
+            assert_type(other, tuple[str, None])
+        case (None, _) as pair:
+            assert_type(b, int)
+            assert_type(pair, tuple[None, int])
+        case _ as pair:
+            assert_type(a, str)
+            assert_type(b, int)
+            assert_type(pair, tuple[str, int])
+
+def shadowed(a: object, b: int | None) -> None:
+    match a, b:
+        case (_, None) as a:
+            assert_type(a, tuple[object, None])
+            assert_type(b, None)
+"#,
+);
+
+testcase!(
+    test_match_tuple_alias_nested_facets,
+    r#"
+from typing import assert_type
+
+def nested_alias(a: tuple[str | None], b: None) -> None:
+    match a, b:
+        case ((str(),), None) as pair:
+            assert_type(a[0], str)
+            assert_type(pair[0][0], str)
+            pair[0][0].upper()
+
+def make_a() -> tuple[str | None]:
+    return (None,)
+
+def expression_alias(b: None) -> None:
+    match make_a(), b:
+        case ((str(),), None) as pair:
+            assert_type(pair[0][0], str)
+            pair[0][0].upper()
+
+class Holder:
+    value: tuple[str | None]
+
+def attribute_alias(h: Holder) -> None:
+    match h.value, None:
+        case ((str(),), None) as pair:
+            assert_type(h.value[0], str)
+            assert_type(pair[0][0], str)
+
+class Box:
+    value: str | None
+
+def class_alias(a: Box, b: None) -> None:
+    match a, b:
+        case ((Box(value=str()), None) as pair) as other:
+            assert_type(a.value, str)
+            assert_type(pair[0].value, str)
+            assert_type(other[0].value, str)
+"#,
+);
+
+testcase!(
+    test_match_tuple_subject_walrus_rebinding,
+    r#"
+from typing import assert_type
+
+def f(a: str | None) -> None:
+    match a, (a := None):
+        case None, None:
+            return
+        case _:
+            assert_type(a, None)
+            a.upper()  # E: Object of class `NoneType` has no attribute `upper`
+
+def positive_pattern(a: str | None) -> None:
+    match a, (a := None):
+        case str(), None:
+            assert_type(a, None)
+        case _:
+            pass
+
+def repeated_walrus(a: str | None) -> None:
+    match (a := "old"), (a := None):
+        case str(), None:
+            assert_type(a, None)
+        case _:
+            pass
+
+def valid_walrus(a: str | None, b: int | None) -> None:
+    match (a := a), b:
+        case None, None:
+            return
+        case _, None:
+            assert_type(a, str)
+        case _:
+            pass
+"#,
+);
+
+testcase!(
+    test_match_tuple_none_cases_subject_rebinding,
+    r#"
+from typing import assert_type
+
+def captured(a: str | None, b: str | None) -> None:
+    match a, b:
+        case None, None:
+            pass
+        case _, None:
+            assert_type(a, str)
+            a = None
+            assert_type(a, None)
+        case None, value:
+            assert_type(a, None)
+            assert_type(value, str)
+            assert_type(b, str)
+        case _ as pair:
+            assert_type(a, str)
+            assert_type(b, str)
+            assert_type(pair, tuple[str, str])
+
+def rebound(a: int | str, b: int | str) -> None:
+    if isinstance(a, int) and isinstance(b, str):
+        match a, b:
+            case b, a:
+                assert_type(a, str)
+                assert_type(b, int)
+
+class Holder:
+    a: int | None
+    b: str | None
+
+def attributes(h: Holder) -> None:
+    match h.a, h.b:
+        case None, None:
+            pass
+        case _, None:
+            assert_type(h.a, int)
+        case None, _:
+            assert_type(h.b, str)
+        case _:
+            assert_type(h.a, int)
+            assert_type(h.b, str)
+
+def constant(a: int | None) -> None:
+    match a, None:
+        case None, None:
+            pass
+        case _:
+            assert_type(a, int)
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/2932
+testcase!(
+    test_match_false_positive_unbound_name,
+    r#"
+from typing import assert_type
+def test(x: int | None, y: int | None) -> None:
+    match x, y:
+        case None, None:
+            raise ValueError
+        case int(m), None:
+            u = m * 3
+            v = m
+        case None, int(n):
+            u = n
+            v = n // 3
+        case _, _:
+            raise ValueError
+    assert_type(u, int)
+    assert_type(v, int)
+"#,
+);
+
+testcase!(
+    test_match_tuple_wildcard_catch_all_is_exhaustive,
+    r#"
+from typing import assert_type
+def f(x: int | None, y: int | None) -> None:
+    match x, y:
+        case None, None:
+            u = 0
+        case int(m), None:
+            u = m
+        case None, int(n):
+            u = n
+        case _, _:
+            u = 1
+    assert_type(u, int)
+"#,
+);
+
+// The final `case (begin, end)` is an all-capture sequence over a fixed-arity tuple
+// subject, so it is a catch-all: the match is exhaustive and the function always
+// returns. The binding step and the implicit-return scan must agree on this, or the
+// latter promises a `Key::Exhaustive(Match, ...)` binding the former never inserts,
+// panicking at solve time with "key lacking binding".
+testcase!(
+    test_match_tuple_capture_catch_all_is_exhaustive_return,
+    r#"
+def f(begin: int | None, end: int | None) -> int:
+    match (begin, end):
+        case (None, None):
+            return 0
+        case (None, e):
+            return 1
+        case (b, None):
+            return 2
+        case (b, e):
+            return 3
+"#,
+);
+
+testcase!(
+    test_match_starred_tuple_subject_is_not_fixed_arity,
+    r#"
+def f(xs: list[int], y: int) -> None:
+    match *xs, y:
+        case a, b:
+            u = 0
+    print(u)  # E: `u` may be uninitialized
+"#,
+);
+
+testcase!(
+    test_match_class_positional_pattern_narrows_attribute,
+    r#"
+from typing import assert_type
+class C:
+    __match_args__ = ("x",)
+    x: int | str
+def f(c: C) -> None:
+    match c:
+        case C(int()):
+            assert_type(c.x, int)
+    "#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/4888.
+testcase!(
+    test_match_class_pattern_with_replaced_import,
+    TestEnv::new().with_replace_imports_with_any(&["pandas"]),
+    r#"
+from typing import Any, assert_type
+import pandas as pd
+def check(arg: object) -> None:
+    match arg:
+        case pd.DataFrame(dtypes=dtypes):
+            assert_type(dtypes, Any)
+    "#,
+);
+
+testcase!(
+    test_guard_lambda_contextual_type,
+    r#"
+from typing import Callable
+
+def pred(f: Callable[[int], object]) -> bool: ...
+
+def f(x: object) -> None:
+    match x:
+        case _ if pred(lambda v: [e for e in v]):  # E: Type `int` is not iterable
+            pass
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/5340.
+testcase!(
+    test_negated_sequence_pattern_narrows_element,
+    r#"
+from typing import assert_type
+
+def f(item: tuple[str, list[int] | None]) -> None:
+    match item:
+        case (name, None):
+            pass
+        case (name, changes):
+            assert_type(changes, list[int])
+            assert_type(item[1], list[int])
+    "#,
+);
+
+testcase!(
+    test_negated_sequence_pattern_narrows_element_before_star,
+    r#"
+from typing import assert_type
+
+def f(item: tuple[str, int | None, bytes]) -> None:
+    match item:
+        case (_, None, _):
+            pass
+        case (a, b, *rest):
+            assert_type(a, str)
+            assert_type(b, int)
+            assert_type(rest, list[bytes])
+    "#,
+);
+
+// Elements after a star are counted from the end, so they don't see the `[1]` narrow.
+testcase!(
+    bug = "`y` is always `item[1]`, so it should be `int`",
+    test_negated_sequence_pattern_element_after_star,
+    r#"
+from typing import assert_type
+
+def f(item: tuple[str, int | None, bytes]) -> None:
+    match item:
+        case (_, None, _):
+            pass
+        case (*rest, y, z):
+            assert_type(rest, list[str])
+            assert_type(y, int | None)
+            assert_type(z, bytes)
+    "#,
+);
+
+testcase!(
+    test_guarded_sequence_pattern_does_not_narrow_element,
+    r#"
+from typing import assert_type
+
+def f(item: tuple[str, int | None], c: bool) -> None:
+    match item:
+        case (_, None) if c:
+            pass
+        case (_, v):
+            assert_type(v, int | None)
+    "#,
+);
+
+// The match subject is evaluated as a plain expression, which drops facet narrows.
+testcase!(
+    bug = "The `item[1]` narrow from before the match should reach `b`",
+    test_sequence_pattern_capture_ignores_narrow_before_match,
+    r#"
+from typing import assert_type
+
+def f(item: tuple[str, int | None]) -> None:
+    if item[1] is not None:
+        match item:
+            case (_, b):
+                assert_type(b, int | None)
+    "#,
+);
+
+testcase!(
+    test_nested_exhaustive_match_in_match_arm_binds_sibling_name,
+    r#"
+from dataclasses import dataclass
+from typing import final
+
+@final
+@dataclass
+class Ok[T]:
+    value: T
+
+@final
+@dataclass
+class Err[E]:
+    error: E
+
+class NotFoundError(Exception): ...
+
+def get() -> Ok[int] | Err[NotFoundError]: ...
+
+def g() -> int:
+    match get():
+        case Ok(value):
+            pass
+        case Err(err):
+            match err:
+                case NotFoundError():
+                    raise ValueError("should not happen")
+    return value
+"#,
+);
+
+// A full class pattern subsumes a later partial pattern of the same class;
+// mypy's `--warn-unreachable` and pyright's strict mode both report the second case.
+testcase!(
+    test_match_case_unreachable_full_class_before_partial,
+    r#"
+class A:
+    x: int
+
+def full_before_partial(a: A) -> None:
+    match a:
+        case A():
+            pass
+        case A(x=1):  # E: Case pattern can never match subject of type `A`
+            pass
+"#,
+);
+
+// A partial class pattern alone stays reachable, and so does a subclass pattern
+// after it: an `A` instance with a different `x` still matches only the second case.
+testcase!(
+    test_match_case_reachable_partial_class_patterns,
+    r#"
+class A:
+    x: int
+
+class B(A):
+    pass
+
+def partial_alone(a: A) -> None:
+    match a:
+        case A(x=1):
+            pass
+
+def partial_before_subclass(b: B) -> None:
+    match b:
+        case A(x=1):
+            pass
+        case B():
+            pass
+"#,
+);
+
+// A repeated partial class pattern is still not reported: its negation cannot
+// subtract the class, because `ClassCoverageGate` only subtracts when every
+// sub-pattern exhausts its slot. Tracked in https://github.com/facebook/pyrefly/issues/5516.
+testcase!(
+    bug = "duplicate partial class pattern is not reported",
+    test_match_case_reachable_duplicate_partial_class_pattern,
+    r#"
+class A:
+    x: int
+
+def duplicate_partial(a: A) -> None:
+    match a:
+        case A(x=1):
+            pass
+        case A(x=1):
+            pass
+"#,
+);

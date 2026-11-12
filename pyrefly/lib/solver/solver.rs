@@ -1,0 +1,5081 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::cell::Ref;
+use std::cell::RefCell;
+use std::cell::RefMut;
+use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Display;
+use std::hash::Hash;
+use std::mem;
+use std::sync::Arc;
+
+use itertools::Either;
+use itertools::Itertools;
+use pyrefly_types::dimension::ShapeError;
+use pyrefly_types::dimension::gradual_size;
+use pyrefly_types::dimension::is_gradual_size;
+use pyrefly_types::heap::TypeHeap;
+use pyrefly_types::literal::LitStyle;
+use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::shaped_array::IntTuple;
+use pyrefly_types::simplify::intersect;
+use pyrefly_types::special_form::SpecialForm;
+use pyrefly_types::tuple::Tuple;
+use pyrefly_types::type_var::Restriction;
+use pyrefly_types::type_var::ShapeExtensionRestriction;
+use pyrefly_types::types::TArgs;
+use pyrefly_util::gas::Gas;
+use pyrefly_util::lock::Mutex;
+use pyrefly_util::lock::RwLock;
+use pyrefly_util::prelude::SliceExt;
+use pyrefly_util::recurser::Guard;
+use pyrefly_util::recurser::Recurser;
+use pyrefly_util::uniques::UniqueFactory;
+use pyrefly_util::visit::VisitMut;
+use ruff_python_ast::name::Name;
+use ruff_text_size::TextRange;
+use starlark_map::small_map::Entry;
+use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
+use vec1::Vec1;
+
+use crate::alt::answers::LookupAnswer;
+use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::attr::AttrSubsetError;
+use crate::config::error_kind::ErrorKind;
+use crate::error::collector::ErrorBuilder;
+use crate::error::collector::ErrorCollector;
+use crate::error::context::TypeCheckContext;
+use crate::error::context::TypeCheckKind;
+use crate::solver::shape::ShapeIntBoundSolution;
+use crate::solver::shape::canonicalize_ints_in_type;
+use crate::solver::shape::has_int_tuple_bound;
+use crate::solver::shape::normalize_shape_int_bound_solution;
+use crate::solver::shape::normalize_shape_tuple_bound_candidate;
+use crate::solver::shape::quantified_gradual_type;
+use crate::solver::shape::simplify_shape_type;
+use crate::solver::shape::type_as_intvar_solution;
+use crate::solver::type_order::TypeOrder;
+use crate::types::callable::Callable;
+use crate::types::callable::Param;
+use crate::types::callable::ParamList;
+use crate::types::callable::Params;
+use crate::types::callable::PrefixParam;
+use crate::types::callable::Required;
+use crate::types::class::Class;
+use crate::types::function::Function;
+use crate::types::module::ModuleType;
+use crate::types::simplify::simplify_tuples_and_distribute_unpacking;
+use crate::types::simplify::unions;
+use crate::types::simplify::unions_with_literals;
+use crate::types::typed_dict::TypedDict;
+use crate::types::types::Substitution;
+use crate::types::types::TParams;
+use crate::types::types::Type;
+use crate::types::types::Var;
+
+/// Error message when a variable has leaked from one module to another.
+///
+/// We have a rule that `Var`'s should not leak from one module to another, but it has happened.
+/// The easiest debugging technique is to look at the `Solutions` and see if there is a `Var(Unique)`
+/// in the output. The usual cause is that we failed to visit all the necessary `Type` fields.
+const VAR_LEAK: &str = "Internal error: a variable has leaked from one module to another.";
+
+/// A number chosen such that all practical types are less than this depth,
+/// but low enough to avoid stack overflow. Rust's default stack size is 8MB,
+/// and each recursive call to is_subset_eq can use several KB of stack space
+/// due to large enums (Type) and lock guards.
+const INITIAL_GAS: Gas = Gas::new(200);
+
+fn is_gradual_shape_bound(ty: &Type) -> bool {
+    matches!(ty, Type::IntTuple(shape) if shape.is_shapeless()) || is_gradual_size(ty)
+}
+
+/// Pin a solver answer for a variable of the given `kind`.
+///
+/// `IntVar` answers are normalized into dimension space, falling back to a
+/// gradual size when the candidate is not a valid dimension. Answers for every
+/// other kind are used as-is. This is distinct from the `.expect(...)` sites
+/// that pin a *bound* already validated by `validate_bound_consistency`, where a
+/// failed normalization is an invariant violation rather than a fallback.
+///
+/// Takes `Cow` so an owned answer is moved through the pass-through branch while
+/// a borrowed one is only cloned when it must be returned as-is.
+fn normalize_answer_for_kind(kind: QuantifiedKind, ty: Cow<Type>) -> Type {
+    if kind == QuantifiedKind::IntVar {
+        type_as_intvar_solution(&ty).unwrap_or_else(gradual_size)
+    } else {
+        ty.into_owned()
+    }
+}
+
+/// Accumulated bounds for a solver variable.
+#[derive(Clone, Debug, Default)]
+struct Bounds {
+    // TODO(https://github.com/facebook/pyrefly/issues/105): use `SmallSet<Type>`; bounds should
+    // not be order-dependent.
+    lower: Vec<Type>,
+    upper: Vec<Type>,
+}
+
+impl Bounds {
+    fn new() -> Self {
+        Self {
+            lower: Vec::new(),
+            upper: Vec::new(),
+        }
+    }
+
+    fn extend(&mut self, other: Bounds) {
+        self.lower.extend(other.lower);
+        self.upper.extend(other.upper);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lower.is_empty() && self.upper.is_empty()
+    }
+}
+
+/// Full per-branch capture used transiently during overload probing.
+#[derive(Clone, Debug)]
+pub struct OverloadBranch {
+    branch_index: usize,
+    values: SmallMap<Var, Variable>,
+    /// The captured vars that appear in the parameters the branch was matched against. The other
+    /// captured vars only receive the branch's return type, so they cannot decide which branch
+    /// applies.
+    param_vars: SmallSet<Var>,
+    /// Vars that may become free quantifieds, as of snapshot time. Read by
+    /// `overload_branch_value_type` to decide whether an unsolved branch value
+    /// should be a free quantified.
+    free_quantified_vars: SmallSet<Var>,
+    /// Errors that matching this branch recorded against the captured vars, such as a bound
+    /// violation. Probing rolls them back, so they are kept here until the call finishes.
+    errors: Vec<TypeVarSpecializationError>,
+}
+
+type OverloadBranchesByArgument = SmallMap<ArgumentKey, Vec<OverloadBranch>>;
+
+/// The solutions a call boundary settled on: one row per consistent combination of overload
+/// branches. Handed to the return boundary, which instantiates the return type once per row.
+#[derive(Clone, Debug, Default)]
+pub struct OverloadTable {
+    rows: Vec<OverloadRow>,
+    /// Whether the branches this table keeps apart are told apart only by a var the call solved
+    /// to a gradual type. Then which branch applies is not merely unknown but unknowable.
+    ambiguous: bool,
+}
+
+enum OverloadRowsBuild {
+    Built(Vec<OverloadRow>),
+    TooManyRows,
+}
+
+impl OverloadTable {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(crate) fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+}
+
+/// How many solutions a call will keep apart. Chosen well above what correlated overloads
+/// produce in practice, and far below where the product of several unconstrained overloaded
+/// arguments makes finishing the call expensive.
+const MAX_OVERLOAD_ROWS: usize = 64;
+
+/// The types implied by one consistent combination of overload branches across a call.
+#[derive(Clone, Debug)]
+pub(crate) struct OverloadRow {
+    values: SmallMap<Var, Type>,
+}
+
+/// What matching the call's arguments recorded, read when the call is finished.
+#[derive(Debug, Default)]
+struct ArgumentCaptures {
+    overload: OverloadBranchesByArgument,
+    /// The vars the call's generic arguments constrain, each mapped to whether it becomes a free
+    /// quantified, rather than a gradual type, if left unsolved.
+    generic: SmallMap<Var, bool>,
+}
+
+impl ArgumentCaptures {
+    fn captured_vars(&self) -> SmallSet<Var> {
+        let mut vars: SmallSet<Var> = self
+            .overload
+            .values()
+            .flat_map(|captures| captures.iter())
+            .flat_map(|capture| capture.values.keys().copied())
+            .collect();
+        vars.extend(self.generic.keys().copied());
+        vars
+    }
+}
+
+/// What survived pruning, per argument, threaded through finishing.
+#[derive(Clone, Debug)]
+enum OverloadPruning {
+    AllPruned(OverloadAllPrunedCause),
+    Surviving(SmallSet<usize>),
+    /// Every var that could tell this argument's branches apart is gradual, so none of them does.
+    Ambiguous,
+}
+
+type OverloadPruningByArgument = SmallMap<ArgumentKey, OverloadPruning>;
+
+/// The branches of one argument that survive its pruning decision.
+fn surviving_branches<'a>(
+    branches: &'a [OverloadBranch],
+    pruning: Option<&'a OverloadPruning>,
+) -> impl Iterator<Item = &'a OverloadBranch> {
+    branches.iter().filter(move |branch| match pruning {
+        Some(OverloadPruning::AllPruned(_)) => false,
+        Some(OverloadPruning::Surviving(kept)) => kept.contains(&branch.branch_index),
+        Some(OverloadPruning::Ambiguous) | None => true,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct OverloadSolvedConstraint {
+    quantified_name: Name,
+    solved_ty: Type,
+}
+
+#[derive(Clone, Debug)]
+struct OverloadAllPrunedCause {
+    solved_constraints: Vec<OverloadSolvedConstraint>,
+}
+
+#[derive(Clone, Debug)]
+struct SolvedVarInfo {
+    quantified_name: Option<Name>,
+    solved_ty: Type,
+}
+
+#[derive(Clone, Debug)]
+enum Variable {
+    /// A "partial type" (terminology borrowed from mypy) for an empty container.
+    ///
+    /// Pyrefly only creates partial types for assignments, and will attempt to
+    /// determine the type ("pin" it) using the first use of the name assigned.
+    ///
+    /// It will attempt to infer the type from the first downstream use; if the
+    /// type cannot be determined it becomes `Any`.
+    ///
+    /// The TextRange is the location of the empty container literal (e.g., `[]` or `{}`),
+    /// used for error reporting when the type cannot be inferred.
+    PartialContained(TextRange),
+    /// A "partial type" (see above) representing a type variable that was not
+    /// solved as part of a generic function or constructor call.
+    ///
+    /// Behaves similar to `PartialContained`, but it has the ability to use
+    /// the default type if the first use does not pin.
+    PartialQuantified(Quantified),
+    /// A variable due to generic instantiation, `def f[T](x: T): T` with `f(1)`
+    Quantified {
+        quantified: Quantified,
+        bounds: Bounds,
+        /// A restriction that replaces the declared one while a hint is decomposed.
+        bound_override: Option<Box<Restriction>>,
+    },
+    /// A variable caused by general recursion, e.g. `x = f(); def f(): return x`.
+    Recursive,
+    /// A variable that used to decompose a type, e.g. getting T from Awaitable[T]
+    Unwrap(Bounds),
+    /// A variable whose answer has been determined.
+    Answer {
+        ty: Type,
+        /// Whether every `Type::Var` transitively reachable through `ty` has a stable answer.
+        /// A var may be published in `Answers` only when its answer is frozen.
+        /// Frozen answers do not need to be traversed again when sanitizing vars for publication.
+        frozen: bool,
+        /// The restricted type parameter this answer instantiates, while the call that supplied
+        /// the answer is still matching arguments against it. See [`RestrictedAnswer`].
+        restricted: Option<Box<RestrictedAnswer>>,
+    },
+}
+
+/// A gradual expected type's answer for a restricted type parameter admits every argument, so it
+/// cannot enforce the parameter's restriction on its own. Argument matching checks each argument
+/// against `param` instead and records the first violation in `error`.
+///
+/// Each call that matches arguments against the answer takes the violation it caused, so that an
+/// overload that causes one is rejected like it is without the expected type.
+/// `finish_quantified_with_captures` reports any violation left and takes the whole record off the
+/// answer, which also keeps `param` out of published answers: `sanitize_vars` traverses only the
+/// answer type, so a parameter left here could hide a variable that never gets pinned.
+///
+/// The violation is recorded here rather than in `Solver::instantiation_errors` because an entry in
+/// that map means "solving this variable went wrong", which makes `with_snapshot` reject the
+/// enclosing subset check. This violation must reject nothing: keeping the answer the expected type
+/// supplied is the whole point of having an expected type.
+#[derive(Debug, Clone)]
+struct RestrictedAnswer {
+    param: Quantified,
+    error: Option<TypeVarSpecializationError>,
+}
+
+impl Variable {
+    fn answer(ty: Type) -> Self {
+        Self::Answer {
+            ty,
+            frozen: false,
+            restricted: None,
+        }
+    }
+
+    /// See [`RestrictedAnswer`].
+    fn restricted_answer(ty: Type, param: Quantified) -> Self {
+        Self::Answer {
+            ty,
+            frozen: false,
+            restricted: Some(Box::new(RestrictedAnswer { param, error: None })),
+        }
+    }
+
+    fn finished(q: &Quantified) -> Self {
+        if q.default().is_some() {
+            Variable::answer(q.as_gradual_type())
+        } else {
+            Variable::PartialQuantified(q.clone())
+        }
+    }
+}
+
+impl Display for Variable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Variable::PartialContained(_) => write!(f, "PartialContained"),
+            Variable::PartialQuantified(q) | Variable::Quantified { quantified: q, .. } => {
+                let label = if matches!(self, Variable::PartialQuantified(_)) {
+                    "PartialQuantified"
+                } else {
+                    "Quantified"
+                };
+                let k = q.kind;
+                if let Some(t) = &q.default {
+                    write!(f, "{label}({k}, default={t})")
+                } else {
+                    write!(f, "{label}({k})")
+                }
+            }
+            Variable::Recursive => write!(f, "Recursive"),
+            Variable::Unwrap(_) => write!(f, "Unwrap"),
+            Variable::Answer { ty, .. } => write!(f, "{ty}"),
+        }
+    }
+}
+
+/// A linear obligation to finalize these created Var IDs. Handles may contain
+/// Vars that later share union-find roots; they do not exclusively own roots.
+#[derive(Debug)]
+#[must_use = "Quantified vars must be finalized. Pass to finish_quantified."]
+pub struct QuantifiedHandle(Vec<Var>);
+
+impl QuantifiedHandle {
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn vars(&self) -> &[Var] {
+        &self.0
+    }
+
+    /// Split the handle into (vars in ty, vars not in ty)
+    pub fn partition_by(self, ty: &Type) -> (Self, Self) {
+        let vars_in_ty = ty.collect_maybe_placeholder_vars();
+        let (left, right) = self.0.into_iter().partition(|var| vars_in_ty.contains(var));
+        (QuantifiedHandle(left), QuantifiedHandle(right))
+    }
+}
+
+/// The solver tracks variables as a mapping from Var to Variable.
+/// We use union-find to unify two vars, using RefCell for interior
+/// mutability.
+///
+/// Note that RefCell means we need to be careful about how we access
+/// variables. Access is "mutable xor shared" like ordinary references,
+/// except with runtime instead of static enforcement.
+#[derive(Debug, Default)]
+struct Variables(SmallMap<Var, RefCell<VariableNode>>);
+
+/// A union-find node. We store the parent pointer in a Cell so that we
+/// can implement path compression. We use a separate Cell instead of using
+/// the RefCell around the node, because we might find that two vars point
+/// to the same root, which would cause us to borrow_mut twice and panic.
+#[derive(Clone, Debug)]
+enum VariableNode {
+    Goto(Cell<Var>),
+    Root(Box<Variable>, usize),
+}
+
+impl Display for VariableNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VariableNode::Goto(x) => write!(f, "Goto({})", x.get()),
+            VariableNode::Root(x, _) => write!(f, "{x}"),
+        }
+    }
+}
+
+impl Variables {
+    fn get<'a>(&'a self, x: Var) -> Ref<'a, Variable> {
+        let root = self.get_root(x);
+        let variable = self.get_node(root).borrow();
+        Ref::map(variable, |v| match v {
+            VariableNode::Root(v, _) => v.as_ref(),
+            _ => unreachable!(),
+        })
+    }
+
+    fn get_mut<'a>(&'a self, x: Var) -> RefMut<'a, Variable> {
+        let root = self.get_root(x);
+        let variable = self.get_node(root).borrow_mut();
+        RefMut::map(variable, |v| match v {
+            VariableNode::Root(v, _) => v.as_mut(),
+            _ => unreachable!(),
+        })
+    }
+
+    /// Unification for vars. Currently unification order matters, since unification is destructive.
+    /// This function will always preserve the "Variable" information from `y`, even when `x` has
+    /// higher rank, for backwards compatibility reasons. Otherwise, this is standard union by rank.
+    fn unify(&self, x: Var, y: Var) {
+        let x_root = self.get_root(x);
+        let y_root = self.get_root(y);
+        if x_root != y_root {
+            let mut x_node = self.get_node(x_root).borrow_mut();
+            let mut y_node = self.get_node(y_root).borrow_mut();
+            match (&mut *x_node, &mut *y_node) {
+                (VariableNode::Root(x, x_rank), VariableNode::Root(y, y_rank)) => {
+                    if x_rank > y_rank {
+                        // X has higher rank, preserve the Variable data from Y
+                        std::mem::swap(x, y);
+                        *y_node = VariableNode::Goto(Cell::new(x_root));
+                    } else {
+                        if x_rank == y_rank {
+                            *y_rank += 1;
+                        }
+                        *x_node = VariableNode::Goto(Cell::new(y_root));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a Var, Ref<'a, VariableNode>)> {
+        self.0.iter().map(|(x, y)| (x, y.borrow()))
+    }
+
+    /// Insert a fresh variable. If we already have a record of this variable,
+    /// this function will panic. To update an existing variable, use `update`.
+    fn insert_fresh(&mut self, x: Var, v: Variable) {
+        assert!(
+            self.0
+                .insert(x, RefCell::new(VariableNode::Root(Box::new(v), 0)))
+                .is_none()
+        );
+    }
+
+    /// Update an existing variable. If the variable does not exist, this will
+    /// panic. To insert a new variable, use `insert_fresh`.
+    fn update(&self, x: Var, v: Variable) {
+        *self.get_mut(x) = v;
+    }
+
+    fn recurse<'a>(&self, x: Var, recurser: &'a VarRecurser) -> Option<Guard<'a, Var>> {
+        let root = self.get_root(x);
+        recurser.recurse(root)
+    }
+
+    /// Get root using path compression.
+    fn get_root(&self, x: Var) -> Var {
+        match &*self.get_node(x).borrow() {
+            VariableNode::Root(..) => x,
+            VariableNode::Goto(parent) => {
+                let root = self.get_root(parent.get());
+                parent.set(root);
+                root
+            }
+        }
+    }
+
+    fn get_node(&self, x: Var) -> &RefCell<VariableNode> {
+        assert_ne!(
+            x,
+            Var::ZERO,
+            "Internal error: unexpected Var::ZERO, which is a dummy value."
+        );
+        self.0.get(&x).expect(VAR_LEAK)
+    }
+}
+
+/// A recurser for Vars which is aware of unification.
+/// Prefer this over Recurser<Var> and use Solver::recurse.
+pub struct VarRecurser(Recurser<Var>);
+
+impl VarRecurser {
+    pub fn new() -> Self {
+        Self(Recurser::new())
+    }
+
+    fn recurse<'a>(&'a self, var: Var) -> Option<Guard<'a, Var>> {
+        self.0.recurse(var)
+    }
+}
+
+#[derive(Debug)]
+pub enum PinError {
+    ImplicitPartialContained(TextRange),
+    UnfinishedQuantified(Quantified),
+}
+
+/// Snapshot of solver variable state.
+/// IMPORTANT: this struct is deliberately opaque.
+/// Var state should not be exposed outside this file.
+#[derive(Default)]
+pub struct VarSnapshot(Vec<(Var, VarState)>);
+
+struct VarState {
+    node: VariableNode,
+    variable: Variable,
+    error: Option<TypeVarSpecializationError>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SolverConfig {
+    pub infer_with_first_use: bool,
+    pub tensor_shapes: bool,
+    pub strict_callable_subtyping: bool,
+    pub strict_partial_subtyping: bool,
+    pub spec_compliant_overloads: bool,
+    pub legacy_overload_expansion: bool,
+    pub reveal_type_qualified_names: bool,
+}
+
+/// The restriction of a quantified variable: its declared one, unless hint decomposition has
+/// replaced it.
+fn effective_restriction<'a>(
+    quantified: &'a Quantified,
+    bound_override: &'a Option<Box<Restriction>>,
+) -> &'a Restriction {
+    bound_override
+        .as_deref()
+        .unwrap_or_else(|| quantified.restriction())
+}
+
+#[derive(Debug)]
+pub struct Solver {
+    variables: Mutex<Variables>,
+    instantiation_errors: RwLock<SmallMap<Var, TypeVarSpecializationError>>,
+    /// Cross-call cache for protocol conformance results.
+    /// Only caches results for types that contain no Vars, to ensure
+    /// soundness across different subset contexts.
+    protocol_cache: Mutex<HashMap<(Type, Type), Result<(), SubsetError>>>,
+    /// Cross-call cache for TypedDict subset results.
+    /// Like protocol_cache, only caches Var-free types.
+    typed_dict_cache: Mutex<HashMap<(TypedDict, TypedDict), Result<(), SubsetError>>>,
+    pub heap: TypeHeap,
+    pub config: SolverConfig,
+}
+
+impl Display for Solver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (x, y) in self.variables.lock().iter() {
+            writeln!(f, "{x} = {y}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A number chosen such that all practical types are less than this depth,
+/// but we don't want to stack overflow.
+const TYPE_LIMIT: usize = 20;
+
+/// Policy for how `resolve_vars` handles unsolved variables.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum VarExpansionPolicy {
+    /// Replace solved vars with their answers. Leave unsolved vars as `Var`.
+    Expand,
+    /// Like `Expand`, but also solve unsolved `Quantified`/`Unwrap` vars from
+    /// their accumulated bounds if possible.
+    ExpandWithBounds,
+    /// Like `ExpandWithBounds`, but force all remaining unsolved vars to
+    /// `Any`/gradual fallback and write the answer back to the solver.
+    Force,
+}
+
+/// A new bound to add to a variable.
+enum NewBound {
+    /// The new bound should replace the existing bound.
+    UpdateExistingBound(Type),
+    /// The new bound should be appended to the existing bounds.
+    AddBound(Type),
+}
+
+/// Result of `with_snapshot`, which performs an `is_subset_eq` call with var snapshotting.
+pub enum SubsetWithSnapshotResult {
+    /// `is_subset_eq` call was successful.
+    Ok,
+    /// `is_subset_eq` call failed.
+    Err(SubsetError),
+}
+
+impl SubsetWithSnapshotResult {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, SubsetWithSnapshotResult::Ok)
+    }
+}
+
+impl Solver {
+    /// Create a new solver.
+    pub fn new(config: SolverConfig) -> Self {
+        Self {
+            variables: Default::default(),
+            instantiation_errors: Default::default(),
+            protocol_cache: Default::default(),
+            typed_dict_cache: Default::default(),
+            heap: TypeHeap::new(),
+            config,
+        }
+    }
+
+    pub fn recurse<'a>(&self, var: Var, recurser: &'a VarRecurser) -> Option<Guard<'a, Var>> {
+        self.variables.lock().recurse(var, recurser)
+    }
+
+    /// Look up a cached protocol conformance result.
+    pub fn check_protocol_cache(&self, got: &Type, want: &Type) -> Option<Result<(), SubsetError>> {
+        self.protocol_cache
+            .lock()
+            .get(&(got.clone(), want.clone()))
+            .cloned()
+    }
+
+    /// Store a protocol conformance result.
+    pub fn store_protocol_cache<Ans: LookupAnswer>(
+        &self,
+        got: &Type,
+        want: &Type,
+        result: &Result<(), SubsetError>,
+        type_order: TypeOrder<'_, Ans>,
+    ) {
+        // SCC-local answers are provisional until the SCC converges. They may use
+        // stable cached results, but must not publish results to a persistent cache.
+        if type_order.has_active_scc() {
+            return;
+        }
+        self.protocol_cache
+            .lock()
+            .insert((got.clone(), want.clone()), result.clone());
+    }
+
+    pub fn check_typed_dict_cache(
+        &self,
+        got: &TypedDict,
+        want: &TypedDict,
+    ) -> Option<Result<(), SubsetError>> {
+        self.typed_dict_cache
+            .lock()
+            .get(&(got.clone(), want.clone()))
+            .cloned()
+    }
+
+    pub fn store_typed_dict_cache<Ans: LookupAnswer>(
+        &self,
+        got: &TypedDict,
+        want: &TypedDict,
+        result: &Result<(), SubsetError>,
+        type_order: TypeOrder<'_, Ans>,
+    ) {
+        // SCC-local answers are provisional until the SCC converges. They may use
+        // stable cached results, but must not publish results to a persistent cache.
+        if type_order.has_active_scc() {
+            return;
+        }
+        self.typed_dict_cache
+            .lock()
+            .insert((got.clone(), want.clone()), result.clone());
+    }
+
+    /// Force all non-recursive Vars in `vars`.
+    pub fn pin_placeholder_type(&self, var: Var, pin_partial_types: bool) -> Option<PinError> {
+        let variables = self.variables.lock();
+        let mut variable = variables.get_mut(var);
+        match &mut *variable {
+            Variable::Recursive | Variable::Answer { .. } => {
+                // Nothing to do if we have an answer already, and we want to skip recursive Vars
+                // which do not represent placeholder types.
+                None
+            }
+            Variable::Quantified { quantified: q, .. } => {
+                // A Variable::Quantified should always be finished (see `finish_quantified`) by
+                // the code that creates it, because we need to know when we're done collecting
+                // constraints. If we see a Quantified while pinning other placeholder types, that
+                // means we forgot to finish it.
+                let result = Some(PinError::UnfinishedQuantified(q.clone()));
+                *variable = Variable::answer(quantified_gradual_type(q));
+                result
+            }
+            Variable::PartialQuantified(q) => {
+                if pin_partial_types {
+                    *variable = Variable::answer(quantified_gradual_type(q));
+                }
+                None
+            }
+            Variable::PartialContained(range) if pin_partial_types => {
+                let range = *range;
+                *variable = Variable::answer(self.heap.mk_any_implicit());
+                Some(PinError::ImplicitPartialContained(range))
+            }
+            Variable::PartialContained(_) => None,
+            Variable::Unwrap(bounds) => {
+                *variable = Variable::answer(
+                    self.solve_bounds(mem::take(bounds))
+                        .unwrap_or_else(Type::any_implicit),
+                );
+                None
+            }
+        }
+    }
+
+    /// Resolve every solver variable reachable from `ty` without rewriting the type itself.
+    ///
+    /// Answers may retain `Type::Var` indirections, but after this returns every reachable
+    /// variable has a stable answer and can be read safely from another calculation.
+    pub fn sanitize_type_vars(&self, ty: &Type, pin_partial_types: bool) -> Vec<PinError> {
+        self.sanitize_vars(ty.collect_all_vars(), pin_partial_types)
+    }
+
+    pub fn sanitize_vars(&self, mut pending: Vec<Var>, pin_partial_types: bool) -> Vec<PinError> {
+        let mut seen = SmallSet::new();
+        let mut to_freeze = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(var) = pending.pop() {
+            if !seen.insert(var) {
+                continue;
+            }
+            if matches!(
+                &*self.variables.lock().get(var),
+                Variable::Answer { frozen: true, .. }
+            ) {
+                continue;
+            }
+            if let Some(error) = self.pin_placeholder_type(var, pin_partial_types) {
+                errors.push(error);
+            }
+            pending.extend(self.force_var(var).collect_all_vars());
+            to_freeze.push(var);
+        }
+        let variables = self.variables.lock();
+        for var in to_freeze {
+            if let Variable::Answer { frozen, .. } = &mut *variables.get_mut(var) {
+                *frozen = true;
+            }
+        }
+        errors
+    }
+
+    /// Check whether a Var represents a partial/placeholder type that would be
+    /// pinned by `pin_placeholder_type` with `pin_partial_types=true`.
+    /// This excludes Quantified (which represents an error case, not a normal partial type)
+    /// and focuses on the types created specifically for first-use inference.
+    pub fn var_is_partial(&self, var: Var) -> bool {
+        let variables = self.variables.lock();
+        let variable = variables.get(var);
+        matches!(
+            &*variable,
+            Variable::PartialQuantified(_) | Variable::PartialContained(_) | Variable::Unwrap(_)
+        )
+    }
+
+    /// Returns true if the given type is a Var that points to a partial variable.
+    pub fn is_partial(&self, ty: &Type) -> bool {
+        if let Type::Var(v) = ty {
+            self.var_is_partial(*v)
+        } else {
+            false
+        }
+    }
+
+    /// Only an unsolved quantified var can hold what a branch implies, since finishing the call
+    /// is what turns those into answers.
+    pub(crate) fn var_is_quantified(&self, var: Var) -> bool {
+        let variables = self.variables.lock();
+        matches!(&*variables.get(var), Variable::Quantified { .. })
+    }
+
+    /// The bound of the type variable that `var` stands for, if inference has not yet given it a
+    /// solution or bounds of its own.
+    pub(crate) fn unconstrained_typevar_bound(&self, var: Var) -> Option<Type> {
+        let variables = self.variables.lock();
+        match &*variables.get(var) {
+            Variable::Quantified {
+                quantified,
+                bounds,
+                bound_override,
+            } if bounds.is_empty() => match effective_restriction(quantified, bound_override) {
+                Restriction::Bound(bound) => Some(bound.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Replace a type variable's declared bound during speculative hint decomposition.
+    pub(crate) fn set_typevar_bound(&self, var: Var, bound: Type) {
+        let variables = self.variables.lock();
+        let mut variable = variables.get_mut(var);
+        let Variable::Quantified { bound_override, .. } = &mut *variable else {
+            unreachable!("only an unconstrained type variable has its bound replaced")
+        };
+        *bound_override = Some(Box::new(Restriction::Bound(bound)));
+    }
+
+    /// The vars an argument could fill in that are still waiting for an answer.
+    pub(crate) fn unsolved_argument_vars(&self, argument: &MatchedArgument) -> Vec<Var> {
+        let variables = self.variables.lock();
+        argument
+            .target_vars
+            .iter()
+            .copied()
+            .filter(|var| matches!(&*variables.get(*var), Variable::Quantified { .. }))
+            .collect()
+    }
+
+    fn snapshot_one_var(
+        variables: &Variables,
+        errors: &SmallMap<Var, TypeVarSpecializationError>,
+        var: Var,
+    ) -> VarState {
+        VarState {
+            node: variables.get_node(var).borrow().clone(),
+            variable: variables.get(var).clone(),
+            error: errors.get(&var).cloned(),
+        }
+    }
+
+    /// Snapshot the current state of the given vars so they can be restored later.
+    pub fn snapshot_exact_vars(&self, vars: &[Var]) -> VarSnapshot {
+        if vars.is_empty() {
+            return VarSnapshot(Vec::new()); // avoid acquiring locks
+        }
+        let variables = self.variables.lock();
+        let errors = self.instantiation_errors.read();
+        VarSnapshot(
+            vars.iter()
+                .map(|var| (*var, Self::snapshot_one_var(&variables, &errors, *var)))
+                .collect(),
+        )
+    }
+
+    /// Snapshots pre-existing variable state that ordinary inference may mutate while processing
+    /// `types`, for rollback after a speculative inference attempt.
+    ///
+    /// Unlike `snapshot_exact_vars`, whose caller supplies the complete set, this follows union-find
+    /// parents and variables referenced by current bounds or answers. Snapshotting only variables
+    /// spelled directly in the input types is insufficient because ordinary inference can mutate
+    /// a variable reached solely through this existing solver state. Variables created after the
+    /// snapshot remain owned by the caller and are not restored by this operation. The snapshot
+    /// covers variable nodes, values, and instantiation errors; it does not capture caches or
+    /// other solver state.
+    pub(crate) fn snapshot_reachable_vars(&self, types: &[&Type]) -> VarSnapshot {
+        let pending: Vec<Var> = types.iter().flat_map(|ty| ty.collect_all_vars()).collect();
+        if pending.is_empty() {
+            return VarSnapshot(Vec::new());
+        }
+
+        let variables = self.variables.lock();
+        let errors = self.instantiation_errors.read();
+        VarSnapshot(
+            Self::reachable_vars(&variables, pending)
+                .into_iter()
+                .map(|var| (var, Self::snapshot_one_var(&variables, &errors, var)))
+                .collect(),
+        )
+    }
+
+    /// Returns the vars in `pending` together with every var reachable from them through
+    /// union-find parents and the vars referenced by current bounds or answers.
+    fn reachable_vars(variables: &Variables, mut pending: Vec<Var>) -> SmallSet<Var> {
+        let mut seen = SmallSet::new();
+        while let Some(var) = pending.pop() {
+            if !seen.insert(var) {
+                continue;
+            }
+
+            match &*variables.get_node(var).borrow() {
+                VariableNode::Goto(parent) => {
+                    pending.push(parent.get());
+                }
+                VariableNode::Root(variable, _) => match variable.as_ref() {
+                    Variable::Quantified {
+                        quantified, bounds, ..
+                    } => {
+                        pending.extend(
+                            Type::Quantified(Box::new(quantified.clone())).collect_all_vars(),
+                        );
+                        pending.extend(
+                            bounds
+                                .lower
+                                .iter()
+                                .chain(&bounds.upper)
+                                .flat_map(Type::collect_all_vars),
+                        );
+                    }
+                    Variable::Unwrap(bounds) => pending.extend(
+                        bounds
+                            .lower
+                            .iter()
+                            .chain(&bounds.upper)
+                            .flat_map(Type::collect_all_vars),
+                    ),
+                    Variable::Answer { ty, .. } => pending.extend(ty.collect_all_vars()),
+                    Variable::PartialQuantified(quantified) => pending
+                        .extend(Type::Quantified(Box::new(quantified.clone())).collect_all_vars()),
+                    Variable::PartialContained(_) | Variable::Recursive => {}
+                },
+            }
+        }
+        seen
+    }
+
+    /// Returns the `candidates` that are reachable from `sources` through unification, bounds,
+    /// and answers.
+    pub(crate) fn vars_reachable_from(
+        &self,
+        sources: &SmallSet<Var>,
+        candidates: impl Iterator<Item = Var>,
+    ) -> SmallSet<Var> {
+        let variables = self.variables.lock();
+        let reached = Self::reachable_vars(&variables, sources.iter().copied().collect());
+        candidates
+            .filter(|var| reached.contains(&variables.get_root(*var)))
+            .collect()
+    }
+
+    /// Restore vars to a previously saved snapshot.
+    pub fn restore_vars(&self, snapshot: VarSnapshot) {
+        if snapshot.0.is_empty() {
+            return; // avoid acquiring locks
+        }
+        let variables = self.variables.lock();
+        let mut errors = self.instantiation_errors.write();
+        // Restore nodes first, so all roots are correct before we write to them with `update`.
+        let mut pending_variables = Vec::with_capacity(snapshot.0.len());
+        for (var, state) in snapshot.0 {
+            *variables.get_node(var).borrow_mut() = state.node;
+            pending_variables.push((var, state.variable, state.error));
+        }
+        for (var, variable, error) in pending_variables {
+            variables.update(var, variable);
+            match error {
+                Some(e) => {
+                    errors.insert(var, e);
+                }
+                None => {
+                    if errors.contains_key(&var) {
+                        errors.shift_remove(&var);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshots the given vars, calls `f`, and rolls back the vars if the call fails.
+    ///
+    /// This rolls back var state only. Callers that also hold subset-checking state should use
+    /// `Subset::with_snapshot`.
+    pub fn with_snapshot(
+        &self,
+        vars: &[Var],
+        f: impl FnOnce() -> Result<(), SubsetError>,
+    ) -> SubsetWithSnapshotResult {
+        if vars.is_empty() {
+            // Fast path - no var snapshotting needed.
+            return f().map_or_else(SubsetWithSnapshotResult::Err, |_| {
+                SubsetWithSnapshotResult::Ok
+            });
+        }
+        let snapshot = self.snapshot_exact_vars(vars);
+        let res = match (f(), self.has_new_instantiation_errors(&snapshot)) {
+            (Ok(()), false) => SubsetWithSnapshotResult::Ok,
+            (Ok(()), true) => SubsetWithSnapshotResult::Err(SubsetError::Other),
+            (Err(e), _) => SubsetWithSnapshotResult::Err(e),
+        };
+        if !res.is_ok() {
+            self.restore_vars(snapshot);
+        }
+        res
+    }
+
+    // Partially sort a list of types for matching (is_subset_eq).
+    // Sort non-var elements before var elements, so that if we match a non-var, we
+    // don't pin the vars. Within var-containing members, try wrapped vars (e.g.
+    // `type[T]`) before bare vars (e.g. `T`), so that more specific patterns are
+    // tried first. This prevents cases like `T | type[T]` from incorrectly matching
+    // bare `T` when `type[T]` would produce a better (bound-satisfying) solution.
+    pub fn partial_sort_by_vars<'a>(
+        &self,
+        ts: &'a [Type],
+    ) -> impl Iterator<Item = (&'a Type, Vec<Var>)> {
+        let (vars, nonvars): (Vec<_>, Vec<_>) = ts.iter().partition_map(|t| {
+            let vs = t.collect_maybe_placeholder_vars();
+            if !vs.is_empty() {
+                Either::Left((t, vs))
+            } else {
+                Either::Right((t, vs))
+            }
+        });
+        let (bare_vars, wrapped_vars): (Vec<_>, Vec<_>) = vars
+            .into_iter()
+            .partition(|(t, _)| matches!(t, Type::Var(_)));
+        nonvars.into_iter().chain(wrapped_vars).chain(bare_vars)
+    }
+
+    pub(crate) fn extract_overload_branch(
+        &self,
+        branch_index: usize,
+        vars: &[Var],
+        param_vars: &SmallSet<Var>,
+        free_quantified_vars_in_call: &SmallSet<Var>,
+    ) -> OverloadBranch {
+        let variables = self.variables.lock();
+        let values: SmallMap<Var, Variable> = vars
+            .iter()
+            .map(|var| (*var, variables.get(*var).clone()))
+            .collect();
+        let free_quantified_vars: SmallSet<Var> = vars
+            .iter()
+            .copied()
+            .filter(|var| free_quantified_vars_in_call.contains(var))
+            .collect();
+        let instantiation_errors = self.instantiation_errors.read();
+        let errors = vars
+            .iter()
+            .filter_map(|var| instantiation_errors.get(var).cloned())
+            .collect();
+        OverloadBranch {
+            branch_index,
+            values,
+            param_vars: param_vars.clone(),
+            free_quantified_vars,
+            errors,
+        }
+    }
+
+    /// Build a result once per overload table row, with that row's Var answers installed, so the
+    /// result sees one consistent world at a time.
+    pub(crate) fn per_row<T>(&self, table: &OverloadTable, build: impl Fn() -> T) -> Vec1<T> {
+        if table.rows.is_empty() {
+            // When there are no rows, build once from the solver's ordinary state.
+            return Vec1::new(build());
+        }
+        Vec1::try_from_vec(
+            table
+                .rows
+                .iter()
+                .map(|row| {
+                    // Finalized rows contain only variables whose answer remains row-dependent.
+                    let vars: Vec<Var> = row.values.keys().copied().collect();
+                    let snapshot = self.snapshot_exact_vars(&vars);
+                    {
+                        let variables = self.variables.lock();
+                        for (var, ty) in &row.values {
+                            variables.update(*var, Variable::answer(ty.clone()));
+                        }
+                    }
+                    let built = build();
+                    self.restore_vars(snapshot);
+                    built
+                })
+                .collect(),
+        )
+        .expect("a nonempty overload table produces at least one result")
+    }
+
+    /// Finish the type returned from a function call.
+    pub fn for_return_boundary(&self, mut t: Type) -> (Type, Vec<ShapeError>) {
+        self.resolve_vars(&mut t, VarExpansionPolicy::Expand, &VarRecurser::new());
+        t = t.finalize_exposed_free_quantifieds();
+        let type_level_dsl_errors = t.finalize_type_level_dsl_at_boundary();
+        self.erase_unsolved_variables(&mut t);
+        self.simplify_mut(&mut t);
+        (t, type_level_dsl_errors)
+    }
+
+    /// Expand a type. All variables that have been bound will be replaced with non-Var types,
+    /// even if they are recursive (using `Any` for self-referential occurrences).
+    /// Variables that have not yet been bound will remain as Var.
+    ///
+    /// In addition, if the type exceeds a large depth, it will be replaced with `Any`.
+    pub fn expand(&self, mut t: Type) -> Type {
+        self.expand_mut(&mut t);
+        t
+    }
+
+    /// Like `expand`, but when you have a `&mut`.
+    pub fn expand_mut(&self, t: &mut Type) {
+        self.resolve_vars(t, VarExpansionPolicy::Expand, &VarRecurser::new());
+        // After we substitute bound variables, we may be able to simplify some types
+        self.simplify_mut(t);
+    }
+
+    /// Unified var resolution traversal. Recursively walks the type tree, resolving
+    /// `Var`s according to the given policy:
+    /// - `Expand`: replace solved vars, leave unsolved as-is
+    /// - `ExpandWithBounds`: also solve unsolved vars from their bounds if possible
+    /// - `Force`: like ExpandWithBounds, but force unsolved vars to Any/gradual fallback
+    fn resolve_vars(&self, t: &mut Type, policy: VarExpansionPolicy, recurser: &VarRecurser) {
+        self.resolve_vars_with_limit(t, TYPE_LIMIT, policy, recurser, None);
+    }
+
+    fn resolve_vars_with_limit(
+        &self,
+        t: &mut Type,
+        limit: usize,
+        policy: VarExpansionPolicy,
+        recurser: &VarRecurser,
+        query_var: Option<Var>,
+    ) {
+        if limit == 0 {
+            *t = self.heap.mk_any_implicit();
+        } else if let Type::Var(x) = t {
+            let query_var = query_var.or(Some(*x));
+            let lock = self.variables.lock();
+            if let Some(_guard) = lock.recurse(*x, recurser) {
+                let variable = lock.get(*x);
+                match &*variable {
+                    Variable::Answer { ty, .. } => {
+                        *t = ty.clone();
+                        drop(variable);
+                        drop(lock);
+                        self.resolve_vars_with_limit(t, limit - 1, policy, recurser, query_var);
+                    }
+                    Variable::Quantified {
+                        quantified: _,
+                        bounds,
+                        ..
+                    }
+                    | Variable::Unwrap(bounds)
+                        if policy == VarExpansionPolicy::ExpandWithBounds
+                            && let Some(bound) = self.solve_bounds(bounds.clone()) =>
+                    {
+                        *t = bound;
+                        drop(variable);
+                        drop(lock);
+                        self.resolve_vars_with_limit(t, limit - 1, policy, recurser, query_var);
+                    }
+                    _ if policy == VarExpansionPolicy::Force => {
+                        drop(variable);
+                        let mut e = lock.get_mut(*x);
+                        let ty = match &mut *e {
+                            Variable::Quantified {
+                                quantified: q,
+                                bounds,
+                                ..
+                            } => self
+                                .solve_bounds(mem::take(bounds))
+                                .unwrap_or_else(|| quantified_gradual_type(q)),
+                            Variable::PartialQuantified(q) => quantified_gradual_type(q),
+                            Variable::Unwrap(bounds) => self
+                                .solve_bounds(mem::take(bounds))
+                                .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                            _ => self.heap.mk_any_implicit(),
+                        };
+                        *e = Variable::answer(ty.clone());
+                        *t = ty;
+                        drop(e);
+                        drop(lock);
+                        self.resolve_vars_with_limit(t, limit - 1, policy, recurser, query_var);
+                    }
+                    _ => {}
+                }
+            } else {
+                *t = self.heap.mk_any_implicit();
+            }
+        } else {
+            t.recurse_mut(&mut |t| {
+                self.resolve_vars_with_limit(t, limit - 1, policy, recurser, query_var)
+            });
+        }
+    }
+
+    /// Expand `Variable::Unwrap` to its answer or its lower bounds accumulated so far.
+    pub fn expand_unwrap(&self, v: Var) -> Type {
+        let variables = self.variables.lock();
+        match &*variables.get(v) {
+            Variable::Answer { ty, .. } => ty.clone(),
+            Variable::Unwrap(bounds) if let Some(bound) = self.solve_bounds(bounds.clone()) => {
+                bound
+            }
+            _ => v.to_type(&self.heap),
+        }
+    }
+
+    /// Public wrapper to expand a dimension type by resolving bound Vars and
+    /// canonicalizing the resulting symbolic dimension expression.
+    /// Used by subset checking before comparing dimension expressions.
+    pub fn expand_with_bounds(&self, dim_ty: &mut Type) {
+        self.resolve_vars(
+            dim_ty,
+            VarExpansionPolicy::ExpandWithBounds,
+            &VarRecurser::new(),
+        );
+        canonicalize_ints_in_type(dim_ty);
+    }
+
+    /// Given a `Var`, ensures that the solver has an answer for it (or inserts Any if not already),
+    /// and returns that answer. Note that if the `Var` is already bound to something that contains a
+    /// `Var` (including itself), then we will return the answer.
+    pub fn force_var(&self, v: Var) -> Type {
+        let lock = self.variables.lock();
+        let mut e = lock.get_mut(v);
+        match &mut *e {
+            Variable::Answer { ty, .. } => ty.clone(),
+            _ => {
+                let ty = match &mut *e {
+                    Variable::Quantified {
+                        quantified: q,
+                        bounds,
+                        ..
+                    } => self
+                        .solve_bounds(mem::take(bounds))
+                        .unwrap_or_else(|| quantified_gradual_type(q)),
+                    Variable::PartialQuantified(q) => quantified_gradual_type(q),
+                    Variable::Unwrap(bounds) => self
+                        .solve_bounds(mem::take(bounds))
+                        .unwrap_or_else(|| self.heap.mk_any_implicit()),
+                    _ => self.heap.mk_any_implicit(),
+                };
+                *e = Variable::answer(ty.clone());
+                ty
+            }
+        }
+    }
+
+    /// A version of `force` that works in-place on a `Type`.
+    pub fn force_mut(&self, t: &mut Type) {
+        self.resolve_vars(t, VarExpansionPolicy::Force, &VarRecurser::new());
+        // After forcing, we might be able to simplify some unions
+        self.simplify_mut(t);
+    }
+
+    /// Simplify a type as much as we can.
+    fn simplify_mut(&self, t: &mut Type) {
+        t.transform_mut(&mut |x| {
+            if let Type::Union(u) = x {
+                let mut merged = unions(mem::take(&mut u.members), &self.heap);
+                // Preserve union display names during simplification
+                if let Type::Union(merged_u) = &mut merged {
+                    merged_u.display_name.0 = u.display_name.0.take();
+                }
+                *x = merged;
+            }
+            if let Type::Intersect(y) = x {
+                *x = intersect(mem::take(&mut y.0), y.1.clone(), &self.heap);
+            }
+            if let Type::Tuple(tuple) = x {
+                *x = simplify_tuples_and_distribute_unpacking(mem::take(tuple), &self.heap);
+            }
+            // When a param spec is resolved, collapse any Concatenate and Callable types that use it
+            if let Type::Concatenate(ts, inner) = x
+                && let Type::ParamSpecValue(paramlist) = &mut **inner
+            {
+                let params = mem::take(paramlist).prepend_types(ts).into_owned();
+                *x = self.heap.mk_param_spec_value(params);
+            }
+            if let Type::Concatenate(ts, inner) = x
+                && let Type::Concatenate(ts2, pspec) = &mut **inner
+            {
+                let combined: Box<[PrefixParam]> = ts.iter().chain(ts2.iter()).cloned().collect();
+                *x = self.heap.mk_concatenate(combined, (**pspec).clone());
+            }
+            let (callable, kind) = match x {
+                Type::Callable(c) => (Some(&mut **c), None),
+                Type::Function(f) => (Some(&mut f.signature), Some(&mut f.metadata)),
+                _ => (None, None),
+            };
+            if let Some(Callable {
+                params: Params::ParamSpec(ts, pspec),
+                ret,
+            }) = callable
+            {
+                let new_callable = |c| {
+                    if let Some(k) = kind {
+                        self.heap.mk_function(Function {
+                            signature: c,
+                            metadata: k.clone(),
+                        })
+                    } else {
+                        self.heap.mk_callable_from(c)
+                    }
+                };
+                match pspec {
+                    Type::ParamSpecValue(paramlist) => {
+                        let params = mem::take(paramlist).prepend_types(ts).into_owned();
+                        let new_callable = new_callable(Callable::list(params, ret.clone()));
+                        *x = new_callable;
+                    }
+                    Type::Ellipsis if ts.is_empty() => {
+                        *x = new_callable(Callable::ellipsis(ret.clone()));
+                    }
+                    Type::Concatenate(ts2, pspec) => {
+                        *x = new_callable(Callable::concatenate(
+                            ts.iter().chain(ts2.iter()).cloned().collect(),
+                            (**pspec).clone(),
+                            ret.clone(),
+                        ));
+                    }
+                    _ => {}
+                }
+            } else if let Some(Callable {
+                params: Params::List(param_list),
+                ret: _,
+            }) = callable
+            {
+                // When a Varargs has a concrete unpacked tuple, expand it to positional-only params
+                // e.g., (*args: Unpack[tuple[int, str]]) -> (int, str, /)
+                let mut new_params = Vec::new();
+                for param in mem::take(param_list).into_items() {
+                    match param {
+                        Param::Varargs(_, Type::Unpack(inner))
+                            if matches!(*inner, Type::Tuple(Tuple::Concrete(_))) =>
+                        {
+                            // Guarded by matches! above
+                            let Type::Tuple(Tuple::Concrete(elts)) = *inner else {
+                                unreachable!("guarded by matches! above")
+                            };
+                            for elt in elts {
+                                new_params.push(Param::PosOnly(None, elt, Required::Required));
+                            }
+                        }
+                        _ => new_params.push(param),
+                    }
+                }
+                *param_list = ParamList::new(new_params);
+            }
+            simplify_shape_type(x);
+        });
+    }
+
+    /// In unions, convert any Variable::Unsolved without a default into Never.
+    /// See test::generic_basic::test_typevar_or_none for why we need to do this.
+    fn erase_unsolved_variables(&self, t: &mut Type) {
+        t.transform_mut(&mut |x| match x {
+            Type::Union(u) => {
+                let xs = &mut u.members;
+                let erase_type = |x: &Type| match x {
+                    Type::Var(v) => {
+                        let lock = self.variables.lock();
+                        let variable = lock.get(*v);
+                        match &*variable {
+                            Variable::PartialQuantified(q) => {
+                                let erase = q.default.is_none();
+                                drop(variable);
+                                drop(lock);
+                                erase
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                let mut erase_xs = Vec::new();
+                // We only want to erase variables from the union if
+                // (1) there is at least one variable to erase, and
+                // (2) we don't erase the entire union.
+                let mut should_erase = false;
+                for x in xs.iter() {
+                    let erase = erase_type(x);
+                    if let Some(prev) = erase_xs.last()
+                        && *prev != erase
+                    {
+                        should_erase = true;
+                    }
+                    erase_xs.push(erase);
+                }
+                if should_erase {
+                    for (x, erase) in xs.iter_mut().zip(erase_xs) {
+                        if erase {
+                            *x = self.heap.mk_never();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        })
+    }
+
+    /// Like [`expand`], but also forces variables that haven't yet been bound
+    /// to become `Any`, both in the result and in the `Solver` going forward.
+    /// Guarantees there will be no `Var` in the result.
+    ///
+    /// In addition, if the type exceeds a large depth, it will be replaced with `Any`.
+    pub fn force(&self, mut t: Type) -> Type {
+        self.force_mut(&mut t);
+        t
+    }
+
+    /// Generate a fresh variable based on code that is unspecified inside a container,
+    /// e.g. `[]` with an unknown type of element.
+    /// The `range` parameter is the location of the empty container literal.
+    pub fn fresh_partial_contained(&self, uniques: &UniqueFactory, range: TextRange) -> Var {
+        let v = Var::new(uniques);
+        self.variables
+            .lock()
+            .insert_fresh(v, Variable::PartialContained(range));
+        v
+    }
+
+    // Generate a fresh variable used to decompose a type, e.g. getting T from Awaitable[T]
+    // Also used for lambda parameters, where the var is created during bindings, but solved during
+    // the answers phase by contextually typing against an annotation.
+    pub fn fresh_unwrap(&self, uniques: &UniqueFactory) -> Var {
+        let v = Var::new(uniques);
+        self.variables
+            .lock()
+            .insert_fresh(v, Variable::Unwrap(Bounds::new()));
+        v
+    }
+
+    fn fresh_quantified_vars(
+        &self,
+        qs: &[&Quantified],
+        uniques: &UniqueFactory,
+    ) -> QuantifiedHandle {
+        let vs = qs.map(|_| Var::new(uniques));
+        let mut lock = self.variables.lock();
+        for (v, q) in vs.iter().zip(qs.iter()) {
+            lock.insert_fresh(
+                *v,
+                Variable::Quantified {
+                    quantified: (*q).clone(),
+                    bounds: Bounds::new(),
+                    bound_override: None,
+                },
+            );
+        }
+        QuantifiedHandle(vs)
+    }
+
+    /// Generate fresh variables and substitute them in replacing a `Forall`.
+    pub fn fresh_quantified(
+        &self,
+        params: &TParams,
+        t: Type,
+        uniques: &UniqueFactory,
+    ) -> (QuantifiedHandle, Type) {
+        if params.is_empty() {
+            return (QuantifiedHandle::empty(), t);
+        }
+
+        let qs = params.iter().collect::<Vec<_>>();
+        let vs = self.fresh_quantified_vars(&qs, uniques);
+        let ts = vs.0.map(|v| v.to_type(&self.heap));
+        let t = t.subst(&qs.into_iter().zip(&ts).collect());
+        (vs, t)
+    }
+
+    /// Partially instantiate a generic function using the first argument.
+    /// Mainly, we use this to create a function type from a bound function,
+    /// but also for calling the staticmethod `__new__`.
+    ///
+    /// Unlike fresh_quantified, which creates vars for every tparam, we only
+    /// instantiate the tparams that appear in the first parameter.
+    ///
+    /// Returns a callable with the first parameter removed, substituted with
+    /// instantiations provided by applying the first argument.
+    pub fn instantiate_callable_self(
+        &self,
+        tparams: &TParams,
+        self_obj: &Type,
+        self_param: &Type,
+        mut callable: Callable,
+        uniques: &UniqueFactory,
+        is_subset: &mut dyn FnMut(&Type, &Type) -> bool,
+    ) -> Callable {
+        // Collect tparams that appear in the first parameter.
+        let mut qs = Vec::new();
+        self_param.for_each_quantified(&mut |q| {
+            if tparams.iter().any(|tparam| *tparam == *q) {
+                qs.push(q);
+            }
+        });
+
+        if qs.is_empty() {
+            return callable;
+        }
+
+        // Substitute fresh vars for the quantifieds in the self param.
+        let vs = self.fresh_quantified_vars(&qs, uniques);
+        let ts = vs.0.map(|v| v.to_type(&self.heap));
+        let mp = qs.into_iter().zip(&ts).collect();
+        let self_param = self_param.clone().subst(&mp);
+        callable.visit_mut(&mut |t| t.subst_mut(&mp));
+        drop(mp);
+
+        // Solve for the vars created above.
+        is_subset(self_obj, &self_param);
+
+        // Either we have solutions, or we fall back to Any. We don't want Variable::Partial.
+        // If this errors, then the definition is invalid, and we should have raised an error at
+        // the definition site.
+        let _specialization_errors = self.finish_quantified_with_captures(
+            vs,
+            false,
+            &mut |_constraints| Some(VarSnapshot::default()),
+            &mut ArgumentCaptures::default(),
+        );
+
+        callable
+    }
+
+    pub fn has_instantiation_errors(&self, vs: &QuantifiedHandle) -> bool {
+        let lock = self.instantiation_errors.read();
+        vs.0.iter().any(|v| lock.contains_key(v))
+    }
+
+    /// Have these vars picked up any new instantiation errors since they were snapshotted?
+    pub fn has_new_instantiation_errors(&self, snapshot: &VarSnapshot) -> bool {
+        let lock = self.instantiation_errors.read();
+        snapshot
+            .0
+            .iter()
+            .any(|(v, state)| state.error.is_none() && lock.contains_key(v))
+    }
+
+    /// Add a bound to the variable if it is a Quantified or Unwrap.
+    ///
+    /// Given two recorded bounds `A` and `B` on the same variable where `B <: A`:
+    ///
+    /// - For *lower* bounds we keep `A`. From `A <: T` we get `B <: T` (transitivity
+    ///   through `B <: A`), so `A` carries strictly more information.
+    /// - For *upper* bounds we keep `B`. From `T <: B` we get `T <: A` (transitivity
+    ///   through `B <: A`), so `B` carries strictly more information. Without this,
+    ///   a tight bound like `T <: int` would be discarded in favor of a looser
+    ///   `T <: int | () -> int` that was recorded first.
+    fn get_new_bound(
+        &self,
+        existing_bound: Option<Type>,
+        mut bound: Type,
+        quantified_kind: Option<QuantifiedKind>,
+        is_upper: bool,
+        is_subset: &mut dyn FnMut(&Type, &Type) -> Result<(), SubsetError>,
+    ) -> NewBound {
+        if quantified_kind == Some(QuantifiedKind::IntVar) {
+            // `validate_bound_consistency` accepted this bound, so the
+            // same IntVar normalization must succeed before storing it.
+            bound = type_as_intvar_solution(&bound)
+                .expect("successful IntVar bound check must normalize")
+        }
+        // Check if the new bound can absorb or be absorbed into the existing bound.
+        // Examples (lower bound): `float` absorbs `int`, `list[Any]` absorbs `list[int]`.
+        // TODO(https://github.com/facebook/pyrefly/issues/105): there are a few fishy things:
+        // * We're only checking against the first bound.
+        // * We're keeping `Any` separate so it can be filtered out in `solve_one_bounds`.
+        // * We're relying on `is_subset` to pin vars.
+        let updated_bound = existing_bound.and_then(|first| {
+            let can_absorb = |t: &Type| {
+                !t.is_any()
+                    && !(self.config.tensor_shapes && is_gradual_shape_bound(t))
+                    && t.collect_all_vars().is_empty()
+            };
+            if !can_absorb(&first) || !can_absorb(&bound) {
+                let _ = is_subset(&bound, &first); // Ignore the result, just pin vars
+                None
+            } else if is_subset(&bound.materialize(), &first).is_ok() {
+                // `bound <: first`: lower bounds keep `first` (the supertype), upper
+                // bounds keep `bound` (the subtype).
+                Some(if is_upper { bound.clone() } else { first })
+            } else if is_subset(&first.materialize(), &bound).is_ok() {
+                // `first <: bound`: lower bounds adopt `bound` (the supertype), upper
+                // bounds keep `first` (the subtype).
+                Some(if is_upper { first } else { bound.clone() })
+            } else {
+                None
+            }
+        });
+        if let Some(updated_bound) = updated_bound {
+            NewBound::UpdateExistingBound(updated_bound)
+        } else {
+            NewBound::AddBound(bound)
+        }
+    }
+
+    fn add_bound(&self, bounds: &mut Vec<Type>, bound: NewBound) {
+        match bound {
+            NewBound::UpdateExistingBound(new_first) => {
+                if let Some(old_first) = bounds.first_mut() {
+                    *old_first = new_first;
+                } else {
+                    *bounds = vec![new_first];
+                }
+            }
+            NewBound::AddBound(bound) => {
+                bounds.push(bound);
+            }
+        }
+    }
+
+    fn validate_bound_consistency(
+        &self,
+        bound: &Type,
+        existing_bounds: &Vec<Type>,
+        kind: QuantifiedKind,
+    ) -> Result<(), SubsetError> {
+        if kind == QuantifiedKind::IntVar && type_as_intvar_solution(bound).is_none() {
+            return Err(SubsetError::Other);
+        }
+        if kind == QuantifiedKind::TypeVarTuple
+            && let Type::Tuple(Tuple::Concrete(elts)) = bound
+        {
+            // Validate that the tuple length is consistent.
+            for t in existing_bounds {
+                if let Type::Tuple(Tuple::Concrete(existing_elts)) = t {
+                    if elts.len() == existing_elts.len() {
+                        // We only need to validate against the first tuple encountered.
+                        // If subsequent ones are a different length, we would've already reported
+                        // a violation when adding them.
+                        return Ok(());
+                    } else {
+                        return Err(SubsetError::Other);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared core of [`Self::add_lower_bound`] (`is_upper == false`) and
+    /// [`Self::add_upper_bound`] (`is_upper == true`).
+    ///
+    /// `is_subset` is called without holding the `variables` lock, because it
+    /// recurses into `is_subset_eq` which re-locks `variables`.
+    fn add_var_bound(
+        &self,
+        v: Var,
+        bound: Type,
+        is_upper: bool,
+        is_subset: &mut dyn FnMut(&Type, &Type) -> Result<(), SubsetError>,
+    ) -> Result<(), SubsetError> {
+        let lock = self.variables.lock();
+        let e = lock.get(v);
+        let (bounds, quantified_kind) = match &*e {
+            Variable::Quantified {
+                bounds, quantified, ..
+            } => (bounds, Some(quantified.kind())),
+            Variable::Unwrap(bounds) => (bounds, None),
+            _ => return Ok(()),
+        };
+        let res = quantified_kind.map_or(Ok(()), |kind| {
+            self.validate_bound_consistency(
+                &bound,
+                if is_upper {
+                    &bounds.upper
+                } else {
+                    &bounds.lower
+                },
+                kind,
+            )
+        });
+        let (first_bound, opposite_bounds) = if is_upper {
+            (bounds.upper.first().cloned(), bounds.lower.clone())
+        } else {
+            (bounds.lower.first().cloned(), bounds.upper.clone())
+        };
+        drop(e);
+        drop(lock);
+        // Generic fallback bounds cannot make a concrete bound inconsistent.
+        let opposite_bound = if bound.is_placeholder() {
+            None
+        } else {
+            self.get_current_bound(
+                opposite_bounds
+                    .into_iter()
+                    .filter(|bound| !bound.is_placeholder())
+                    .collect(),
+            )
+        };
+        let res = res.and_then(|_| {
+            // The new bound must be consistent with the opposite-side bound via transitivity.
+            let consistent = if is_upper {
+                opposite_bound.map(|lower_bound| is_subset(&lower_bound, &bound))
+            } else {
+                opposite_bound.map(|upper_bound| is_subset(&bound, &upper_bound))
+            };
+            consistent.unwrap_or(Ok(()))
+        });
+        let new_bound = if res.is_ok() {
+            self.get_new_bound(first_bound, bound, quantified_kind, is_upper, is_subset)
+        } else {
+            // TODO(https://github.com/facebook/pyrefly/issues/105): don't throw away the bound.
+            NewBound::AddBound(Type::any_error())
+        };
+        let lock = self.variables.lock();
+        match &mut *lock.get_mut(v) {
+            Variable::Quantified {
+                quantified: _,
+                bounds,
+                ..
+            }
+            | Variable::Unwrap(bounds) => self.add_bound(
+                if is_upper {
+                    &mut bounds.upper
+                } else {
+                    &mut bounds.lower
+                },
+                new_bound,
+            ),
+            _ => {}
+        }
+        res
+    }
+
+    pub fn add_lower_bound(
+        &self,
+        v: Var,
+        bound: Type,
+        is_subset: &mut dyn FnMut(&Type, &Type) -> Result<(), SubsetError>,
+    ) -> Result<(), SubsetError> {
+        self.add_var_bound(v, bound, false, is_subset)
+    }
+
+    pub fn add_upper_bound(
+        &self,
+        v: Var,
+        bound: Type,
+        is_subset: &mut dyn FnMut(&Type, &Type) -> Result<(), SubsetError>,
+    ) -> Result<(), SubsetError> {
+        self.add_var_bound(v, bound, true, is_subset)
+    }
+
+    /// Get current bound from a set of bounds of an unfinished variable.
+    /// TODO(https://github.com/facebook/pyrefly/issues/105): the current solver design requires us
+    /// to repeatedly clone and union together intermediate bounds to validate every new bound we
+    /// add. Consider a less wasteful strategy, such as validating when we finish the variable.
+    fn get_current_bound(&self, bounds: Vec<Type>) -> Option<Type> {
+        if bounds.is_empty() {
+            return None;
+        }
+        Some(unions(bounds, &self.heap))
+    }
+
+    /// Solve one set of bounds (upper or lower)
+    fn solve_one_bounds(&self, mut bounds: Vec<Type>) -> Option<Type> {
+        if bounds.is_empty() {
+            return None;
+        }
+        if bounds.iter().any(|t| !t.is_any() && !t.is_placeholder()) {
+            bounds.retain(|t| !t.is_any() && !t.is_placeholder());
+        }
+        // Gradual shapes and sizes constrain a variable when they are the only evidence, but they
+        // must not erase a precise shape or size inferred from another argument.
+        if self.config.tensor_shapes
+            && bounds
+                .iter()
+                .any(|t| !t.is_any() && !is_gradual_shape_bound(t))
+        {
+            bounds.retain(|t| !is_gradual_shape_bound(t));
+        }
+        // Keeping `Any` bounds causes `Any` to propagate to too many places,
+        // so we filter them out unless `Any` is the only solution.
+        if bounds.iter().any(|t| !t.is_any()) {
+            bounds.retain(|t| !t.is_any());
+        }
+        Some(unions(bounds, &self.heap))
+    }
+
+    fn solve_bounds(&self, mut bounds: Bounds) -> Option<Type> {
+        // Generic callable bounds are fallbacks across both polarities.
+        if bounds
+            .lower
+            .iter()
+            .chain(&bounds.upper)
+            .any(|bound| !bound.is_any() && !bound.is_placeholder())
+        {
+            bounds.lower.retain(|bound| !bound.is_placeholder());
+            bounds.upper.retain(|bound| !bound.is_placeholder());
+        }
+        // Prefer non-Any lower bound > upper bound > Any lower bound.
+        // TODO(https://github.com/facebook/pyrefly/issues/105): consider using polarity to
+        // determine whether we use the lower or upper bound.
+        let lower_bound = self.solve_one_bounds(bounds.lower);
+        if lower_bound.as_ref().is_none_or(|b| b.is_any()) {
+            self.solve_one_bounds(bounds.upper).or(lower_bound)
+        } else {
+            lower_bound
+        }
+    }
+
+    fn overload_branch_value_type(&self, value: &Variable, may_be_free_quantified: bool) -> Type {
+        match value {
+            Variable::Answer { ty, .. } => ty.clone(),
+            Variable::Quantified {
+                quantified, bounds, ..
+            } => {
+                if let Some(bound) = self.solve_bounds(bounds.clone()) {
+                    return bound;
+                }
+                if may_be_free_quantified {
+                    return self
+                        .heap
+                        .mk_quantified(quantified.clone().with_needs_finalization());
+                }
+                quantified_gradual_type(quantified)
+            }
+            Variable::PartialQuantified(q) => quantified_gradual_type(q),
+            Variable::PartialContained(_) | Variable::Recursive => self.heap.mk_any_implicit(),
+            Variable::Unwrap(_) => {
+                unreachable!("an overload branch cannot bind an unwrap var")
+            }
+        }
+    }
+
+    /// The types a single overload branch implies for the vars it captured.
+    fn resolve_overload_branch(&self, capture: &OverloadBranch) -> SmallMap<Var, Type> {
+        capture
+            .values
+            .iter()
+            .map(|(var, value)| {
+                let may_be_free_quantified = capture.free_quantified_vars.contains(var);
+                let ty = self.overload_branch_value_type(value, may_be_free_quantified);
+                (*var, ty)
+            })
+            .collect()
+    }
+
+    /// Build one row per compatible combination of the branches that survived pruning.
+    ///
+    /// Rows stay in overload declaration order, and callers must keep them that way: resolving a
+    /// call against them relies on first-match-wins, which only means anything in that order.
+    fn build_overload_rows(
+        &self,
+        captures: &OverloadBranchesByArgument,
+        pruning: &OverloadPruningByArgument,
+    ) -> OverloadRowsBuild {
+        if captures.is_empty()
+            || pruning
+                .values()
+                .any(|decision| matches!(decision, OverloadPruning::AllPruned(_)))
+        {
+            return OverloadRowsBuild::Built(Vec::new());
+        }
+        let mut rows = vec![OverloadRow {
+            values: SmallMap::new(),
+        }];
+        for (argument, branches) in captures.iter() {
+            let branches = surviving_branches(branches, pruning.get(argument))
+                .map(|branch| self.resolve_overload_branch(branch))
+                .collect::<Vec<_>>();
+            // The join is a product over the arguments, so arguments that share no variable to
+            // disagree about multiply. Past a point the solutions cannot be enumerated, let alone
+            // told apart, and the call is better off answering as it would with no table at all.
+            if rows.len().saturating_mul(branches.len()) > MAX_OVERLOAD_ROWS {
+                return OverloadRowsBuild::TooManyRows;
+            }
+            let mut joined = Vec::new();
+            for row in &rows {
+                for values in &branches {
+                    let agrees = values
+                        .iter()
+                        .all(|(var, ty)| row.values.get(var).is_none_or(|seen| seen == ty));
+                    if agrees {
+                        let mut next = row.clone();
+                        next.values.extend(values.clone());
+                        joined.push(next);
+                    }
+                }
+            }
+            if joined.is_empty() {
+                return OverloadRowsBuild::Built(Vec::new());
+            }
+            rows = joined;
+        }
+        OverloadRowsBuild::Built(rows)
+    }
+
+    /// Union the values assigned to a variable across all surviving overload rows.
+    fn union_from_rows(&self, var: Var, rows: &[OverloadRow]) -> Type {
+        let values = rows
+            .iter()
+            .filter_map(|row| row.values.get(&var).cloned())
+            .collect::<Vec<_>>();
+        unions(values, &self.heap)
+    }
+
+    /// Collect compatibility constraints without mutating the captured branch value.
+    ///
+    /// The upper bounds of a captured var are the branch's parameter types that the var's solved
+    /// type is passed to. If `materialize` is true, the solved type is materialized in those
+    /// constraints, so they hold only if the branch accepts every materialization of it.
+    fn overload_branch_constraints(
+        &self,
+        branch_value: &Variable,
+        solved_ty: &Type,
+        materialize: bool,
+    ) -> Vec<(Type, Type)> {
+        let passed_ty = if materialize {
+            solved_ty.materialize()
+        } else {
+            solved_ty.clone()
+        };
+        let bounds = match branch_value {
+            Variable::Quantified { bounds, .. } | Variable::Unwrap(bounds) => bounds,
+            Variable::Answer { ty: branch_ty, .. } => {
+                // If this branch already collapsed to a concrete type, treat
+                // compatibility as type equivalence against the solved type.
+                return vec![
+                    (branch_ty.clone(), solved_ty.clone()),
+                    (passed_ty, branch_ty.clone()),
+                ];
+            }
+            Variable::PartialQuantified(_)
+            | Variable::PartialContained(_)
+            | Variable::Recursive => return Vec::new(),
+        };
+        let mut constraints = Vec::with_capacity(bounds.lower.len() + bounds.upper.len());
+        constraints.extend(bounds.lower.iter().map(|lower| {
+            let lower = self
+                .sanitize_self_referential_vars(lower, solved_ty)
+                .unwrap_or_else(|| lower.clone());
+            (lower, solved_ty.clone())
+        }));
+        constraints.extend(bounds.upper.iter().map(|upper| {
+            let upper = self
+                .sanitize_self_referential_vars(upper, solved_ty)
+                .unwrap_or_else(|| upper.clone());
+            (passed_ty.clone(), upper)
+        }));
+        let Variable::Quantified {
+            quantified,
+            bound_override,
+            ..
+        } = branch_value
+        else {
+            return constraints;
+        };
+        // The branch's own restriction has to accept the solved type.
+        match effective_restriction(quantified, bound_override) {
+            Restriction::Constraints(options) => {
+                constraints.push((solved_ty.clone(), unions(options.clone(), &self.heap)))
+            }
+            Restriction::Bound(bound) => constraints.push((solved_ty.clone(), bound.clone())),
+            Restriction::ShapeExtension(_) | Restriction::Unrestricted => {}
+        }
+        constraints
+    }
+
+    /// Replace any placeholder var whose answer mentions the var itself with the solved type.
+    fn sanitize_self_referential_vars(&self, ty: &Type, solved_ty: &Type) -> Option<Type> {
+        let vars = ty.collect_maybe_placeholder_vars();
+        if vars.is_empty() {
+            return None;
+        }
+        let self_referential: Vec<Var> = {
+            let variables = self.variables.lock();
+            vars.into_iter()
+                .filter(|v| {
+                    matches!(&*variables.get(*v), Variable::Answer { ty: answer, .. }
+                        if answer.collect_maybe_placeholder_vars().contains(v))
+                })
+                .collect()
+        };
+        if self_referential.is_empty() {
+            return None;
+        }
+        let mut ty = ty.clone();
+        ty.transform_mut(&mut |inner| {
+            if let Type::Var(v) = inner
+                && self_referential.contains(v)
+            {
+                *inner = solved_ty.clone();
+            }
+        });
+        Some(ty)
+    }
+
+    fn quantified_name_for_var(
+        &self,
+        branch_value: &Variable,
+        existing_name: Option<Name>,
+    ) -> Name {
+        existing_name
+            .or_else(|| match branch_value {
+                Variable::Quantified { quantified, .. }
+                | Variable::PartialQuantified(quantified) => Some(quantified.name().clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| Name::new("unknown"))
+    }
+
+    /// Prune each argument's branches against the types its own variables solved to. Arguments
+    /// that share variables see each other's results when only one overload branch survives.
+    fn prune_overload_branches(
+        &self,
+        solved_vars: &SmallMap<Var, SolvedVarInfo>,
+        branches_by_argument: &OverloadBranchesByArgument,
+        probe_constraints: &mut dyn FnMut(&[(Type, Type)]) -> Option<VarSnapshot>,
+    ) -> OverloadPruningByArgument {
+        let mut pruning = SmallMap::new();
+        for (argument, branches) in branches_by_argument {
+            let Some(decision) = self.prune_one_argument(solved_vars, branches, probe_constraints)
+            else {
+                continue;
+            };
+            pruning.insert(*argument, decision);
+        }
+        pruning
+    }
+
+    /// The branches of one overloaded argument that survive the types its variables solved to,
+    /// or `None` when this argument cannot be pruned.
+    fn prune_one_argument(
+        &self,
+        solved_vars: &SmallMap<Var, SolvedVarInfo>,
+        branches: &[OverloadBranch],
+        probe_constraints: &mut dyn FnMut(&[(Type, Type)]) -> Option<VarSnapshot>,
+    ) -> Option<OverloadPruning> {
+        let solved_vars_in_argument = solved_vars
+            .iter()
+            .filter_map(|(&var, solved_var)| {
+                branches
+                    .iter()
+                    .any(|capture| capture.values.contains_key(&var))
+                    .then_some((var, solved_var))
+            })
+            .collect::<Vec<_>>();
+        if solved_vars_in_argument.is_empty() {
+            return None;
+        }
+        // A gradual solved type accepts every branch, so pruning against only gradual types
+        // cannot tell them apart, and neither can anything else downstream. A lone branch has
+        // nothing to be told apart from, so it is still probed: committing its probe solves the
+        // vars that only the branch mentions.
+        if branches.len() > 1
+            && solved_vars_in_argument
+                .iter()
+                .all(|(_, solved_var)| solved_var.solved_ty.is_any())
+        {
+            return Some(OverloadPruning::Ambiguous);
+        }
+
+        let branch_constraints = |capture: &OverloadBranch, materialize: bool| {
+            solved_vars_in_argument.iter().try_fold(
+                Vec::new(),
+                |mut constraints, (var, solved_var)| {
+                    constraints.extend(self.overload_branch_constraints(
+                        capture.values.get(var)?,
+                        &solved_var.solved_ty,
+                        materialize,
+                    ));
+                    Some(constraints)
+                },
+            )
+        };
+        let mut surviving_branches = Vec::new();
+        for capture in branches {
+            let Some(state) = branch_constraints(capture, false)
+                .and_then(|constraints| probe_constraints(&constraints))
+            else {
+                continue;
+            };
+            surviving_branches.push((capture.branch_index, state));
+            // Step 5 of overload call evaluation: once the types passed to a branch's parameters
+            // are known, a branch that accepts every materialization of them eliminates later
+            // branches. A var in the parameters receives a parameter type as an upper bound, or is
+            // pinned outright.
+            let passed_types_are_known = capture.values.iter().all(|(var, branch_value)| {
+                !capture.param_vars.contains(var)
+                    || solved_vars.contains_key(var)
+                    || match branch_value {
+                        Variable::Quantified { bounds, .. } | Variable::Unwrap(bounds) => {
+                            bounds.upper.is_empty()
+                        }
+                        Variable::Answer { .. } => false,
+                        Variable::PartialQuantified(_)
+                        | Variable::PartialContained(_)
+                        | Variable::Recursive => true,
+                    }
+            });
+            if passed_types_are_known
+                && branch_constraints(capture, true)
+                    .is_some_and(|constraints| probe_constraints(&constraints).is_some())
+            {
+                break;
+            }
+        }
+
+        let surviving_branch_indices: SmallSet<usize> = if surviving_branches.len() == 1 {
+            let (branch_index, state) = surviving_branches
+                .pop()
+                .expect("a single surviving overload branch must exist");
+            self.restore_vars(state);
+            [branch_index].into_iter().collect()
+        } else {
+            surviving_branches
+                .into_iter()
+                .map(|(branch_index, _)| branch_index)
+                .collect()
+        };
+        let decision = if surviving_branch_indices.is_empty() {
+            let mut solved_constraints = solved_vars_in_argument
+                .iter()
+                .map(|(var, solved_var)| {
+                    let quantified_name = branches
+                        .iter()
+                        .find_map(|capture| {
+                            capture.values.get(var).map(|branch_value| {
+                                self.quantified_name_for_var(
+                                    branch_value,
+                                    solved_var.quantified_name.clone(),
+                                )
+                            })
+                        })
+                        .unwrap_or_else(|| Name::new("unknown"));
+                    OverloadSolvedConstraint {
+                        quantified_name,
+                        solved_ty: solved_var.solved_ty.clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            solved_constraints
+                .sort_by(|left, right| left.quantified_name.cmp(&right.quantified_name));
+            OverloadPruning::AllPruned(OverloadAllPrunedCause { solved_constraints })
+        } else {
+            OverloadPruning::Surviving(surviving_branch_indices)
+        };
+        Some(decision)
+    }
+
+    /// Finish a specific quantified set, resolving type variables to their
+    /// solved types or gradual fallbacks.
+    ///
+    /// Called after a quantified function has been called. Given
+    /// `def f[T](x: int): list[T]`, this runs after generic solving completes.
+    ///
+    /// If `infer_with_first_use` is true, unresolved `T` behaves like an
+    /// empty-container partial type and may be pinned by first use.
+    /// If `infer_with_first_use` is false, unresolved `T` is replaced with
+    /// gradual (`Any`-like) fallback.
+    pub fn finish_quantified(
+        &self,
+        vs: QuantifiedHandle,
+        infer_with_first_use: bool,
+    ) -> Result<(), Vec1<TypeVarSpecializationError>> {
+        if vs.0.is_empty() {
+            return Ok(());
+        }
+        self.finish_quantified_with_captures(
+            vs,
+            infer_with_first_use,
+            &mut |_constraints| Some(VarSnapshot::default()),
+            &mut ArgumentCaptures::default(),
+        )
+        .1
+    }
+
+    /// Finish every quantified set registered with a call boundary.
+    ///
+    /// The returned set records parameters that were still unsolved and therefore consumed their
+    /// declared defaults.
+    pub(crate) fn finish_call_boundary<Ans: LookupAnswer>(
+        &self,
+        infer_with_first_use: bool,
+        type_order: TypeOrder<Ans>,
+        boundary: CallBoundary,
+    ) -> (
+        OverloadTable,
+        Result<(), Vec1<TypeVarSpecializationError>>,
+        SmallSet<Quantified>,
+    ) {
+        let (handles, mut captures) = boundary.into_parts();
+        let overload_branch_vars = captures
+            .overload
+            .values()
+            .flat_map(|branches| branches.iter())
+            .flat_map(|capture| capture.values.keys().copied());
+        let mut roots: SmallSet<Var> = handles.into_iter().flat_map(|handle| handle.0).collect();
+        // Overload pruning must include solved vars even if they already
+        // collapsed to `Answer` before boundary finishing.
+        roots.extend(overload_branch_vars);
+        let mut all_boundary_vars: Vec<Var> = roots.into_iter().collect();
+        all_boundary_vars.sort_unstable();
+        if all_boundary_vars.is_empty() {
+            return (OverloadTable::default(), Ok(()), SmallSet::new());
+        }
+        let boundary_vars = all_boundary_vars.clone();
+        let mut subset = self.subset(type_order);
+        self.finish_quantified_with_captures(
+            QuantifiedHandle(all_boundary_vars),
+            infer_with_first_use,
+            &mut |constraints| subset.probe_overload_constraints(&boundary_vars, constraints),
+            &mut captures,
+        )
+    }
+
+    /// Core quantified-finishing implementation.
+    ///
+    /// `probe_constraints` checks each candidate overload branch and captures the state reached by
+    /// successful probes. Pruning commits that state when an argument has one survivor.
+    fn finish_quantified_with_captures(
+        &self,
+        vs: QuantifiedHandle,
+        infer_with_first_use: bool,
+        probe_constraints: &mut dyn FnMut(&[(Type, Type)]) -> Option<VarSnapshot>,
+        captures: &mut ArgumentCaptures,
+    ) -> (
+        OverloadTable,
+        Result<(), Vec1<TypeVarSpecializationError>>,
+        SmallSet<Quantified>,
+    ) {
+        let mut err = Vec::new();
+        let mut defaults_used = SmallSet::new();
+        let has_overload_captures = !captures.overload.is_empty();
+        let mut solved_quantified_names_by_var: SmallMap<Var, Name> = SmallMap::new();
+        let lock = self.variables.lock();
+        for &v in &vs.0 {
+            let mut variable = lock.get_mut(v);
+            match &mut *variable {
+                Variable::Answer { .. } => {
+                    // We pin the quantified var to a type when it first appears in a subset constraint,
+                    // and at that point we check the instantiation with the bound.
+                    if let Some(e) = self.instantiation_errors.read().get(&v) {
+                        err.push(e.clone());
+                    }
+                    // Every argument has now been matched, so the restriction has been checked as
+                    // far as it can be. Take the record off the answer before it can be published.
+                    if let Variable::Answer { restricted, .. } = &mut *variable
+                        && let Some(restricted) = restricted.take()
+                    {
+                        err.extend(restricted.error);
+                    }
+                }
+                Variable::Quantified {
+                    quantified: q,
+                    bounds,
+                    ..
+                } => {
+                    if let Some(e) = self.instantiation_errors.read().get(&v) {
+                        err.push(e.clone());
+                    }
+                    let original_bounds = mem::take(bounds);
+                    if let Some(bound) = self.solve_bounds(original_bounds.clone()) {
+                        if has_overload_captures {
+                            solved_quantified_names_by_var.insert(v, q.name().clone());
+                        }
+                        *variable = Variable::answer(bound);
+                    } else {
+                        *bounds = original_bounds;
+                    }
+                }
+                _ => {}
+            }
+        }
+        drop(lock);
+
+        let overload_pruning_by_argument = if has_overload_captures {
+            let solved_vars = {
+                let lock = self.variables.lock();
+                vs.0.iter()
+                    .filter_map(|&v| match &*lock.get(v) {
+                        Variable::Answer { ty: solved_ty, .. } => Some((
+                            v,
+                            SolvedVarInfo {
+                                quantified_name: solved_quantified_names_by_var.get(&v).cloned(),
+                                solved_ty: solved_ty.clone(),
+                            },
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let pruning =
+                self.prune_overload_branches(&solved_vars, &captures.overload, probe_constraints);
+
+            // Partial captures impose no compatibility constraint, but materialization still
+            // needs their concrete solved value after pruning finishes.
+            for capture in captures.overload.values_mut().flatten() {
+                for (var, branch_value) in &mut capture.values {
+                    let Some(solved_var) = solved_vars.get(var) else {
+                        continue;
+                    };
+                    let answer = match branch_value {
+                        Variable::PartialQuantified(q) => normalize_answer_for_kind(
+                            q.kind(),
+                            Cow::Borrowed(&solved_var.solved_ty),
+                        ),
+                        Variable::PartialContained(_) | Variable::Recursive => {
+                            solved_var.solved_ty.clone()
+                        }
+                        _ => continue,
+                    };
+                    *branch_value = Variable::answer(answer);
+                }
+            }
+            pruning
+        } else {
+            SmallMap::new()
+        };
+        // Build after patching partial captures so that they contribute their solved value. Above
+        // the row limit, widen captured variables rather than leave them unsolved.
+        let (mut overload_rows, vars_over_row_limit) =
+            match self.build_overload_rows(&captures.overload, &overload_pruning_by_argument) {
+                OverloadRowsBuild::Built(rows) => (rows, SmallSet::new()),
+                OverloadRowsBuild::TooManyRows => (Vec::new(), captures.captured_vars()),
+            };
+        let mut overload_columns = SmallSet::new();
+
+        // A surviving branch's errors fail the call, as they would if the branch had been matched
+        // directly.
+        for (argument, branches) in captures.overload.iter() {
+            for branch in surviving_branches(branches, overload_pruning_by_argument.get(argument)) {
+                err.extend(branch.errors.iter().cloned());
+            }
+        }
+        for decision in overload_pruning_by_argument.values() {
+            let OverloadPruning::AllPruned(all_pruned_cause) = decision else {
+                continue;
+            };
+            err.push(TypeVarSpecializationError::IncompatibleOverloadArgument {
+                solved_constraints: all_pruned_cause.solved_constraints.map(|constraint| {
+                    (
+                        constraint.quantified_name.clone(),
+                        constraint.solved_ty.clone(),
+                    )
+                }),
+            });
+        }
+
+        // A generic argument constrains a var if it constrains anything in the var's union-find
+        // equivalence class, and the var becomes a free quantified if any var in the class does.
+        // Resolve that up front, since the main loop below holds a mutable borrow of each var it
+        // visits.
+        let from_generic_argument: SmallMap<Var, bool> = if !captures.generic.is_empty() {
+            let lock = self.variables.lock();
+            let mut roots: SmallMap<Var, bool> = SmallMap::new();
+            for (&v, &may_be_free_quantified) in &captures.generic {
+                *roots.entry(lock.get_root(v)).or_insert(false) |= may_be_free_quantified;
+            }
+            vs.0.iter()
+                .filter_map(|&v| Some((v, *roots.get(&lock.get_root(v))?)))
+                .collect()
+        } else {
+            SmallMap::new()
+        };
+
+        let lock = self.variables.lock();
+        for &v in &vs.0 {
+            let mut e = lock.get_mut(v);
+            if let Variable::Quantified {
+                quantified: q,
+                bounds,
+                ..
+            } = &mut *e
+            {
+                let solved_bound = self.solve_bounds(mem::take(bounds));
+
+                let in_rows = solved_bound.is_none()
+                    && overload_rows.iter().any(|row| row.values.contains_key(&v));
+                let all_pruned = solved_bound.is_none()
+                    && captures.overload.iter().any(|(argument, branches)| {
+                        matches!(
+                            overload_pruning_by_argument.get(argument),
+                            Some(OverloadPruning::AllPruned(_))
+                        ) && branches
+                            .iter()
+                            .any(|capture| capture.values.contains_key(&v))
+                    });
+                let may_be_free_quantified = from_generic_argument.get(&v).copied();
+
+                *e = if let Some(bound) = solved_bound {
+                    Variable::answer(bound)
+                } else if all_pruned {
+                    Variable::answer(Type::never())
+                } else if in_rows {
+                    overload_columns.insert(v);
+                    Variable::answer(self.union_from_rows(v, &overload_rows))
+                } else if may_be_free_quantified == Some(true) {
+                    Variable::answer(self.heap.mk_quantified(q.clone().with_needs_finalization()))
+                } else if may_be_free_quantified.is_some() || vars_over_row_limit.contains(&v) {
+                    Variable::answer(q.as_gradual_type())
+                } else if infer_with_first_use {
+                    if q.default().is_some() {
+                        defaults_used.insert(q.clone());
+                    }
+                    Variable::finished(q)
+                } else {
+                    if q.default().is_some() {
+                        defaults_used.insert(q.clone());
+                    }
+                    Variable::answer(quantified_gradual_type(q))
+                };
+            }
+        }
+        drop(lock);
+
+        for row in &mut overload_rows {
+            row.values.retain(|var, _| overload_columns.contains(var));
+        }
+        let ambiguous = !overload_rows.is_empty()
+            && overload_pruning_by_argument
+                .values()
+                .any(|decision| matches!(decision, OverloadPruning::Ambiguous));
+        let overload_table = OverloadTable {
+            rows: overload_rows,
+            ambiguous,
+        };
+
+        let result = match Vec1::try_from_vec(err) {
+            Ok(err) => Err(err),
+            Err(_) => Ok(()),
+        };
+        (overload_table, result, defaults_used)
+    }
+
+    /// Given targs which contain quantified (as come from `instantiate`), replace the quantifieds
+    /// with fresh vars. We can avoid substitution because tparams can not appear in the bounds of
+    /// another tparam. tparams can appear in the default, but those are not in quantified form yet.
+    pub fn freshen_class_targs(
+        &self,
+        targs: &mut TArgs,
+        uniques: &UniqueFactory,
+    ) -> QuantifiedHandle {
+        let mut vs = Vec::new();
+        let mut lock = self.variables.lock();
+        targs.iter_paired_mut().for_each(|(param, t)| {
+            if let Type::Quantified(q) = t
+                && **q == *param
+            {
+                let v = Var::new(uniques);
+                vs.push(v);
+                *t = v.to_type(&self.heap);
+                lock.insert_fresh(
+                    v,
+                    Variable::Quantified {
+                        quantified: param.clone(),
+                        bounds: Bounds::new(),
+                        bound_override: None,
+                    },
+                );
+            }
+        });
+        QuantifiedHandle(vs)
+    }
+
+    /// Solve each fresh var created in freshen_class_targs. If we still have a Var, we do not
+    /// yet have an instantiation, but one might come later. E.g., __new__ did not provide an
+    /// instantiation, but __init__ will.
+    pub fn generalize_class_targs(
+        &self,
+        targs: &mut TArgs,
+        vars_with_overload_branches: &SmallSet<Var>,
+    ) {
+        self.generalize_class_targs_impl(targs, vars_with_overload_branches, false)
+    }
+
+    /// Like `generalize_class_targs`, but for type arguments that came from an expected type
+    /// applied to a constructor call, with argument matching still to come.
+    ///
+    /// A gradual expected type solves a restricted type parameter to a type that admits every
+    /// argument, which would silently suppress the parameter's restriction. Keeping that solution
+    /// is what the expected type is for, so the answer records the parameter it instantiates and
+    /// argument matching checks the restriction against each argument instead.
+    pub fn generalize_class_targs_for_constructor_hint(
+        &self,
+        targs: &mut TArgs,
+        vars_with_overload_branches: &SmallSet<Var>,
+    ) {
+        self.generalize_class_targs_impl(targs, vars_with_overload_branches, true)
+    }
+
+    /// Take the restriction violations that argument matching recorded on the restricted answers
+    /// in `targs`. See [`RestrictedAnswer`].
+    ///
+    /// `targs` must not have been expanded yet, because expansion replaces each answer's var with
+    /// its type and leaves nothing to take from.
+    pub fn take_restricted_answer_errors(&self, targs: &TArgs) -> Vec<TypeVarSpecializationError> {
+        let lock = self.variables.lock();
+        targs
+            .as_slice()
+            .iter()
+            .filter_map(|t| {
+                let Type::Var(v) = t else { return None };
+                match &mut *lock.get_mut(*v) {
+                    Variable::Answer {
+                        restricted: Some(restricted),
+                        ..
+                    } => restricted.error.take(),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn generalize_class_targs_impl(
+        &self,
+        targs: &mut TArgs,
+        vars_with_overload_branches: &SmallSet<Var>,
+        constructor_hint: bool,
+    ) {
+        // Expanding targs might require the variables lock, so do that first.
+        targs.as_mut().iter_mut().for_each(|t| self.expand_mut(t));
+        let lock = self.variables.lock();
+        targs.iter_paired_mut().for_each(|(param, t)| {
+            if let Type::Var(v) = t {
+                let mut e = lock.get_mut(*v);
+                if let Variable::Quantified {
+                    quantified: q,
+                    bounds,
+                    ..
+                } = &mut *e
+                    && *q == *param
+                {
+                    let has_overload_branches = vars_with_overload_branches.contains(v);
+                    if bounds.is_empty() && !has_overload_branches {
+                        *t = param.clone().to_type(&self.heap);
+                    } else if !bounds.is_empty() {
+                        // If the variable has bounds, finalize its type now.
+                        let solved = self
+                            .solve_bounds(mem::take(bounds))
+                            .unwrap_or_else(|| quantified_gradual_type(q));
+                        // A restriction that rejects nothing needs no further checking, so only a
+                        // parameter that can reject is worth carrying on the answer.
+                        *e = if constructor_hint && param.restriction().is_restricted() {
+                            Variable::restricted_answer(solved, param.clone())
+                        } else {
+                            Variable::answer(solved)
+                        };
+                    }
+                    // Otherwise leave it Quantified, so finishing the call can answer it from
+                    // the branches an argument recorded.
+                }
+            }
+        })
+    }
+
+    /// Finalize the tparam instantiations. Any targs which don't yet have an instantiation
+    /// will resolve to their default, if one exists. Otherwise, create a "partial" var and
+    /// try to find an instantiation at the first use, like finish_quantified.
+    pub fn finish_class_targs(&self, targs: &mut TArgs, uniques: &UniqueFactory) {
+        let (tparams, args) = targs.split_mut();
+        for (i, param) in tparams.iter().enumerate() {
+            let Type::Quantified(q) = &args[i] else {
+                continue;
+            };
+            if **q != *param {
+                continue;
+            }
+            let new_targ = if let Some(default) = param.default() {
+                // The default can refer to a tparam from earlier in the list.
+                Substitution::for_prefix(tparams, &args[..i]).substitute_into(default.clone())
+            } else if self.config.infer_with_first_use {
+                let v = Var::new(uniques);
+                self.variables.lock().insert_fresh(v, Variable::finished(q));
+                v.to_type(&self.heap)
+            } else {
+                quantified_gradual_type(q)
+            };
+            args[i] = new_targ;
+        }
+    }
+
+    /// Generate a fresh variable used to tie recursive bindings.
+    pub fn fresh_recursive(&self, uniques: &UniqueFactory) -> Var {
+        let v = Var::new(uniques);
+        self.variables.lock().insert_fresh(v, Variable::Recursive);
+        v
+    }
+
+    pub fn for_display(&self, t: Type) -> Type {
+        let mut t = t;
+        self.resolve_vars(
+            &mut t,
+            VarExpansionPolicy::ExpandWithBounds,
+            &VarRecurser::new(),
+        );
+        self.simplify_mut(&mut t);
+        t.deterministic_printing()
+    }
+
+    /// Generate an error message that `got <: want` failed.
+    /// Returns a builder so the caller can chain additional decorations before emitting.
+    pub fn error_builder<'a>(
+        &self,
+        got: &Type,
+        want: &Type,
+        errors: &'a ErrorCollector,
+        loc: TextRange,
+        tcc: &dyn Fn() -> TypeCheckContext,
+        subset_error: SubsetError,
+    ) -> ErrorBuilder<'a> {
+        if !errors.is_active() {
+            // Optimization: return early to avoid evaluating `tcc`.
+            return errors.error_builder(loc, ErrorKind::InternalError, String::new());
+        }
+        let tcc = tcc();
+        let msg = tcc.kind.format_error(
+            &self.for_display(got.clone()),
+            &self.for_display(want.clone()),
+            errors.module().name(),
+        );
+        let mut builder = errors.error_builder(loc, tcc.kind.as_error_kind(), msg);
+        builder = builder.with_context(tcc.context.map(|ctx| || ctx));
+        for (range, label) in tcc.annotations {
+            builder = builder.with_annotation(range, label);
+        }
+        if let Some(detail) = subset_error.to_error_msg() {
+            builder = builder.with_detail(detail);
+        }
+        builder
+    }
+
+    /// Union a list of types together. In the process may cause some variables to be forced.
+    pub fn unions<Ans: LookupAnswer>(
+        &self,
+        mut branches: Vec<Type>,
+        type_order: TypeOrder<Ans>,
+    ) -> Type {
+        if branches.is_empty() {
+            return self.heap.mk_never();
+        }
+        if branches.len() == 1 {
+            return branches.pop().unwrap();
+        }
+
+        // We want to union modules differently, by merging their module sets
+        let mut modules: SmallMap<Vec<Name>, ModuleType> = SmallMap::new();
+        let mut branches = branches
+            .into_iter()
+            .filter_map(|x| match x {
+                // Maybe we should force x before looking at it, but that causes issues with
+                // recursive variables that we can't examine.
+                // In practice unlikely anyone has a recursive variable which evaluates to a module.
+                Type::Module(m) => {
+                    match modules.entry(m.parts().to_owned()) {
+                        Entry::Occupied(mut e) => {
+                            e.get_mut().merge(&m);
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert(m);
+                        }
+                    }
+                    None
+                }
+                t => Some(t),
+            })
+            .collect::<Vec<_>>();
+        branches.extend(modules.into_values().map(Type::Module));
+        unions_with_literals(
+            branches,
+            type_order.stdlib(),
+            &|cls| type_order.get_expandable_enum_member_count(cls),
+            &self.heap,
+        )
+    }
+
+    /// Record a variable that is used recursively.
+    pub fn record_recursive(&self, var: Var, ty: Type) -> Type {
+        fn expand(
+            t: Type,
+            variables: &Variables,
+            recurser: &VarRecurser,
+            heap: &TypeHeap,
+            res: &mut Vec<Type>,
+        ) {
+            match t {
+                Type::Var(v) if let Some(_guard) = variables.recurse(v, recurser) => {
+                    let variable = variables.get(v);
+                    match &*variable {
+                        Variable::Answer { ty, .. } => {
+                            let t = ty.clone();
+                            drop(variable);
+                            expand(t, variables, recurser, heap, res);
+                        }
+                        _ => res.push(v.to_type(heap)),
+                    }
+                }
+                Type::Union(u) => {
+                    for t in u.members {
+                        expand(t, variables, recurser, heap, res);
+                    }
+                }
+                _ => res.push(t),
+            }
+        }
+
+        let lock = self.variables.lock();
+        let variable = lock.get(var);
+        match &*variable {
+            Variable::Answer { ty: forced, .. } => {
+                // An answer was already forced - use it, not the type from analysis.
+                //
+                // This can only happen in a fixpoint, and we'll catch it with a fixpoint non-convergence
+                // error if it does not eventually converge.
+                let forced = forced.clone();
+                drop(variable);
+                drop(lock);
+                forced
+            }
+            _ => {
+                drop(variable);
+                // If you are recording `@1 = @1 | something` then the `@1` can't contribute any
+                // possibilities, so just ignore it.
+                let mut res = Vec::new();
+                // First expand all union/var into a list of the possible unions
+                expand(ty, &lock, &VarRecurser::new(), &self.heap, &mut res);
+                // Then remove any reference to self, before unioning it back together
+                res.retain(|x| x != &Type::Var(var));
+                let ty = unions(res, &self.heap);
+                lock.update(var, Variable::answer(ty.clone()));
+                ty
+            }
+        }
+    }
+
+    /// Is `got <: want`? If you aren't sure, return `false`.
+    /// May cause partial variables to be resolved to an answer.
+    ///
+    /// If `call_context` is provided, the subset check runs with that context
+    /// active (e.g. to record an argument's branches during call analysis).
+    pub fn is_subset_eq<'subset, Ans: LookupAnswer>(
+        &self,
+        got: &Type,
+        want: &Type,
+        type_order: TypeOrder<Ans>,
+        call_context: Option<&CallContext<'subset>>,
+    ) -> Result<(), SubsetError> {
+        let mut subset = self.subset(type_order);
+        subset.with_active_call_context(call_context.cloned(), |me| me.is_subset_eq(got, want))
+    }
+
+    pub fn is_consistent<Ans: LookupAnswer>(
+        &self,
+        got: &Type,
+        want: &Type,
+        type_order: TypeOrder<Ans>,
+    ) -> Result<(), SubsetError> {
+        let mut subset = self.subset(type_order);
+        subset.is_consistent(got, want)
+    }
+
+    pub fn is_equivalent<Ans: LookupAnswer>(
+        &self,
+        got: &Type,
+        want: &Type,
+        type_order: TypeOrder<Ans>,
+    ) -> Result<(), SubsetError> {
+        let mut subset = self.subset(type_order);
+        subset.is_equivalent(got, want)
+    }
+
+    fn subset<'solver, 'subset, Ans: LookupAnswer>(
+        &'solver self,
+        type_order: TypeOrder<'solver, Ans>,
+    ) -> Subset<'solver, 'subset, Ans> {
+        Subset {
+            solver: self,
+            type_order,
+            gas: INITIAL_GAS,
+            active_call_context: CallContext::outside(),
+            subset_cache: SmallMap::new(),
+            class_protocol_assumptions: SmallSet::new(),
+            coinductive_assumptions_used: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeVarSpecializationError {
+    BadShapeExtensionSpecialization {
+        name: Name,
+        got: Type,
+        restriction: ShapeExtensionRestriction,
+    },
+    ConflictingShapeExtensionSpecialization {
+        name: Name,
+        selected: Type,
+        constraint: Type,
+        restriction: ShapeExtensionRestriction,
+    },
+    BadBoundSpecialization {
+        name: Name,
+        got: Type,
+        want: Type,
+    },
+    BadConstraintSpecialization {
+        name: Name,
+        got: Type,
+        want: Vec<Type>,
+    },
+    IncompatibleOverloadArgument {
+        solved_constraints: Vec<(Name, Type)>,
+    },
+}
+
+impl TypeVarSpecializationError {
+    pub fn error_kind(&self) -> ErrorKind {
+        match self {
+            Self::BadShapeExtensionSpecialization { .. }
+            | Self::ConflictingShapeExtensionSpecialization { .. }
+            | Self::BadBoundSpecialization { .. }
+            | Self::BadConstraintSpecialization { .. } => ErrorKind::BadSpecialization,
+            Self::IncompatibleOverloadArgument { .. } => ErrorKind::IncompatibleOverloadArgument,
+        }
+    }
+
+    pub fn to_error_msg<Ans: LookupAnswer>(self, ans: &AnswersSolver<Ans>) -> String {
+        match self {
+            Self::BadShapeExtensionSpecialization {
+                name,
+                got,
+                restriction,
+            } => format!(
+                "`{}` is not a valid `{restriction}` value for type variable `{name}`",
+                ans.for_display(got),
+            ),
+            Self::ConflictingShapeExtensionSpecialization {
+                name,
+                selected,
+                constraint,
+                restriction,
+            } => format!(
+                "`{}` is incompatible with selected `{}` value `{}` for type variable `{name}`",
+                ans.for_display(constraint),
+                restriction.kind_name(),
+                ans.for_display(selected),
+            ),
+            Self::BadBoundSpecialization { name, got, want } => {
+                TypeCheckKind::TypeVarSpecialization(name).format_error(
+                    &ans.for_display(got),
+                    &ans.for_display(want),
+                    ans.module().name(),
+                )
+            }
+            Self::BadConstraintSpecialization { name, got, want } => {
+                format!(
+                    "`{}` is not assignable to any of constraints {} of type variable `{name}`",
+                    ans.for_display(got),
+                    want.into_iter()
+                        .map(|want| format!("`{}`", ans.for_display(want)))
+                        .join(", ")
+                )
+            }
+            Self::IncompatibleOverloadArgument { solved_constraints } => {
+                format!(
+                    "Overload type was not compatible with solved type variables: {}",
+                    solved_constraints
+                        .into_iter()
+                        .map(|(name, ty)| format!("{} = {}", name, ans.for_display(ty)))
+                        .join(", ")
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypedDictSubsetError {
+    /// TypedDict `got` is missing a field that `want` requires
+    MissingField { got: Name, want: Name, field: Name },
+    /// TypedDict field in `got` is ReadOnly but `want` requires read-write
+    ReadOnlyMismatch { got: Name, want: Name, field: Name },
+    /// TypedDict field in `got` is not required but `want` requires it
+    RequiredMismatch { got: Name, want: Name, field: Name },
+    /// TypedDict field in `got` is required cannot be, since it is `NotRequired` and read-write in `want`
+    NotRequiredReadWriteMismatch { got: Name, want: Name, field: Name },
+    /// TypedDict invariant field type mismatch (read-write fields must have exactly the same type)
+    InvariantFieldMismatch {
+        got: Name,
+        got_field_ty: Type,
+        want: Name,
+        want_field_ty: Type,
+        field: Name,
+    },
+    /// TypedDict covariant field type mismatch (readonly field type in `got` is not a subtype of `want`)
+    CovariantFieldMismatch {
+        got: Name,
+        got_field_ty: Type,
+        want: Name,
+        want_field_ty: Type,
+        field: Name,
+    },
+}
+
+impl TypedDictSubsetError {
+    fn to_error_msg(self) -> String {
+        match self {
+            TypedDictSubsetError::MissingField { got, want, field } => {
+                format!("Field `{field}` is present in `{want}` and absent in `{got}`")
+            }
+            TypedDictSubsetError::ReadOnlyMismatch { got, want, field } => {
+                format!("Field `{field}` is read-write in `{want}` but is `ReadOnly` in `{got}`")
+            }
+            TypedDictSubsetError::RequiredMismatch { got, want, field } => {
+                format!("Field `{field}` is required in `{want}` but is `NotRequired` in `{got}`")
+            }
+            TypedDictSubsetError::NotRequiredReadWriteMismatch { got, want, field } => {
+                format!(
+                    "Field `{field}` is `NotRequired` and read-write in `{want}`, so it cannot be required in `{got}`"
+                )
+            }
+            TypedDictSubsetError::InvariantFieldMismatch {
+                got,
+                got_field_ty,
+                want,
+                want_field_ty,
+                field,
+            } => format!(
+                "Field `{field}` in `{got}` has type `{}`, which is not consistent with `{}` in `{want}` (read-write fields must have the same type)",
+                got_field_ty.deterministic_printing(),
+                want_field_ty.deterministic_printing()
+            ),
+            TypedDictSubsetError::CovariantFieldMismatch {
+                got,
+                got_field_ty,
+                want,
+                want_field_ty,
+                field,
+            } => format!(
+                "Field `{field}` in `{got}` has type `{}`, which is not assignable to `{}`, the type of `{want}.{field}` (read-only fields are covariant)",
+                got_field_ty.deterministic_printing(),
+                want_field_ty.deterministic_printing()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum OpenTypedDictSubsetError {
+    /// `got` is missing a field in `want`
+    MissingField { got: Name, want: Name, field: Name },
+    /// `got` may contain unknown fields contradicting the `extra_items` type in `want`
+    UnknownFields {
+        got: Name,
+        want: Name,
+        extra_items: Type,
+    },
+}
+
+impl OpenTypedDictSubsetError {
+    fn to_error_msg(self) -> String {
+        let (msg, got) = match self {
+            Self::MissingField { got, want, field } => (
+                format!(
+                    "`{got}` is an open TypedDict with unknown extra items, which may include `{want}` item `{field}` with an incompatible type"
+                ),
+                got,
+            ),
+            Self::UnknownFields {
+                got,
+                want,
+                extra_items: Type::Never(_),
+            } => (
+                format!(
+                    "`{got}` is an open TypedDict with unknown extra items, which cannot be unpacked into closed TypedDict `{want}`",
+                ),
+                got,
+            ),
+            Self::UnknownFields {
+                got,
+                want,
+                extra_items,
+            } => (
+                format!(
+                    "`{got}` is an open TypedDict with unknown extra items, which may not be compatible with `extra_items` type `{}` in `{want}`",
+                    extra_items.deterministic_printing(),
+                ),
+                got,
+            ),
+        };
+        format!("{msg}. Hint: add `closed=True` to the definition of `{got}` to close it.")
+    }
+}
+
+/// If a got <: want check fails, the failure reason
+#[derive(Debug, Clone)]
+pub enum SubsetError {
+    /// The name of a positional parameter differs between `got` and `want`.
+    PosParamName(Name, Name),
+    /// `got` does not accept positional parameters that `want` allows callers to pass.
+    CallableMissingPositionalParameters(Vec<Type>),
+    /// Instantiations for quantified vars are incompatible with bounds
+    TypeVarSpecialization(Vec1<TypeVarSpecializationError>),
+    /// `got` is missing an attribute that the Protocol `want` requires
+    /// The first element is the name of the protocol, the second is the name of the attribute
+    MissingAttribute(Name, Name),
+    /// Attribute in `got` is incompatible with the same attribute in Protocol `want`
+    /// The first element is the name of `want, the second element is `got`, and the third element is the name of the attribute
+    IncompatibleAttribute(Box<(Name, Type, Name, AttrSubsetError)>),
+    /// TypedDict subset check failed
+    TypedDict(Box<TypedDictSubsetError>),
+    /// Errors involving arbitrary unknown fields in open TypedDicts
+    OpenTypedDict(Box<OpenTypedDictSubsetError>),
+    /// Tensor shape check failed
+    Shape(ShapeError),
+    /// An invariant was violated - used for cases that should be unreachable when - if there is ever a bug - we
+    /// would prefer to not panic and get a text location for reproducing rather than just a crash report.
+    /// Note: always use `ErrorCollector::internal_error` to log internal errors.
+    InternalError(String),
+    /// Protocol class names cannot be assigned to `type[P]` when `P` is a protocol
+    TypeOfProtocolNeedsConcreteClass(Name),
+    /// A `type` cannot accept special forms like `Callable`
+    TypeCannotAcceptSpecialForms(SpecialForm),
+    /// A function without **kwargs is not assignable to a function with Unpack-ed TypedDict **kwargs
+    /// unless the TypedDict is closed.
+    OpenTypedDictKwargs(Name),
+    // TODO(rechen): replace this with specific reasons
+    Other,
+}
+
+impl SubsetError {
+    pub fn to_error_msg(self) -> Option<String> {
+        match self {
+            SubsetError::PosParamName(got, want) => Some(format!(
+                "Positional parameter name mismatch: got `{got}`, want `{want}`"
+            )),
+            SubsetError::CallableMissingPositionalParameters(types) => {
+                let count = types.len();
+                let types = types
+                    .iter()
+                    .map(|ty| format!("`{}`", ty.clone().deterministic_printing()))
+                    .join(" and ");
+                Some(if count == 1 {
+                    format!("Callable is missing a positional parameter with type {types}")
+                } else {
+                    format!(
+                        "Callable is missing {} positional parameters with types {types}",
+                        count
+                    )
+                })
+            }
+            SubsetError::TypeVarSpecialization(_) => {
+                // TODO
+                None
+            }
+            SubsetError::MissingAttribute(protocol, attribute) => Some(format!(
+                "Protocol `{protocol}` requires attribute `{attribute}`"
+            )),
+            SubsetError::IncompatibleAttribute(inner) => {
+                let (protocol, got, attribute, err) = &*inner;
+                Some(err.to_error_msg(&Name::new(format!("{got}")), protocol, attribute))
+            }
+            SubsetError::TypedDict(err) => Some(err.to_error_msg()),
+            SubsetError::OpenTypedDict(err) => Some(err.to_error_msg()),
+            SubsetError::Shape(err) => Some(err.to_string()),
+            SubsetError::InternalError(msg) => Some(format!("Pyrefly internal error: {msg}")),
+            SubsetError::TypeOfProtocolNeedsConcreteClass(want) => Some(format!(
+                "Only concrete classes may be assigned to `type[{want}]` because `{want}` is a protocol"
+            )),
+            SubsetError::TypeCannotAcceptSpecialForms(form) => Some(format!(
+                "`type` cannot accept special form `{}` as an argument",
+                form
+            )),
+            SubsetError::OpenTypedDictKwargs(td) => Some(format!(
+                "Callable without `**kwargs` cannot be assigned to callable with `**kwargs: Unpack[{td}]`, because `{td}` is not closed and may have additional unknown keys"
+            )),
+            SubsetError::Other => None,
+        }
+    }
+}
+
+/// Cached result for a recursive subset check. Used by `Subset::subset_cache`.
+#[derive(Clone, Debug)]
+pub enum SubsetCacheEntry {
+    /// Currently being computed — used for coinductive cycle detection.
+    /// Treated as `Ok(())`: if we encounter a pair already being checked,
+    /// we optimistically assume the check succeeds (coinductive reasoning).
+    InProgress,
+    /// Computed and succeeded.
+    Ok,
+    /// Computed and failed.
+    Err(SubsetError),
+}
+
+/// Which side of a call argument check we are currently analyzing.
+///
+/// `NotAnalyzingACall` is required because `is_subset_eq` is also called in
+/// contexts that are unrelated to callable argument-vs-parameter checks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ArgumentSide {
+    Got,
+    Want,
+    #[default]
+    NotAnalyzingACall,
+}
+
+/// Which argument of the call being checked is in hand. Positional arguments are numbered with
+/// the `self` argument (if any) first, and keyword arguments are numbered separately.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ArgumentKey {
+    Positional(usize),
+    Keyword(usize),
+}
+
+impl ArgumentSide {
+    pub(crate) fn negated(self) -> Self {
+        match self {
+            Self::Got => Self::Want,
+            Self::Want => Self::Got,
+            Self::NotAnalyzingACall => Self::NotAnalyzingACall,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub(crate) enum SubsetCacheContext {
+    #[default]
+    Default,
+    MatchedArgument {
+        argument: ArgumentKey,
+        argument_side: ArgumentSide,
+    },
+}
+
+// The argument whose match is being recorded.
+// - The `argument` identifies which argument of the call this is, so that two
+//   arguments with the same type stay apart.
+// - The `target_vars` are the vars this argument could fill in: those of the
+//   parameter it is matched against, plus its own.
+#[derive(Clone, Debug)]
+pub struct MatchedArgument {
+    argument: ArgumentKey,
+    target_vars: SmallSet<Var>,
+    argument_side: ArgumentSide,
+}
+
+impl MatchedArgument {
+    /// Build the match context for a `Forall` argument during subset checking.
+    pub fn for_forall(
+        argument: ArgumentKey,
+        vars: &QuantifiedHandle,
+        want: &Type,
+        argument_side: ArgumentSide,
+    ) -> Self {
+        let mut target_vars: SmallSet<Var> =
+            want.collect_maybe_placeholder_vars().into_iter().collect();
+        target_vars.extend(vars.0.iter().copied());
+        Self {
+            argument,
+            target_vars,
+            argument_side,
+        }
+    }
+
+    /// Build the match context for an overloaded argument during subset checking.
+    pub fn for_overload(
+        argument: ArgumentKey,
+        eligible_vars: &[Var],
+        argument_side: ArgumentSide,
+    ) -> Self {
+        Self {
+            argument,
+            target_vars: eligible_vars.iter().copied().collect(),
+            argument_side,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CallBoundaryState {
+    quantified_handles: Vec<QuantifiedHandle>,
+    captures: ArgumentCaptures,
+}
+
+/// The unique owner of the quantified vars and recorded branches deferred to a call boundary.
+#[derive(Debug)]
+#[must_use = "Call boundaries must be passed to finish_call_boundary."]
+pub(crate) struct CallBoundary {
+    state: Option<Mutex<CallBoundaryState>>,
+}
+
+impl CallBoundary {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Some(Mutex::new(CallBoundaryState::default())),
+        }
+    }
+
+    pub(crate) fn context(&self) -> CallContext<'_> {
+        CallContext {
+            matched_argument: None,
+            argument_side: ArgumentSide::default(),
+            argument: None,
+            boundary: Some(self),
+            shape_extension_vars: None,
+            shape_extension_binding_source: None,
+        }
+    }
+
+    fn state(&self) -> &Mutex<CallBoundaryState> {
+        self.state
+            .as_ref()
+            .expect("a borrowed call boundary cannot have been consumed")
+    }
+
+    pub(crate) fn defer_quantified(&self, handle: QuantifiedHandle) {
+        if !handle.0.is_empty() {
+            self.state().lock().quantified_handles.push(handle);
+        }
+    }
+
+    fn record_overload_branches(&self, argument: ArgumentKey, branches: Vec<OverloadBranch>) {
+        self.state()
+            .lock()
+            .captures
+            .overload
+            .insert(argument, branches);
+    }
+
+    fn record_generic_argument(
+        &self,
+        argument: &MatchedArgument,
+        free_quantified_vars: SmallSet<Var>,
+    ) {
+        let mut state = self.state().lock();
+        for &var in &argument.target_vars {
+            *state.captures.generic.entry(var).or_insert(false) |=
+                free_quantified_vars.contains(&var);
+        }
+    }
+
+    fn captured_vars(&self) -> SmallSet<Var> {
+        self.state().lock().captures.captured_vars()
+    }
+
+    fn free_quantified_vars_in_call(&self) -> SmallSet<Var> {
+        self.state()
+            .lock()
+            .captures
+            .generic
+            .iter()
+            .filter(|(_, may_be_free_quantified)| **may_be_free_quantified)
+            .map(|(var, _)| *var)
+            .collect()
+    }
+
+    fn into_parts(mut self) -> (Vec<QuantifiedHandle>, ArgumentCaptures) {
+        let state = self
+            .state
+            .take()
+            .expect("a call boundary can only be consumed once")
+            .into_inner();
+        (state.quantified_handles, state.captures)
+    }
+}
+
+impl Drop for CallBoundary {
+    fn drop(&mut self) {
+        assert!(
+            self.state.is_none() || std::thread::panicking(),
+            "CallBoundary dropped without being consumed"
+        );
+    }
+}
+
+/// Recursive subset-checking context. Boundary ownership remains with `CallBoundary`.
+#[derive(Clone, Debug, Default)]
+pub struct CallContext<'subset> {
+    matched_argument: Option<MatchedArgument>,
+    argument_side: ArgumentSide,
+    /// Which argument of the call is being checked, when one is.
+    argument: Option<ArgumentKey>,
+    boundary: Option<&'subset CallBoundary>,
+    shape_extension_vars: Option<Arc<SmallSet<Var>>>,
+    shape_extension_binding_source: Option<Var>,
+}
+
+impl<'subset> CallContext<'subset> {
+    pub fn outside() -> Self {
+        Self::default()
+    }
+
+    pub fn with_argument(mut self, argument: ArgumentKey) -> Self {
+        self.argument = Some(argument);
+        self
+    }
+
+    pub(crate) fn argument(&self) -> Option<ArgumentKey> {
+        self.argument
+    }
+
+    /// Context for checking a call argument without a call boundary.
+    pub fn for_argument_outside_call() -> Self {
+        Self::outside().with_argument_side(ArgumentSide::Got)
+    }
+
+    pub(crate) fn defer_quantified(
+        &self,
+        handle: QuantifiedHandle,
+    ) -> Result<(), QuantifiedHandle> {
+        if let Some(boundary) = &self.boundary {
+            boundary.defer_quantified(handle);
+            Ok(())
+        } else {
+            Err(handle)
+        }
+    }
+
+    pub fn with_argument_side(mut self, argument_side: ArgumentSide) -> Self {
+        self.argument_side = argument_side;
+        self
+    }
+
+    pub(crate) fn with_shape_extension_vars(mut self, vars: Option<Arc<SmallSet<Var>>>) -> Self {
+        self.shape_extension_vars = vars;
+        self
+    }
+
+    pub(crate) fn is_shape_extension_var_type(&self, ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Var(var)
+                if self.shape_extension_vars.as_ref().is_some_and(|vars| vars.contains(var))
+        )
+    }
+
+    pub(crate) fn for_shape_extension_binding_source(&self, ty: &Type) -> Option<Self> {
+        let Type::Var(var) = ty else {
+            return None;
+        };
+        self.shape_extension_vars
+            .as_ref()
+            .is_some_and(|vars| vars.contains(var))
+            .then(|| {
+                let mut context = self.clone();
+                context.shape_extension_binding_source = Some(*var);
+                context
+            })
+    }
+
+    fn is_shape_extension_binding_source(&self, var: Var) -> bool {
+        self.shape_extension_binding_source == Some(var)
+    }
+
+    pub fn with_outside_context(mut self) -> Self {
+        // Recording requires a non-default argument side, so this stops it while keeping the
+        // boundary's already-recorded branches.
+        self.matched_argument = Default::default();
+        self.argument_side = Default::default();
+        self.shape_extension_vars = Default::default();
+        self.shape_extension_binding_source = None;
+        self
+    }
+
+    pub fn with_matched_argument(mut self, argument: MatchedArgument) -> Self {
+        self.matched_argument = Some(argument);
+        self
+    }
+
+    pub fn matched_argument(&self) -> Option<&MatchedArgument> {
+        self.matched_argument.as_ref()
+    }
+
+    pub fn matched_argument_mut(&mut self) -> Option<&mut MatchedArgument> {
+        self.matched_argument.as_mut()
+    }
+
+    pub fn take_matched_argument(&mut self) -> Option<MatchedArgument> {
+        self.matched_argument.take()
+    }
+
+    pub(crate) fn argument_side(&self) -> ArgumentSide {
+        self.argument_side
+    }
+
+    pub(crate) fn subset_cache_context(&self) -> SubsetCacheContext {
+        if let Some(argument) = &self.matched_argument {
+            // Recording an argument's branches is a side effect of checking it, so a result
+            // memoized while matching one argument must not be reused for another, or for the
+            // opposite polarity. Checks outside an argument share one cache as before.
+            SubsetCacheContext::MatchedArgument {
+                argument: argument.argument,
+                argument_side: self.argument_side,
+            }
+        } else {
+            SubsetCacheContext::Default
+        }
+    }
+
+    /// Record what each branch of an overloaded argument implies. Finishing the call reads these
+    /// as the authoritative source for pruning and for the solutions it settles on.
+    pub(crate) fn record_overload_branches(&self, branches: Vec<OverloadBranch>) {
+        let argument = self
+            .matched_argument
+            .as_ref()
+            .expect("recording overload branches requires an active argument")
+            .argument;
+        if let Some(boundary) = &self.boundary {
+            boundary.record_overload_branches(argument, branches);
+        }
+    }
+
+    /// Record that a completed argument check captured type parameters from a generic argument.
+    /// The argument's target vars in `free_quantified_vars` become free quantifieds if left
+    /// unsolved; other vars in `free_quantified_vars` are ignored.
+    pub(crate) fn record_generic_argument(
+        &self,
+        argument: &MatchedArgument,
+        free_quantified_vars: SmallSet<Var>,
+    ) {
+        assert!(
+            !matches!(self.argument_side, ArgumentSide::NotAnalyzingACall),
+            "recording a generic argument requires active call analysis"
+        );
+        if let Some(boundary) = &self.boundary {
+            boundary.record_generic_argument(argument, free_quantified_vars);
+        }
+    }
+
+    /// Returns the union of all captured vars across both overload and generic argument captures,
+    /// without draining.
+    pub(crate) fn captured_vars(&self) -> SmallSet<Var> {
+        self.boundary
+            .map_or_else(SmallSet::new, CallBoundary::captured_vars)
+    }
+
+    /// Returns the generic argument vars that may become free quantifieds, without draining.
+    pub(crate) fn free_quantified_vars_in_call(&self) -> SmallSet<Var> {
+        self.boundary
+            .map_or_else(SmallSet::new, CallBoundary::free_quantified_vars_in_call)
+    }
+}
+
+/// A helper to implement subset ergonomically.
+/// Should only be used within `crate::subset`, which implements part of it.
+pub struct Subset<'solver, 'subset, Ans: LookupAnswer> {
+    pub(crate) solver: &'solver Solver,
+    pub type_order: TypeOrder<'solver, Ans>,
+    gas: Gas,
+    /// Invariant: there is a single active call context for a subset query.
+    /// Nested work is recursive subset checking inside the same call, not a
+    /// nested full call pipeline with independent call-scoped solving.
+    pub(crate) active_call_context: CallContext<'subset>,
+    /// Memoization cache for recursive subset checks (protocols and recursive type aliases).
+    /// Doubles as a cycle detector: `InProgress` entries break cycles via coinductive
+    /// reasoning by optimistically returning `Ok(())`.
+    ///
+    /// Unlike a stack-based cycle detector (which removes entries on return and forces
+    /// re-computation from sibling call paths), this cache persists `Ok` results across
+    /// the entire query, preventing exponential re-checking when the same `(got, want)`
+    /// pair is encountered from multiple sibling call paths (e.g., different methods of
+    /// a protocol each requiring the same structural subtype check).
+    ///
+    /// On failure, entries added *during* the failing computation are rolled back
+    /// (popped from the end of the map back to the saved size), because intermediate
+    /// `Ok` entries may have depended on a coinductive assumption that the failure
+    /// invalidated. For example, if checking `A <: P1` internally succeeds on
+    /// `A <: P2` (via the coinductive assumption that `A <: P1` holds) but then
+    /// `A <: P1` ultimately fails, the cached success for `A <: P2` is unsound and
+    /// must be discarded. Only entries added during the failing computation are
+    /// removed; entries from earlier (independent) computations are preserved.
+    /// This works because `SmallMap` preserves insertion order.
+    pub subset_cache: SmallMap<(Type, Type, SubsetCacheContext), SubsetCacheEntry>,
+    /// Class-level recursive assumptions for protocol checks.
+    /// When checking `got <: protocol` where got's type arguments contain Vars
+    /// (indicating we're in a recursive pattern), we track (got_class, protocol_class)
+    /// pairs to detect cycles. This enables coinductive reasoning for recursive protocols
+    /// like Functor/Maybe without falsely assuming success for unrelated protocol checks.
+    pub class_protocol_assumptions: SmallSet<(Class, Class)>,
+    /// Tracks whether a coinductive assumption (InProgress → Ok) was used during
+    /// the current computation. Used to avoid caching protocol results in the
+    /// persistent cross-call cache when they depend on coinductive assumptions.
+    pub coinductive_assumptions_used: bool,
+}
+
+struct SubsetStateSnapshot {
+    subset_cache_size: usize,
+    class_protocol_assumptions: SmallSet<(Class, Class)>,
+    coinductive_assumptions_used: bool,
+}
+
+impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
+    /// Drops the `self.subset_cache.len() - cache_size` most recent entries in the subset cache.
+    /// This can be used to roll back the cache after some speculative calculation by recording its
+    /// pre-calculation size, doing the calculation, then truncating back to the recorded size.
+    /// This works because the cache is a `SmallMap`, which preserves insertion order.
+    pub fn truncate_subset_cache(&mut self, cache_size: usize) {
+        while self.subset_cache.len() > cache_size {
+            self.subset_cache.pop();
+        }
+    }
+
+    fn snapshot_subset_state(&self) -> SubsetStateSnapshot {
+        SubsetStateSnapshot {
+            subset_cache_size: self.subset_cache.len(),
+            class_protocol_assumptions: self.class_protocol_assumptions.clone(),
+            coinductive_assumptions_used: self.coinductive_assumptions_used,
+        }
+    }
+
+    fn restore_subset_state(&mut self, snapshot: SubsetStateSnapshot) {
+        self.truncate_subset_cache(snapshot.subset_cache_size);
+        self.class_protocol_assumptions = snapshot.class_protocol_assumptions;
+        self.coinductive_assumptions_used = snapshot.coinductive_assumptions_used;
+    }
+
+    /// Run `f` as a speculative subset check, rolling back to the current state if it fails.
+    pub fn with_snapshot(
+        &mut self,
+        vars: &[Var],
+        f: impl FnOnce(&mut Self) -> Result<(), SubsetError>,
+    ) -> SubsetWithSnapshotResult {
+        let subset_snapshot = self.snapshot_subset_state();
+        let res = self.solver.with_snapshot(vars, || f(self));
+        if !res.is_ok() {
+            self.restore_subset_state(subset_snapshot);
+        }
+        res
+    }
+
+    /// Run `f` as a probe, unconditionally rolling back state afterwards.
+    pub(crate) fn probe<T>(&mut self, vars: &[Var], f: impl FnOnce(&mut Self) -> T) -> T {
+        let subset_snapshot = self.snapshot_subset_state();
+        let vars_snapshot = self.solver.snapshot_exact_vars(vars);
+        let result = f(self);
+        self.solver.restore_vars(vars_snapshot);
+        self.restore_subset_state(subset_snapshot);
+        result
+    }
+
+    /// Check one overload branch's constraints. Any solver side effects from the check are rolled back.
+    fn probe_overload_constraints(
+        &mut self,
+        boundary_vars: &[Var],
+        constraints: &[(Type, Type)],
+    ) -> Option<VarSnapshot> {
+        if constraints.is_empty() {
+            return Some(VarSnapshot::default());
+        }
+        // Captured bounds may refer to placeholder vars owned by a surrounding boundary.
+        let mut vars: SmallSet<Var> = boundary_vars.iter().copied().collect();
+        for (got, want) in constraints {
+            vars.extend(got.collect_maybe_placeholder_vars());
+            vars.extend(want.collect_maybe_placeholder_vars());
+        }
+        let vars = vars.into_iter().collect::<Vec<_>>();
+        self.probe(&vars, |me| {
+            let compatible = me.with_active_call_context(Some(CallContext::outside()), |me| {
+                constraints
+                    .iter()
+                    .all(|(got, want)| me.is_subset_eq(got, want).is_ok())
+            });
+            compatible.then(|| me.solver.snapshot_exact_vars(&vars))
+        })
+    }
+
+    pub fn is_consistent(&mut self, got: &Type, want: &Type) -> Result<(), SubsetError> {
+        self.is_subset_eq(got, want)?;
+        self.is_subset_eq(want, got)
+    }
+
+    pub fn is_equivalent(&mut self, got: &Type, want: &Type) -> Result<(), SubsetError> {
+        self.is_consistent(&got.materialize(), want)?;
+        self.is_consistent(got, &want.materialize())
+    }
+
+    pub fn is_subset_eq(&mut self, got: &Type, want: &Type) -> Result<(), SubsetError> {
+        if self.gas.stop() {
+            return Err(SubsetError::Other);
+        }
+        // Normalize before var solving so decorator metadata does not get pinned as part of a type.
+        if let Type::KwCall(call) = got {
+            let res = self.is_subset_eq(&call.return_ty, want);
+            self.gas.restore();
+            return res;
+        } else if let Type::KwCall(call) = want {
+            let res = self.is_subset_eq(got, &call.return_ty);
+            self.gas.restore();
+            return res;
+        } else if matches!(got, Type::Materialization) {
+            if is_gradual_size(want) {
+                self.gas.restore();
+                return Ok(());
+            }
+            let res = self.is_subset_eq(
+                &self
+                    .solver
+                    .heap
+                    .mk_class_type(self.type_order.stdlib().object().clone()),
+                want,
+            );
+            self.gas.restore();
+            return res;
+        } else if matches!(want, Type::Materialization) {
+            if is_gradual_size(got) {
+                self.gas.restore();
+                return Ok(());
+            }
+            let res = self.is_subset_eq(got, &self.solver.heap.mk_never());
+            self.gas.restore();
+            return res;
+        }
+        let res = self.is_subset_eq_var(got, want);
+        self.gas.restore();
+        res
+    }
+
+    /// Runs `f` within the given call context, restoring the current context afterwards.
+    /// Directly runs `f` within the current context if the given context is `None`.
+    pub fn with_active_call_context<T>(
+        &mut self,
+        call_context: Option<CallContext<'subset>>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let old = call_context.map(|cc| mem::replace(&mut self.active_call_context, cc));
+        let res = f(self);
+        if let Some(old) = old {
+            self.active_call_context = old;
+        }
+        res
+    }
+
+    pub(crate) fn active_matched_argument(&self) -> Option<MatchedArgument> {
+        let argument = self.active_call_context.matched_argument()?;
+        let side = self.active_call_context.argument_side();
+        if side != argument.argument_side || matches!(side, ArgumentSide::NotAnalyzingACall) {
+            return None;
+        }
+        Some(argument.clone())
+    }
+
+    fn quantified_satisfies_constraints(&mut self, q: &Quantified, constraints: &[Type]) -> bool {
+        match q.restriction() {
+            Restriction::Bound(b) => constraints.iter().any(|c| self.is_subset_eq(b, c).is_ok()),
+            Restriction::Constraints(cs) => cs.iter().all(|c1| {
+                constraints
+                    .iter()
+                    .any(|c2| self.is_subset_eq(c1, c2).is_ok())
+            }),
+            Restriction::ShapeExtension(extension) => extension
+                .upper_bound_members(self.type_order.stdlib())
+                .iter()
+                .all(|atom| {
+                    constraints
+                        .iter()
+                        .any(|constraint| self.is_subset_eq(atom, constraint).is_ok())
+                }),
+            Restriction::Unrestricted => {
+                // Check if the implicit bound `object` is assignable to any of the constraints
+                constraints.iter().any(|c| c.is_any() || c.is_object())
+            }
+        }
+    }
+
+    /// For a constrained TypeVar, find the narrowest constraint that `ty` is assignable to.
+    ///
+    /// Per the typing spec, a constrained TypeVar (`T = TypeVar("T", int, str)`) must resolve
+    /// to exactly one of its constraint types — never a subtype like `bool` or `Literal[42]`.
+    /// This method finds the best (narrowest) matching constraint by checking assignability
+    /// and preferring the most specific constraint when multiple match.
+    fn find_matching_constraint<'c>(
+        &mut self,
+        ty: &Type,
+        constraints: &'c [Type],
+    ) -> Option<&'c Type> {
+        if ty.is_any() {
+            return None;
+        }
+        let matching: Vec<&Type> = constraints
+            .iter()
+            .filter(|c| self.is_subset_eq(ty, c).is_ok())
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        // Pick the narrowest matching constraint: the one that is a subtype of all others.
+        let mut best = matching[0];
+        for &candidate in &matching[1..] {
+            if self.is_subset_eq(candidate, best).is_ok() {
+                best = candidate;
+            }
+        }
+        Some(best)
+    }
+
+    /// Check `got` against the restriction of the type parameter that `v`'s answer instantiates,
+    /// recording the first violation on the answer. See [`RestrictedAnswer`].
+    ///
+    /// The answer is deliberately kept, so this runs purely for its error: the type the check would
+    /// have solved to must not be committed, and neither may the bindings and cached subset results
+    /// it produced along the way. The caller must not hold the `variables` lock.
+    ///
+    /// The check can bind a var reachable only through an existing answer or bound, so rollback
+    /// needs the transitive set. `param`'s restriction is the `want` side, so it is seeded too.
+    fn check_restricted_answer(&mut self, got: &Type, v: Var, param: &Quantified) {
+        let is_shape_extension_binding_source = self.is_shape_extension_binding_source(param, v);
+        let param_ty = Type::Quantified(Box::new(param.clone()));
+        let subset_snapshot = self.snapshot_subset_state();
+        let var_snapshot = self.solver.snapshot_reachable_vars(&[got, &param_ty]);
+        let (_, error) = self.is_subset_eq_quantified(
+            got,
+            param,
+            None,
+            None,
+            is_shape_extension_binding_source,
+            None,
+        );
+        self.solver.restore_vars(var_snapshot);
+        self.restore_subset_state(subset_snapshot);
+        let Some(error) = error else { return };
+        // Re-read under a fresh lock: the answer is only still the place to record against if it is
+        // still awaiting a restriction check.
+        if let Variable::Answer {
+            restricted: Some(restricted),
+            ..
+        } = &mut *self.solver.variables.lock().get_mut(v)
+        {
+            restricted.error = Some(error);
+        }
+    }
+
+    /// is_subset_eq_var(t1, Quantified)
+    fn is_subset_eq_quantified(
+        &mut self,
+        t1: &Type,
+        q: &Quantified,
+        lower_bound: Option<&Type>,
+        upper_bound: Option<&Type>,
+        is_shape_extension_binding_source: bool,
+        bound_override: Option<&Restriction>,
+    ) -> (Type, Option<TypeVarSpecializationError>) {
+        let restriction = bound_override.unwrap_or_else(|| q.restriction());
+        let bound = restriction.as_type(self.type_order.stdlib(), &self.solver.heap, q.kind());
+        let t1_p = if let Some(normalized) =
+            normalize_shape_tuple_bound_candidate(q, t1, &self.solver.heap)
+        {
+            normalized
+        } else if let Some(normalized) =
+            normalize_shape_int_bound_solution(q, t1, self.type_order.stdlib(), &self.solver.heap)
+        {
+            let ShapeIntBoundSolution {
+                answer,
+                precise_union,
+            } = normalized;
+            if let (Some(precise_union), Some(upper_bound)) = (precise_union, upper_bound)
+                && self.is_subset_eq(&precise_union, upper_bound).is_err()
+            {
+                precise_union
+            } else {
+                answer
+            }
+        } else {
+            let t1_p = t1.clone().promote(self.type_order.stdlib());
+            if let Some(upper_bound) = upper_bound {
+                // Don't promote literals if doing so would violate a literal upper bound.
+                if self.is_subset_eq(&t1_p, upper_bound).is_ok() {
+                    t1_p
+                } else {
+                    t1.clone()
+                }
+            } else {
+                t1_p
+            }
+        };
+        match restriction {
+            Restriction::Constraints(constraints) => {
+                // For constrained TypeVars, promote to the matching constraint type.
+                if let Type::Quantified(q_t1) = t1 {
+                    let err =
+                        (!self.quantified_satisfies_constraints(q_t1, constraints)).then(|| {
+                            TypeVarSpecializationError::BadConstraintSpecialization {
+                                name: q.name.clone(),
+                                got: t1.clone(),
+                                want: constraints.clone(),
+                            }
+                        });
+                    (t1.clone(), err)
+                // Try promoted type first, then fall back to original (for literal bounds).
+                } else if let Some(constraint) = self.find_matching_constraint(&t1_p, constraints) {
+                    (constraint.clone(), None)
+                } else if let Some(constraint) = self.find_matching_constraint(t1, constraints) {
+                    (constraint.clone(), None)
+                } else {
+                    // `Any` falls through to here because it does not match a specific constraint.
+                    let specialization_error = (!t1_p.is_any()).then(|| {
+                        TypeVarSpecializationError::BadConstraintSpecialization {
+                            name: q.name().clone(),
+                            got: t1_p.clone(),
+                            want: constraints.clone(),
+                        }
+                    });
+                    (t1_p.clone(), specialization_error)
+                }
+            }
+            Restriction::ShapeExtension(extension) if is_shape_extension_binding_source => {
+                let accepted = extension.accepts_specialization(t1, |member| match member {
+                    Type::ClassType(cls) | Type::SelfType(cls) => self.type_order.has_superclass(
+                        cls.class_object(),
+                        self.type_order.stdlib().str().class_object(),
+                    ),
+                    _ => false,
+                });
+                let specialization_error = if !accepted {
+                    Some(
+                        TypeVarSpecializationError::BadShapeExtensionSpecialization {
+                            name: q.name().clone(),
+                            got: t1.clone(),
+                            restriction: extension.clone(),
+                        },
+                    )
+                } else if let Some(lower_bound) = lower_bound
+                    && self.is_subset_eq(lower_bound, t1).is_err()
+                {
+                    Some(
+                        TypeVarSpecializationError::ConflictingShapeExtensionSpecialization {
+                            name: q.name().clone(),
+                            selected: t1.clone(),
+                            constraint: lower_bound.clone(),
+                            restriction: extension.clone(),
+                        },
+                    )
+                } else if let Some(upper_bound) = upper_bound
+                    && self.is_subset_eq(t1, upper_bound).is_err()
+                {
+                    Some(
+                        TypeVarSpecializationError::ConflictingShapeExtensionSpecialization {
+                            name: q.name().clone(),
+                            selected: t1.clone(),
+                            constraint: upper_bound.clone(),
+                            restriction: extension.clone(),
+                        },
+                    )
+                } else {
+                    None
+                };
+                // A successfully specialized shape-extension value's literal identity is part of
+                // its type, including literals nested in an accepted composite value, so pin them
+                // recursively against later widening. Rejected specializations keep their recovery
+                // type.
+                let answer = if specialization_error.is_none() {
+                    t1.clone().with_literal_style(LitStyle::Explicit)
+                } else {
+                    t1.clone()
+                };
+                (answer, specialization_error)
+            }
+            Restriction::ShapeExtension(_) | Restriction::Bound(_) | Restriction::Unrestricted => {
+                if self.is_subset_eq(&t1_p, &bound).is_err() {
+                    // If the promoted type fails, try again with the original type, in case the bound itself is literal.
+                    // This could be more optimized, but errors are rare, so this code path should not be hot.
+                    if self.is_subset_eq(t1, &bound).is_err() {
+                        // If the original type is also an error, use the promoted type.
+                        let specialization_error =
+                            TypeVarSpecializationError::BadBoundSpecialization {
+                                name: q.name().clone(),
+                                got: t1_p.clone(),
+                                want: bound,
+                            };
+                        (t1_p.clone(), Some(specialization_error))
+                    } else {
+                        (t1.clone(), None)
+                    }
+                } else {
+                    (t1_p.clone(), None)
+                }
+            }
+        }
+    }
+
+    fn is_shape_extension_binding_source(&self, q: &Quantified, v: Var) -> bool {
+        q.restriction().uses_direct_value_source()
+            && self
+                .active_call_context
+                .is_shape_extension_binding_source(v)
+    }
+
+    /// Implementation of Var subset cases, calling onward to solve non-Var cases.
+    ///
+    /// This function does two things: it checks that got <: want, and it solves free variables assuming that
+    /// got <: want.
+    ///
+    /// Before solving, for Quantified and Partial variables we will generally
+    /// promote literals when a variable appears on the left side of an
+    /// inequality, but not when it is on the left. This means that, e.g.:
+    /// - if `f[T](x: T) -> T: ...`, then `f(1)` gets solved to `int`
+    /// - if `f(x: Literal[0]): ...`, then `x = []; f(x[0])` results in `x: list[Literal[0]]`
+    fn is_subset_eq_var(&mut self, got: &Type, want: &Type) -> Result<(), SubsetError> {
+        match (got, want) {
+            _ if got == want => Ok(()),
+            (Type::Var(v1), Type::Var(v2)) => {
+                let variables = self.solver.variables.lock();
+                // Variable unification is destructive, so we have to copy bounds first.
+                let root1 = variables.get_root(*v1);
+                let root2 = variables.get_root(*v2);
+                if root1 == root2 {
+                    // same variable after unification, nothing to do
+                } else {
+                    // TODO(https://github.com/facebook/pyrefly/issues/105): unifying vars in this
+                    // scenario is probably wrong. v1 <: v2 should mean that v2 gains v1 as a lower
+                    // bound and v1 gains v2 as an upper bound, not that the two are now equal.
+                    let mut v1_mut = variables.get_mut(*v1);
+                    let mut v2_mut = variables.get_mut(*v2);
+                    match (&mut *v1_mut, &mut *v2_mut) {
+                        (
+                            Variable::Quantified {
+                                quantified: _,
+                                bounds: v1_bounds,
+                                ..
+                            }
+                            | Variable::Unwrap(v1_bounds),
+                            Variable::Quantified {
+                                quantified: _,
+                                bounds: v2_bounds,
+                                ..
+                            }
+                            | Variable::Unwrap(v2_bounds),
+                        ) => {
+                            v1_bounds.extend(mem::take(v2_bounds));
+                            *v2_bounds = v1_bounds.clone();
+                        }
+                        _ => {}
+                    }
+                    drop(v1_mut);
+                    drop(v2_mut);
+                }
+
+                let variable1 = variables.get(*v1);
+                let variable2 = variables.get(*v2);
+                let solved1 = match &*variable1 {
+                    Variable::Answer { ty, .. } => Some(ty.clone()),
+                    _ => None,
+                };
+                let solved2 = match &*variable2 {
+                    Variable::Answer { ty, .. } => Some(ty.clone()),
+                    _ => None,
+                };
+                if let (Some(t1), Some(t2)) = (solved1.clone(), solved2.clone()) {
+                    drop(variable1);
+                    drop(variable2);
+                    drop(variables);
+                    self.is_subset_eq(&t1, &t2)
+                } else if let Some(t2) = solved2 {
+                    drop(variable1);
+                    drop(variable2);
+                    drop(variables);
+                    self.is_subset_eq(got, &t2)
+                } else if let Some(t1) = solved1 {
+                    drop(variable1);
+                    drop(variable2);
+                    drop(variables);
+                    self.is_subset_eq(&t1, want)
+                } else {
+                    if let Some((x, y)) =
+                        intvar_typevar_unify_order(*v1, &variable1, *v2, &variable2)
+                    {
+                        drop(variable1);
+                        drop(variable2);
+                        variables.unify(x, y);
+                        return Ok(());
+                    }
+
+                    match (&*variable1, &*variable2) {
+                        // When both variables are quantified, we need to preserve the stricter bound.
+                        // The `unify` function preserves the Variable data from its second argument,
+                        // so we call it with the stricter bound in the v2 position.
+                        (
+                            Variable::Quantified { quantified: q1, .. },
+                            Variable::Quantified { quantified: q2, .. },
+                        )
+                        | (Variable::PartialQuantified(q1), Variable::PartialQuantified(q2)) => {
+                            let r1_restricted = q1.restriction().is_restricted();
+                            let r2_restricted = q2.restriction().is_restricted();
+                            let b1 = q1.upper_bound(self.type_order.stdlib(), &self.solver.heap);
+                            let b2 = q2.upper_bound(self.type_order.stdlib(), &self.solver.heap);
+                            drop(variable1);
+                            drop(variable2);
+
+                            match (r1_restricted, r2_restricted) {
+                                (false, false) => {
+                                    variables.unify(*v1, *v2);
+                                }
+                                (true, false) => {
+                                    // Only v1 has a restriction, preserve v1's data
+                                    variables.unify(*v2, *v1);
+                                }
+                                (false, true) => {
+                                    // Only v2 has a restriction, preserve v2's data
+                                    variables.unify(*v1, *v2);
+                                }
+                                (true, true) => {
+                                    // Both have restrictions, need to compare bounds
+                                    drop(variables);
+
+                                    let b1_subtype_of_b2 = self.is_subset_eq(&b1, &b2).is_ok();
+                                    let b2_subtype_of_b1 = self.is_subset_eq(&b2, &b1).is_ok();
+
+                                    // Unify in the correct order to preserve the stricter bound.
+                                    // unify(x, y) preserves y's Variable data.
+                                    if b1_subtype_of_b2 && b2_subtype_of_b1 {
+                                        // Bounds are equivalent, order doesn't matter
+                                        self.solver.variables.lock().unify(*v1, *v2);
+                                    } else if b1_subtype_of_b2 {
+                                        // b1 is stricter (subtype of b2), preserve v1's data
+                                        self.solver.variables.lock().unify(*v2, *v1);
+                                    } else if b2_subtype_of_b1 {
+                                        // b2 is stricter (subtype of b1), preserve v2's data
+                                        self.solver.variables.lock().unify(*v1, *v2);
+                                    } else {
+                                        // Bounds are incompatible
+                                        return Err(SubsetError::Other);
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
+                        // An empty container contributes no evidence for a shape-extension
+                        // parameter. Keep its validated direct source authoritative instead of
+                        // preserving the partial.
+                        (
+                            Variable::PartialContained(_),
+                            Variable::Quantified { quantified: q2, .. },
+                        ) if q2.restriction().uses_direct_value_source() => {
+                            drop(variable1);
+                            drop(variable2);
+                            variables.unify(*v1, *v2);
+                            Ok(())
+                        }
+                        (
+                            Variable::Quantified { quantified: q1, .. },
+                            Variable::PartialContained(_),
+                        ) if q1.restriction().uses_direct_value_source() => {
+                            drop(variable1);
+                            drop(variable2);
+                            variables.unify(*v2, *v1);
+                            Ok(())
+                        }
+                        (_, Variable::Quantified { .. }) => {
+                            drop(variable1);
+                            drop(variable2);
+                            // `unify` preserves the Variable in its second argument. When a Quantified
+                            // and a non-Quantified are unified, we preserve the non-Quantified to
+                            // avoid leaking unsolved type parameters across bindings.
+                            variables.unify(*v2, *v1);
+                            Ok(())
+                        }
+                        (_, _) => {
+                            drop(variable1);
+                            drop(variable2);
+                            variables.unify(*v1, *v2);
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            (Type::Var(v1), t2) => {
+                let variables = self.solver.variables.lock();
+                let v1_ref = variables.get(*v1);
+                match &*v1_ref {
+                    Variable::Answer { ty: t1, .. } => {
+                        let t1 = t1.clone();
+                        drop(v1_ref);
+                        drop(variables);
+                        self.is_subset_eq(&t1, t2)
+                    }
+                    Variable::Quantified { quantified: q, .. }
+                        if q.kind() == QuantifiedKind::ParamSpec =>
+                    {
+                        // TODO(https://github.com/facebook/pyrefly/issues/105): figure out what to
+                        // do with ParamSpec.
+                        drop(v1_ref);
+                        variables.update(*v1, Variable::answer(t2.clone()));
+                        Ok(())
+                    }
+                    Variable::Quantified { .. } | Variable::Unwrap(_) => {
+                        drop(v1_ref);
+                        drop(variables);
+                        self.solver
+                            .add_upper_bound(*v1, t2.clone(), &mut |got, want| {
+                                self.is_subset_eq(got, want)
+                            })
+                    }
+                    Variable::PartialQuantified(q) => {
+                        let name = q.name.clone();
+                        let kind = q.kind();
+                        let restriction = q.restriction().clone();
+                        let bound = q.upper_bound(self.type_order.stdlib(), &self.solver.heap);
+                        drop(v1_ref);
+
+                        // For constrained TypeVars, promote to the matching constraint type
+                        // rather than pinning to the raw argument type.
+                        if let Restriction::Constraints(constraints) = restriction {
+                            // Source-created IntVars are represented with an
+                            // unrestricted marker, not constraints; keep this
+                            // defensive path normalized in case an internal
+                            // quantified value is constructed with constraints.
+                            let answer = normalize_answer_for_kind(kind, Cow::Borrowed(t2));
+                            variables.update(*v1, Variable::answer(answer));
+                            drop(variables);
+                            if let Type::Quantified(q_t2) = t2 {
+                                if !self.quantified_satisfies_constraints(q_t2, &constraints) {
+                                    self.solver.instantiation_errors.write().insert(
+                                        *v1,
+                                        TypeVarSpecializationError::BadConstraintSpecialization {
+                                            name,
+                                            got: t2.clone(),
+                                            want: constraints,
+                                        },
+                                    );
+                                }
+                            } else if let Some(constraint) =
+                                self.find_matching_constraint(t2, &constraints)
+                            {
+                                let constraint =
+                                    normalize_answer_for_kind(kind, Cow::Borrowed(constraint));
+                                self.solver
+                                    .variables
+                                    .lock()
+                                    .update(*v1, Variable::answer(constraint));
+                            } else if !t2.is_any() {
+                                self.solver.instantiation_errors.write().insert(
+                                    *v1,
+                                    TypeVarSpecializationError::BadConstraintSpecialization {
+                                        name,
+                                        got: t2.clone(),
+                                        want: constraints,
+                                    },
+                                );
+                            }
+                        } else {
+                            let answer = normalize_answer_for_kind(kind, Cow::Borrowed(t2));
+                            variables.update(*v1, Variable::answer(answer));
+                            drop(variables);
+                            if self.is_subset_eq(t2, &bound).is_err() {
+                                self.solver.instantiation_errors.write().insert(
+                                    *v1,
+                                    TypeVarSpecializationError::BadBoundSpecialization {
+                                        name,
+                                        got: t2.clone(),
+                                        want: bound,
+                                    },
+                                );
+                            }
+                        }
+                        // Widen None to None | Any for PartialQuantified, matching
+                        // the PartialContained behavior (see comment there).
+                        let variables = self.solver.variables.lock();
+                        let v1_current = variables.get(*v1);
+                        if let Variable::Answer { ty: t, .. } = &*v1_current
+                            && t.is_none()
+                        {
+                            let widened =
+                                unions(vec![t.clone(), Type::any_implicit()], &self.solver.heap);
+                            drop(v1_current);
+                            variables.update(*v1, Variable::answer(widened));
+                        }
+                        Ok(())
+                    }
+                    Variable::PartialContained(_) => {
+                        drop(v1_ref);
+                        // When an empty container's element is pinned to None, widen to
+                        // None | Any. A bare None in the first use almost always means the
+                        // container will later hold some other (unknown) type, analogous
+                        // to how `self.x = None` is inferred as `None | Any` for attributes.
+                        let answer = if t2.is_none() {
+                            unions(vec![t2.clone(), Type::any_implicit()], &self.solver.heap)
+                        } else {
+                            t2.clone()
+                        };
+                        variables.update(*v1, Variable::answer(answer));
+                        Ok(())
+                    }
+                    Variable::Recursive => {
+                        drop(v1_ref);
+                        variables.update(*v1, Variable::answer(t2.clone()));
+                        Ok(())
+                    }
+                }
+            }
+            (t1, Type::Var(v2)) => {
+                let variables = self.solver.variables.lock();
+                let v2_ref = variables.get(*v2);
+                // Tuple actuals for `IntTuple`-bounded variables use dimension binding.
+                let has_int_tuple_bound = match &*v2_ref {
+                    Variable::Quantified { quantified, .. }
+                    | Variable::PartialQuantified(quantified) => has_int_tuple_bound(quantified),
+                    _ => false,
+                };
+                if has_int_tuple_bound && let Type::Tuple(tuple) = t1 {
+                    drop(v2_ref);
+                    drop(variables);
+                    return self.is_subset_tuple_to_int_tuple(
+                        tuple,
+                        &IntTuple::unpacked(Vec::new(), Type::Var(*v2), Vec::new()),
+                    );
+                }
+                match &*v2_ref {
+                    Variable::Answer {
+                        ty: t2, restricted, ..
+                    } => {
+                        let t2 = t2.clone();
+                        // Only the first violation per call is kept, so a parameter that this call
+                        // has already rejected needs no further checking.
+                        let param = restricted
+                            .as_ref()
+                            .filter(|r| r.error.is_none())
+                            .map(|r| r.param.clone());
+                        // Both guards are dropped before recursing: the mutex is not reentrant.
+                        drop(v2_ref);
+                        drop(variables);
+                        if let Some(param) = param {
+                            // A restriction violation is recorded only while an argument is being
+                            // matched against its parameter. Outside that, the solver may be trying
+                            // a pairing the call never makes, such as `T` against one member of a
+                            // `T | None` hint, and a violation recorded there is never undone.
+                            match self.active_call_context.argument_side() {
+                                ArgumentSide::NotAnalyzingACall => {}
+                                ArgumentSide::Got | ArgumentSide::Want => {
+                                    self.check_restricted_answer(t1, *v2, &param);
+                                }
+                            }
+                        }
+                        self.is_subset_eq(t1, &t2)
+                    }
+                    Variable::Quantified {
+                        quantified: q,
+                        bounds,
+                        bound_override,
+                    } => {
+                        let q = q.clone();
+                        let bound_override = bound_override.clone();
+                        let is_shape_extension_binding_source =
+                            self.is_shape_extension_binding_source(&q, *v2);
+                        // Optimization: compute the lower bound only when it is needed for
+                        // shape-extension value checks. Computing it unconditionally makes pytorch
+                        // incremental edits 4-5x slower on our LSP benchmarks.
+                        let lower_bound = is_shape_extension_binding_source
+                            .then(|| self.solver.get_current_bound(bounds.lower.clone()))
+                            .flatten();
+                        // A fallback bound must not prevent ordinary implicit-literal promotion.
+                        let upper_bound = self.solver.get_current_bound(
+                            bounds
+                                .upper
+                                .iter()
+                                .filter(|bound| !bound.is_placeholder())
+                                .cloned()
+                                .collect(),
+                        );
+                        drop(v2_ref);
+                        drop(variables);
+                        let (answer, specialization_error) = self.is_subset_eq_quantified(
+                            t1,
+                            &q,
+                            lower_bound.as_ref(),
+                            upper_bound.as_ref(),
+                            is_shape_extension_binding_source,
+                            bound_override.as_deref(),
+                        );
+                        if let Some(specialization_error) = specialization_error {
+                            self.solver
+                                .instantiation_errors
+                                .write()
+                                .insert(*v2, specialization_error);
+                        }
+                        if q.kind() == QuantifiedKind::ParamSpec
+                            // For constraints, `Any` usually does not provide any information, so
+                            // we drop it and pin to the first non-`Any` answer.
+                            || (matches!(q.restriction(), Restriction::Constraints(_)) && !answer.is_any())
+                            || is_shape_extension_binding_source
+                        {
+                            // If the TypeVar has constraints, we write the answer immediately to
+                            // enforce that we always match the same constraint.
+                            //
+                            // TODO(https://github.com/facebook/pyrefly/issues/105): figure out
+                            // what to do with ParamSpec.
+                            let answer = normalize_answer_for_kind(q.kind(), Cow::Owned(answer));
+                            self.solver
+                                .variables
+                                .lock()
+                                .update(*v2, Variable::answer(answer));
+                            Ok(())
+                        } else {
+                            self.solver.add_lower_bound(*v2, answer, &mut |got, want| {
+                                self.is_subset_eq(got, want)
+                            })
+                        }
+                    }
+                    Variable::PartialQuantified(q) => {
+                        let q = q.clone();
+                        drop(v2_ref);
+                        drop(variables);
+                        let (answer, specialization_error) = self.is_subset_eq_quantified(
+                            t1,
+                            &q,
+                            None,
+                            None,
+                            self.is_shape_extension_binding_source(&q, *v2),
+                            None,
+                        );
+                        let answer = normalize_answer_for_kind(q.kind(), Cow::Owned(answer));
+                        if let Some(specialization_error) = specialization_error {
+                            self.solver
+                                .instantiation_errors
+                                .write()
+                                .insert(*v2, specialization_error);
+                        }
+                        // Widen None to None | Any for PartialQuantified, matching
+                        // the PartialContained behavior (see comment there).
+                        let variables = self.solver.variables.lock();
+                        if answer.is_none() {
+                            let widened = unions(
+                                vec![answer.clone(), Type::any_implicit()],
+                                &self.solver.heap,
+                            );
+                            variables.update(*v2, Variable::answer(widened));
+                        } else {
+                            variables.update(*v2, Variable::answer(answer));
+                        }
+                        Ok(())
+                    }
+                    Variable::PartialContained(_) => {
+                        let t1_p = t1.clone().promote(self.type_order.stdlib());
+                        drop(v2_ref);
+                        // Widen None to None | Any (see comment at the other
+                        // PartialContained pinning site above).
+                        let answer = if t1_p.is_none() {
+                            unions(vec![t1_p, Type::any_implicit()], &self.solver.heap)
+                        } else {
+                            t1_p
+                        };
+                        variables.update(*v2, Variable::answer(answer));
+                        Ok(())
+                    }
+                    Variable::Unwrap(_) => {
+                        drop(v2_ref);
+                        drop(variables);
+                        self.solver
+                            .add_lower_bound(*v2, t1.clone(), &mut |got, want| {
+                                self.is_subset_eq(got, want)
+                            })
+                    }
+                    Variable::Recursive => {
+                        drop(v2_ref);
+                        variables.update(*v2, Variable::answer(t1.clone()));
+                        Ok(())
+                    }
+                }
+            }
+            _ => self.is_subset_eq_impl(got, want),
+        }
+    }
+}
+
+fn quantified_kind_for_unification(variable: &Variable) -> Option<QuantifiedKind> {
+    match variable {
+        Variable::Quantified { quantified, .. } | Variable::PartialQuantified(quantified) => {
+            Some(quantified.kind())
+        }
+        _ => None,
+    }
+}
+
+fn intvar_typevar_unify_order(
+    v1: Var,
+    variable1: &Variable,
+    v2: Var,
+    variable2: &Variable,
+) -> Option<(Var, Var)> {
+    // `unify(x, y)` preserves `y`'s variable data. If a symbolic-int variable
+    // meets an ordinary type variable, preserve the IntVar kind even if the
+    // ordinary TypeVar has a bound or constraints: later IntVar answers must
+    // remain symbolic integers, and any ordinary TypeVar restriction has already
+    // been checked when bounds were admitted.
+    match (
+        quantified_kind_for_unification(variable1),
+        quantified_kind_for_unification(variable2),
+    ) {
+        (Some(QuantifiedKind::IntVar), Some(QuantifiedKind::TypeVar)) => Some((v2, v1)),
+        (Some(QuantifiedKind::TypeVar), Some(QuantifiedKind::IntVar)) => Some((v1, v2)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use pyrefly_python::module::Module;
+    use pyrefly_python::module_name::ModuleName;
+    use pyrefly_python::module_path::ModulePath;
+    use pyrefly_python::nesting_context::NestingContext;
+    use pyrefly_types::class::ClassDefIndex;
+    use pyrefly_types::class::ClassType;
+    use pyrefly_types::dimension::Int;
+    use pyrefly_types::dimension::canonicalize;
+    use pyrefly_types::dimension::gradual_size;
+    use pyrefly_types::identity::IdentityIgnored;
+    use pyrefly_types::lit_int::LitInt;
+    use pyrefly_types::quantified::AnchorIndex;
+    use pyrefly_types::quantified::QuantifiedIdentity;
+    use pyrefly_types::quantified::QuantifiedOrigin;
+    use pyrefly_types::shaped_array::IntTuple;
+    use pyrefly_types::type_var::PreInferenceVariance;
+    use pyrefly_types::types::AnyStyle;
+    use pyrefly_types::types::TArgs;
+    use pyrefly_types::types::Union;
+    use ruff_python_ast::Identifier;
+    use ruff_text_size::TextSize;
+
+    use super::*;
+    use crate::types::class::PrecomputedTParams;
+
+    fn solver_with_answer(answer: Type) -> (Solver, Var) {
+        let solver = Solver::new(SolverConfig {
+            tensor_shapes: true,
+            ..Default::default()
+        });
+        let uniques = UniqueFactory::new();
+        let var = Var::new(&uniques);
+        solver
+            .variables
+            .lock()
+            .insert_fresh(var, Variable::answer(answer));
+        (solver, var)
+    }
+
+    #[test]
+    fn call_context_defers_quantified_only_to_a_real_boundary() {
+        let uniques = UniqueFactory::new();
+        let outside_var = Var::new(&uniques);
+        let outside_handle = CallContext::outside()
+            .with_argument_side(ArgumentSide::Got)
+            .defer_quantified(QuantifiedHandle(vec![outside_var]))
+            .expect_err("an argument side does not own quantified vars");
+
+        let boundary = CallBoundary::new();
+        boundary
+            .context()
+            .defer_quantified(outside_handle)
+            .expect("a context backed by a boundary owns quantified vars");
+        let boundary_var = Var::new(&uniques);
+        boundary.defer_quantified(QuantifiedHandle(vec![boundary_var]));
+
+        let (handles, captures) = boundary.into_parts();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0].vars(), &[outside_var]);
+        assert_eq!(handles[1].vars(), &[boundary_var]);
+        assert!(captures.overload.is_empty());
+        assert!(captures.generic.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "CallBoundary dropped without being consumed")]
+    fn call_boundary_must_be_consumed() {
+        drop(CallBoundary::new());
+    }
+
+    #[test]
+    fn sanitize_type_vars_follows_answer_chains_without_rewriting() {
+        let solver = Solver::new(SolverConfig {
+            tensor_shapes: true,
+            ..Default::default()
+        });
+        let uniques = UniqueFactory::new();
+        let range = TextRange::new(TextSize::new(1), TextSize::new(3));
+        let partial = solver.fresh_partial_contained(&uniques, range);
+        let outer = Var::new(&uniques);
+        solver
+            .variables
+            .lock()
+            .insert_fresh(outer, Variable::answer(Type::Var(partial)));
+        let ty = Type::Var(outer);
+
+        let errors = solver.sanitize_type_vars(&ty, true);
+
+        assert!(matches!(
+            errors.as_slice(),
+            [PinError::ImplicitPartialContained(error_range)] if *error_range == range
+        ));
+        assert!(solver.force_var(partial).is_any());
+        assert_eq!(ty, Type::Var(outer));
+        let variables = solver.variables.lock();
+        for var in [outer, partial] {
+            assert!(matches!(
+                &*variables.get(var),
+                Variable::Answer { frozen: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn sanitize_type_vars_freezes_through_a_quantified_needing_finalization() {
+        let solver = Solver::new(SolverConfig {
+            tensor_shapes: true,
+            ..Default::default()
+        });
+        let uniques = UniqueFactory::new();
+        let range = TextRange::new(TextSize::new(1), TextSize::new(3));
+        let partial = solver.fresh_partial_contained(&uniques, range);
+        let answer = Var::new(&uniques);
+        // The partial var sits in the quantified's restriction, which only a traversal of the
+        // stored answer reaches.
+        let ty = solver.heap.mk_quantified(
+            quantified_with_restriction(
+                QuantifiedKind::TypeVar,
+                0,
+                Restriction::Bound(Type::Var(partial)),
+            )
+            .with_needs_finalization(),
+        );
+        solver
+            .variables
+            .lock()
+            .insert_fresh(answer, Variable::answer(ty));
+
+        let errors = solver.sanitize_type_vars(&Type::Var(answer), true);
+
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [PinError::ImplicitPartialContained(error_range)] if *error_range == range
+            ),
+            "sanitizing must traverse into the stored answer and pin the partial var it holds"
+        );
+        let variables = solver.variables.lock();
+        assert!(matches!(
+            &*variables.get(answer),
+            Variable::Answer { frozen: true, .. }
+        ));
+        assert!(matches!(
+            &*variables.get(partial),
+            Variable::Answer { frozen: true, .. }
+        ));
+    }
+
+    #[test]
+    fn finishing_takes_the_restriction_record_off_the_answer() {
+        let solver = Solver::new(SolverConfig {
+            infer_with_first_use: true,
+            tensor_shapes: false,
+            strict_callable_subtyping: false,
+            strict_partial_subtyping: false,
+            spec_compliant_overloads: false,
+            legacy_overload_expansion: false,
+            reveal_type_qualified_names: false,
+        });
+        let uniques = UniqueFactory::new();
+        let var = Var::new(&uniques);
+        let bound = Type::ClassType(fake_array(TArgs::default()));
+        let param = quantified_with_restriction(
+            QuantifiedKind::TypeVar,
+            0,
+            Restriction::Bound(bound.clone()),
+        );
+        // Stand in for argument matching, which records the first violation it finds.
+        let error = TypeVarSpecializationError::BadBoundSpecialization {
+            name: param.name().clone(),
+            got: Type::None,
+            want: bound,
+        };
+        solver.variables.lock().insert_fresh(
+            var,
+            Variable::Answer {
+                ty: Type::Any(AnyStyle::Explicit),
+                frozen: false,
+                restricted: Some(Box::new(RestrictedAnswer {
+                    param,
+                    error: Some(error),
+                })),
+            },
+        );
+
+        let errors = solver
+            .finish_quantified_with_captures(
+                QuantifiedHandle(vec![var]),
+                false,
+                &mut |_| Some(VarSnapshot::default()),
+                &mut ArgumentCaptures::default(),
+            )
+            .1
+            .expect_err("the violation recorded while matching arguments is reported");
+
+        assert!(matches!(
+            errors.as_slice(),
+            [TypeVarSpecializationError::BadBoundSpecialization {
+                got: Type::None,
+                ..
+            }]
+        ));
+        assert!(
+            matches!(
+                &*solver.variables.lock().get(var),
+                Variable::Answer {
+                    ty: Type::Any(AnyStyle::Explicit),
+                    restricted: None,
+                    ..
+                }
+            ),
+            "the answer the expected type supplied is kept, and the record is gone before publication"
+        );
+    }
+
+    #[test]
+    fn restore_vars_preserves_vars_outside_the_snapshot() {
+        let solver = Solver::new(SolverConfig::default());
+        let uniques = UniqueFactory::new();
+        let inner = Var::new(&uniques);
+        let root = Var::new(&uniques);
+        let escapee = Var::new(&uniques);
+        let rank_filler = Var::new(&uniques);
+        {
+            let mut variables = solver.variables.lock();
+            variables.insert_fresh(inner, Variable::answer(Type::None));
+            variables.insert_fresh(root, Variable::answer(Type::None));
+            variables.insert_fresh(escapee, Variable::answer(Type::Any(AnyStyle::Explicit)));
+            variables.insert_fresh(rank_filler, Variable::answer(Type::None));
+            // `inner` becomes `Goto(root)`, and `root` gains rank 1.
+            variables.unify(inner, root);
+            // Raise `escapee`'s rank so the next unification points `root` at it, not the reverse.
+            variables.unify(rank_filler, escapee);
+        }
+
+        let snapshot = solver.snapshot_exact_vars(&[inner, root]);
+
+        {
+            let variables = solver.variables.lock();
+            // `root` becomes `Goto(escapee)`.
+            variables.unify(root, escapee);
+            // Verify that the test is set up correctly: both vars in the snapshot now point to a var
+            // outside the snapshot.
+            assert_eq!(variables.get_root(inner), escapee);
+            assert_eq!(variables.get_root(root), escapee);
+        }
+
+        solver.restore_vars(snapshot);
+
+        let variables = solver.variables.lock();
+        assert!(
+            matches!(&*variables.get(root), Variable::Answer { ty, .. } if *ty == Type::None),
+            "a snapshotted root is restored to its own answer"
+        );
+        assert_eq!(
+            variables.get_root(inner),
+            root,
+            "a `Goto` var's root is correctly restored"
+        );
+        assert!(
+            matches!(
+                &*variables.get(escapee),
+                Variable::Answer { ty, .. } if *ty == Type::Any(AnyStyle::Explicit)
+            ),
+            "a var outside the snapshot keeps its own answer"
+        );
+    }
+
+    #[test]
+    fn speculative_inference_snapshot_restores_variables_referenced_only_by_bounds() {
+        let solver = Solver::new(SolverConfig::default());
+        let uniques = UniqueFactory::new();
+        let inner = Var::new(&uniques);
+        let inner_alias = Var::new(&uniques);
+        let upper_inner = Var::new(&uniques);
+        let outer = Var::new(&uniques);
+        {
+            let mut variables = solver.variables.lock();
+            variables.insert_fresh(inner, Variable::answer(Type::None));
+            variables.insert_fresh(inner_alias, Variable::answer(Type::None));
+            variables.unify(inner_alias, inner);
+            variables.insert_fresh(upper_inner, Variable::answer(Type::None));
+            variables.insert_fresh(
+                outer,
+                Variable::Quantified {
+                    quantified: quantified(QuantifiedKind::TypeVar, 0),
+                    bounds: Bounds {
+                        lower: vec![Type::Var(inner_alias)],
+                        upper: vec![Type::Var(upper_inner)],
+                    },
+                    bound_override: None,
+                },
+            );
+        }
+
+        let snapshot = solver.snapshot_reachable_vars(&[&Type::Var(outer)]);
+        solver
+            .variables
+            .lock()
+            .update(inner, Variable::answer(Type::Any(AnyStyle::Explicit)));
+        solver
+            .variables
+            .lock()
+            .update(upper_inner, Variable::answer(Type::Any(AnyStyle::Explicit)));
+        solver.restore_vars(snapshot);
+
+        assert!(
+            matches!(&*solver.variables.lock().get(inner), Variable::Answer { ty, .. } if *ty == Type::None),
+            "rollback must include variables reachable only through existing bounds"
+        );
+        assert_eq!(
+            solver.variables.lock().get_root(inner_alias),
+            inner,
+            "rollback must preserve union-find links reached through existing bounds"
+        );
+        assert!(
+            matches!(&*solver.variables.lock().get(upper_inner), Variable::Answer { ty, .. } if *ty == Type::None),
+            "rollback must include variables reachable only through upper bounds"
+        );
+    }
+
+    fn quantified(kind: QuantifiedKind, index: u32) -> Quantified {
+        quantified_with_restriction(kind, index, Restriction::Unrestricted)
+    }
+
+    fn quantified_with_restriction(
+        kind: QuantifiedKind,
+        index: u32,
+        restriction: Restriction,
+    ) -> Quantified {
+        Quantified::new(
+            QuantifiedIdentity::new(
+                ModuleName::from_str("test"),
+                AnchorIndex::new(TextRange::default(), index),
+                QuantifiedOrigin::synthetic(),
+            ),
+            Name::new(match kind {
+                QuantifiedKind::IntVar => "S",
+                QuantifiedKind::TypeVar => "T",
+                QuantifiedKind::ParamSpec | QuantifiedKind::TypeVarTuple => {
+                    unreachable!("test only creates scalar quantifieds")
+                }
+            }),
+            kind,
+            None,
+            restriction,
+            PreInferenceVariance::Invariant,
+        )
+    }
+
+    #[test]
+    fn direct_int_tuple_bound_has_shape_aware_gradual_fallback() {
+        let int_tuple = quantified_with_restriction(
+            QuantifiedKind::TypeVar,
+            0,
+            Restriction::Bound(IntTuple::shapeless().to_shape_arg_type()),
+        );
+        let precise_bound =
+            IntTuple::new(vec![Int::Literal(2), Int::Literal(3)]).to_shape_arg_type();
+        let precise_int_tuple = quantified_with_restriction(
+            QuantifiedKind::TypeVar,
+            1,
+            Restriction::Bound(precise_bound.clone()),
+        );
+        let ordinary_bound =
+            quantified_with_restriction(QuantifiedKind::TypeVar, 2, Restriction::Bound(Type::None));
+        let unrestricted = quantified(QuantifiedKind::TypeVar, 3);
+
+        assert_eq!(
+            quantified_gradual_type(&int_tuple),
+            IntTuple::shapeless().to_shape_arg_type(),
+        );
+        assert_eq!(quantified_gradual_type(&precise_int_tuple), precise_bound);
+        assert!(quantified_gradual_type(&ordinary_bound).is_any());
+        assert!(quantified_gradual_type(&unrestricted).is_any());
+    }
+
+    fn fake_array(targs: TArgs) -> ClassType {
+        let module = Module::new(
+            ModuleName::from_str("test"),
+            ModulePath::filesystem(PathBuf::from("test")),
+            Arc::new("fake module contents".to_owned()),
+        );
+        ClassType::new(
+            Class::new(
+                ClassDefIndex(0),
+                Identifier::new(Name::new("Array"), TextRange::empty(TextSize::new(0))),
+                NestingContext::toplevel(),
+                module,
+                PrecomputedTParams::NotGeneric,
+                false,
+                None,
+            ),
+            targs,
+        )
+    }
+
+    #[test]
+    fn expand_with_bounds_canonicalizes_solved_int_literals() {
+        let (solver, var) = solver_with_answer(LitInt::new(2).to_implicit_type());
+        let mut ty = Type::Int(Int::add(Type::Var(var), Type::Int(Int::Literal(1))));
+
+        solver.expand_with_bounds(&mut ty);
+
+        assert_eq!(ty, Type::Int(Int::Literal(3)));
+    }
+
+    #[test]
+    fn expand_with_bounds_canonicalizes_solved_gradual_int() {
+        let (solver, var) = solver_with_answer(Type::Any(AnyStyle::Explicit));
+        let mut ty = Type::Int(Int::mul(Type::Int(Int::Literal(2)), Type::Var(var)));
+
+        solver.expand_with_bounds(&mut ty);
+
+        assert_eq!(ty, gradual_size());
+    }
+
+    #[test]
+    fn expand_with_bounds_preserves_quantified_int_leaves() {
+        let cases = [QuantifiedKind::IntVar, QuantifiedKind::TypeVar];
+        for (index, kind) in cases.into_iter().enumerate() {
+            let quantified = quantified(kind, index as u32);
+            let quantified_ty = Type::Quantified(Box::new(quantified));
+            let (solver, var) = solver_with_answer(quantified_ty.clone());
+            let mut ty = Type::Int(Int::add(Type::Var(var), Type::Int(Int::Literal(1))));
+
+            solver.expand_with_bounds(&mut ty);
+
+            assert_eq!(
+                ty,
+                Type::Int(Int::add(quantified_ty, Type::Int(Int::Literal(1)))),
+            );
+        }
+    }
+
+    #[test]
+    fn expand_with_bounds_canonicalizes_int_inside_tuple_splice() {
+        let quantified_ty = Type::Quantified(Box::new(quantified(QuantifiedKind::IntVar, 0)));
+        let raw_compound = Type::Int(Int::add(quantified_ty.clone(), quantified_ty));
+        let expected_compound = canonicalize(raw_compound.clone());
+        assert_ne!(raw_compound, expected_compound);
+
+        let (solver, var) = solver_with_answer(Type::Tuple(Tuple::Concrete(vec![raw_compound])));
+        let mut ty = Type::Tuple(Tuple::unpacked(
+            vec![Type::Int(Int::Literal(1))],
+            Type::Var(var),
+            vec![Type::Int(Int::Literal(3))],
+        ));
+
+        solver.expand_with_bounds(&mut ty);
+
+        assert_eq!(
+            ty,
+            Type::Tuple(Tuple::unpacked(
+                vec![Type::Int(Int::Literal(1))],
+                Type::Tuple(Tuple::Concrete(vec![expected_compound])),
+                vec![Type::Int(Int::Literal(3))],
+            ))
+        );
+    }
+
+    #[test]
+    fn expand_with_bounds_does_not_simplify_non_int_types() {
+        let union = Type::Union(Box::new(Union {
+            members: vec![Type::None, Type::None],
+            display_name: IdentityIgnored(None),
+        }));
+        let (solver, var) = solver_with_answer(union.clone());
+        let mut ty = Type::Var(var);
+
+        solver.expand_with_bounds(&mut ty);
+
+        assert_eq!(ty, union);
+    }
+
+    #[test]
+    fn simplify_mut_flattens_reachable_concrete_tuple_unpack() {
+        let (solver, var) = solver_with_answer(Type::Tuple(Tuple::Concrete(vec![Type::Int(
+            Int::Literal(2),
+        )])));
+        let mut ty = Type::Tuple(Tuple::unpacked(
+            vec![Type::Int(Int::Literal(1))],
+            Type::Var(var),
+            vec![Type::Int(Int::Literal(3))],
+        ));
+
+        solver.expand_mut(&mut ty);
+
+        assert_eq!(
+            ty,
+            Type::Tuple(Tuple::Concrete(vec![
+                Type::Int(Int::Literal(1)),
+                Type::Int(Int::Literal(2)),
+                Type::Int(Int::Literal(3)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn simplify_mut_normalizes_standalone_int_tuple() {
+        let (solver, var) = solver_with_answer(Type::Tuple(Tuple::Concrete(vec![
+            Type::Int(Int::Literal(2)),
+            Type::Int(Int::Literal(3)),
+        ])));
+        let mut ty =
+            IntTuple::unpacked(vec![Int::Literal(1)], Type::Var(var), vec![Int::Literal(4)])
+                .to_shape_arg_type();
+
+        solver.expand_mut(&mut ty);
+
+        assert_eq!(
+            ty,
+            IntTuple::from_types(vec![
+                Type::Int(Int::Literal(1)),
+                Type::Int(Int::Literal(2)),
+                Type::Int(Int::Literal(3)),
+                Type::Int(Int::Literal(4)),
+            ])
+            .to_shape_arg_type()
+        );
+    }
+
+    #[test]
+    fn simplify_mut_flattens_tuple_unpack_in_standalone_int_tuple() {
+        let nested = Type::Unpack(Box::new(Type::Tuple(Tuple::Concrete(vec![
+            Type::Int(Int::Literal(2)),
+            Type::Int(Int::Literal(3)),
+        ]))));
+        let (solver, var) = solver_with_answer(Type::Tuple(Tuple::Concrete(vec![nested])));
+        let mut ty =
+            IntTuple::unpacked(vec![Int::Literal(1)], Type::Var(var), vec![Int::Literal(4)])
+                .to_shape_arg_type();
+
+        solver.expand_mut(&mut ty);
+
+        assert_eq!(
+            ty,
+            IntTuple::from_types(vec![
+                Type::Int(Int::Literal(1)),
+                Type::Int(Int::Literal(2)),
+                Type::Int(Int::Literal(3)),
+                Type::Int(Int::Literal(4)),
+            ])
+            .to_shape_arg_type()
+        );
+    }
+
+    #[test]
+    fn intvar_typevar_unification_preserves_intvar_kind() {
+        let cases = [
+            (
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Unrestricted,
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+            (
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Unrestricted,
+            ),
+            (
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Bound(Type::any_implicit()),
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+            (
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+            (
+                true,
+                QuantifiedKind::IntVar,
+                Restriction::Unrestricted,
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+            (
+                false,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+                true,
+                QuantifiedKind::IntVar,
+                Restriction::Unrestricted,
+            ),
+            (
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Bound(Type::any_implicit()),
+                true,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+            (
+                true,
+                QuantifiedKind::TypeVar,
+                Restriction::Bound(Type::any_implicit()),
+                false,
+                QuantifiedKind::IntVar,
+                Restriction::Bound(Type::any_implicit()),
+            ),
+        ];
+        for (index, (v1_quantified, k1, r1, v2_quantified, k2, r2)) in cases.into_iter().enumerate()
+        {
+            let solver = Solver::new(SolverConfig {
+                tensor_shapes: true,
+                ..Default::default()
+            });
+            let uniques = UniqueFactory::new();
+            let v1 = Var::new(&uniques);
+            let v2 = Var::new(&uniques);
+            let q1 = quantified_with_restriction(k1, (index * 2) as u32, r1);
+            let q2 = quantified_with_restriction(k2, (index * 2 + 1) as u32, r2);
+            let mut variables = solver.variables.lock();
+            variables.insert_fresh(
+                v1,
+                if v1_quantified {
+                    Variable::Quantified {
+                        quantified: q1,
+                        bounds: Bounds::new(),
+                        bound_override: None,
+                    }
+                } else {
+                    Variable::PartialQuantified(q1)
+                },
+            );
+            variables.insert_fresh(
+                v2,
+                if v2_quantified {
+                    Variable::Quantified {
+                        quantified: q2,
+                        bounds: Bounds::new(),
+                        bound_override: None,
+                    }
+                } else {
+                    Variable::PartialQuantified(q2)
+                },
+            );
+            let variable1 = variables.get(v1);
+            let variable2 = variables.get(v2);
+            let (x, y) = intvar_typevar_unify_order(v1, &variable1, v2, &variable2)
+                .expect("case should require IntVar-preserving unification");
+            drop(variable1);
+            drop(variable2);
+            variables.unify(x, y);
+
+            for var in [v1, v2] {
+                let current = variables.get(var);
+                assert!(match &*current {
+                    Variable::Quantified { quantified, .. } => {
+                        quantified.kind() == QuantifiedKind::IntVar
+                    }
+                    Variable::PartialQuantified(q) => q.kind() == QuantifiedKind::IntVar,
+                    _ => false,
+                });
+            }
+        }
+    }
+}

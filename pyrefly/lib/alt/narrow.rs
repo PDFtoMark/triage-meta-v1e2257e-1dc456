@@ -1,0 +1,3069 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use dupe::Dupe;
+use num_traits::ToPrimitive;
+use pyrefly_config::error_kind::ErrorKind;
+use pyrefly_graph::index::Idx;
+use pyrefly_python::ast::Ast;
+use pyrefly_python::dunder;
+use pyrefly_types::class::Class;
+use pyrefly_types::display::TypeDisplayContext;
+use pyrefly_types::facet::FacetChain;
+use pyrefly_types::facet::FacetKind;
+use pyrefly_types::facet::UnresolvedFacetChain;
+use pyrefly_types::facet::UnresolvedFacetKind;
+use pyrefly_types::known_class::KnownClass;
+use pyrefly_types::quantified::Quantified;
+use pyrefly_types::simplify::intersect;
+use pyrefly_types::simplify::simplify_tuples;
+use pyrefly_types::type_alias::TypeAliasData;
+use pyrefly_types::type_info::JoinStyle;
+use pyrefly_types::typed_dict::ExtraItems;
+use pyrefly_util::prelude::SliceExt;
+use pyrefly_util::visit::Visit;
+use ruff_python_ast::Arguments;
+use ruff_python_ast::AtomicNodeIndex;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ExprBinOp;
+use ruff_python_ast::ExprNumberLiteral;
+use ruff_python_ast::ExprUnaryOp;
+use ruff_python_ast::Int;
+use ruff_python_ast::Number;
+use ruff_python_ast::Operator;
+use ruff_python_ast::UnaryOp;
+use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use starlark_map::small_set::SmallSet;
+use vec1::Vec1;
+
+use crate::alt::answers::LookupAnswer;
+use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::call::CallTargetLookup;
+use crate::alt::callable::CallArg;
+use crate::alt::callable::CallKeyword;
+use crate::alt::polars_specials::polars_degrade_for_mutation;
+use crate::alt::solve::TypeFormContext;
+use crate::alt::types::instance::Instance;
+use crate::binding::binding::Key;
+use crate::binding::binding::MatchCaseNegations;
+use crate::binding::narrow::AtomicNarrowOp;
+use crate::binding::narrow::FacetOrigin;
+use crate::binding::narrow::FacetSubject;
+use crate::binding::narrow::NarrowOp;
+use crate::binding::narrow::NarrowSource;
+use crate::binding::narrow::NarrowingSubject;
+use crate::error::collector::ErrorCollector;
+use crate::error::style::ErrorStyle;
+use crate::types::class::ClassType;
+use crate::types::function::FunctionKind;
+use crate::types::lit_int::LitInt;
+use crate::types::literal::Lit;
+use crate::types::tuple::Tuple;
+use crate::types::type_info::TypeInfo;
+use crate::types::type_var::Restriction;
+use crate::types::types::CalleeKind;
+use crate::types::types::TParams;
+use crate::types::types::Type;
+
+/// Synthesize an `Expr` for an integer index, producing a `NumberLiteral` for
+/// non-negative values and `UnaryOp(USub, NumberLiteral)` for negative values.
+fn synthesize_int_slice(idx: i64) -> Expr {
+    let fake_range = TextRange::empty(TextSize::from(0));
+    let node_index = AtomicNodeIndex::default();
+    if idx >= 0 {
+        Expr::NumberLiteral(ExprNumberLiteral {
+            node_index,
+            range: fake_range,
+            value: Number::Int(Int::from(idx as u64)),
+        })
+    } else {
+        Expr::UnaryOp(ExprUnaryOp {
+            node_index,
+            range: fake_range,
+            op: UnaryOp::USub,
+            operand: Box::new(Expr::NumberLiteral(ExprNumberLiteral {
+                node_index: AtomicNodeIndex::default(),
+                range: fake_range,
+                value: Number::Int(Int::from(idx.unsigned_abs())),
+            })),
+        })
+    }
+}
+
+/// Append `facet` to an existing facet chain, or start a new one.
+fn extend_facet_chain(resolved_chain: Option<&FacetChain>, facet: FacetKind) -> Vec1<FacetKind> {
+    match resolved_chain {
+        Some(chain) => {
+            let mut facets = chain.facets().clone();
+            facets.push(facet);
+            facets
+        }
+        None => Vec1::new(facet),
+    }
+}
+
+/// Beyond this size, don't try and narrow an enum.
+///
+/// If we have over 100 fields, the odds of the negative-type being useful is vanishingly small.
+/// But the cost to create such a type (and then probably knock individual elements out of it)
+/// is very high.
+const NARROW_ENUM_LIMIT: usize = 100;
+
+#[derive(Clone, Copy)]
+pub(crate) enum IntersectFallback {
+    Never,
+    Right,
+}
+
+impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    // Get the union of all members of an enum, minus the specified member
+    fn subtract_enum_member(&self, instance: Instance, name: &Name) -> Type {
+        if self
+            .get_class_fields(instance.class)
+            .is_some_and(|f| f.len() > NARROW_ENUM_LIMIT)
+        {
+            return instance.to_type(self.heap);
+        }
+        self.get_enum_from_class(instance.class)
+            .expect("enum subtraction requires an enum class");
+        // Enums derived from enum.Flag cannot be treated as a union of their members
+        if self.has_superclass(instance.class, self.stdlib.enum_flag().class_object()) {
+            return instance.to_type(self.heap);
+        }
+        self.unions(
+            self.get_enum_members(instance.class)
+                .into_iter()
+                .filter_map(|f| {
+                    if let Lit::Enum(lit_enum) = &f
+                        && &lit_enum.member == name
+                    {
+                        None
+                    } else {
+                        Some(f.to_implicit_type())
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Return the most specific disjoint base for a type per PEP 800.
+    ///
+    /// `Self` and bounded type variables inherit the representative of their
+    /// class/bound, since every value they can denote is constrained by it.
+    /// Falls back to `object` for anything not explicitly disjoint.
+    pub fn disjoint_base(&self, t: &Type) -> Class {
+        match t {
+            Type::ClassType(cls) | Type::SelfType(cls) => {
+                let class = cls.class_object();
+                self.get_disjoint_base_for_class(class)
+                    .representative()
+                    .cloned()
+                    .unwrap_or_else(|| self.stdlib.object().class_object().dupe())
+            }
+            Type::Quantified(q) if q.is_type_var() => match q.restriction() {
+                Restriction::Bound(bound) => self.disjoint_base(bound),
+                Restriction::ShapeExtension(extension) => {
+                    self.disjoint_base(&extension.upper_bound(self.stdlib, self.heap))
+                }
+                Restriction::Constraints(_) | Restriction::Unrestricted => {
+                    self.stdlib.object().class_object().dupe()
+                }
+            },
+            Type::Tuple(_) => self.stdlib.tuple_object().clone(),
+            _ => self.stdlib.object().class_object().clone(),
+        }
+    }
+
+    fn intersect_impl(&self, left: &Type, right: &Type, fallback: IntersectFallback) -> Type {
+        if Self::enum_instance(left, right).is_some() {
+            right.clone()
+        } else if Self::enum_instance(right, left).is_some() {
+            left.clone()
+        } else if self.is_subset_eq(right, left) {
+            if left.is_toplevel_callable()
+                && right.is_toplevel_callable()
+                && self.is_subset_eq(left, right)
+            {
+                // If is_subset_eq checks succeed in both directions, we typically want to
+                // return `right`, which corresponds to more recently encountered type info.
+                // The exception is that, for callables, it's common to intersect a callable
+                // with `(...) -> object` via `builtins.callable`, so we return the original
+                // callable type.
+                left.clone()
+            } else {
+                right.clone()
+            }
+        } else if left.is_typed_dict() != right.is_typed_dict() {
+            // Use runtime representation of TypedDict for intersections w/ non-TypedDicts
+            // Normally, TypedDict is not assignable to dict to avoid unsafe aliasing
+            let runtime_class = self.heap.mk_class_type(self.stdlib.dict(
+                self.heap.mk_class_type(self.stdlib.str().clone()),
+                self.heap.mk_class_type(self.stdlib.object().clone()),
+            ));
+            if left.is_typed_dict() && self.is_subset_eq(&runtime_class, right) {
+                left.clone()
+            } else if right.is_typed_dict() && self.is_subset_eq(&runtime_class, left) {
+                right.clone()
+            } else {
+                self.heap.mk_never()
+            }
+        } else if self.is_subset_eq(left, right) {
+            left.clone()
+        } else if let (Type::Type(left), Type::Type(right)) = (left, right) {
+            let inner = self.intersect_with_fallback(left, right, fallback);
+            if inner.is_never() {
+                inner
+            } else {
+                self.heap.mk_type_of(inner)
+            }
+        } else if let (Type::ClassType(cls), Type::SelfType(self_cls))
+        | (Type::SelfType(self_cls), Type::ClassType(cls)) = (left, right)
+            && self.as_superclass(cls, self_cls.class_object()).as_ref() == Some(self_cls)
+        {
+            // ClassType(C) & SelfType(Parent) simplifies to SelfType(C) when C
+            // is a subclass of Parent with a matching inherited instantiation.
+            // Self[Parent] represents "Parent or any subclass", so narrowing it
+            // to the subclass C keeps it a self-type anchored at C: attribute and
+            // constructor lookups resolve through C, while the value stays
+            // assignable back to Self[Parent] (all self-types are mutually
+            // assignable). Collapsing to a plain ClassType(C) instead would drop
+            // the self-ness and spuriously reject `return self`/`return cls()`
+            // against a declared `-> Self`.
+            // Producing a SelfType (rather than an unsimplified Intersect) also
+            // avoids leaking Intersect types to downstream consumers that don't
+            // handle them.
+            self.heap.mk_self_type(cls.clone())
+        } else if left.is_scalar() || right.is_scalar() {
+            // The only inhabited intersections of literals are things like
+            // `Literal[0] & Literal[0]` or `Literal[0] & int` that would have already been
+            // intercepted by the is_subset_eq checks above. type(None) cannot be subclassed.
+            self.heap.mk_never()
+        } else {
+            let fallback = match fallback {
+                IntersectFallback::Never => return self.heap.mk_never(),
+                IntersectFallback::Right if right.is_never() => return right.clone(),
+                IntersectFallback::Right => right,
+            };
+            if let Type::ClassType(left_cls) = left
+                && let Type::ClassType(right_cls) = right
+                && (!self.is_subclassable(left_cls.class_object())
+                    || !self.is_subclassable(right_cls.class_object()))
+            {
+                // The only way for `left & right` to exist is if it is an instance of a class that
+                // multiply inherits from both `left` and `right`'s classes. But at least one of
+                // the classes cannot be subclassed, so such a class does not exist.
+                self.heap.mk_never()
+            } else {
+                let left_base = self.disjoint_base(left);
+                let right_base = self.disjoint_base(right);
+                if self.has_superclass(&left_base, &right_base)
+                    || self.has_superclass(&right_base, &left_base)
+                {
+                    intersect(
+                        vec![left.clone(), right.clone()],
+                        fallback.clone(),
+                        self.heap,
+                    )
+                } else {
+                    // A common subclass of these two classes cannot exist.
+                    self.heap.mk_never()
+                }
+            }
+        }
+    }
+
+    /// Get our best approximation of ty & right.
+    ///
+    /// If the intersection is empty - which does not necessarily indicate
+    /// an actual empty set because of multiple inheritance - use `fallback`
+    pub(crate) fn intersect_with_fallback(
+        &self,
+        left: &Type,
+        right: &Type,
+        fallback: IntersectFallback,
+    ) -> Type {
+        let mut narrowed = Vec::new();
+        self.map_over_union(left, |l| {
+            self.map_over_union(right, |r| {
+                let t = self.intersect_impl(l, r, fallback);
+                if !t.is_never() {
+                    narrowed.push(t);
+                }
+            });
+        });
+        match narrowed.len() {
+            0 => self.heap.mk_never(),
+            1 => narrowed.pop().expect("narrowed has one element"),
+            _ => self.unions(narrowed),
+        }
+    }
+
+    fn intersect(&self, left: &Type, right: &Type) -> Type {
+        self.intersect_with_fallback(left, right, IntersectFallback::Never)
+    }
+
+    fn narrow_enum_after_equality_match(&self, left: &Type, right: &Type) -> Option<Type> {
+        let Type::ClassType(class) = left else {
+            return None;
+        };
+        if !self.get_metadata_for_class(class.class_object()).is_enum() {
+            return None;
+        }
+        let mut matches = self
+            .get_enum_members(class.class_object())
+            .into_iter()
+            .filter(|lit| match lit {
+                Lit::Enum(lit_enum) => Self::literal_equal(&lit_enum.ty, right),
+                _ => false,
+            })
+            .map(Lit::to_implicit_type)
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        if matches.is_empty() {
+            None
+        } else {
+            Some(self.unions(matches))
+        }
+    }
+
+    /// Return the possible types of `left` after `left == right` evaluates to true.
+    fn narrow_after_equality_match(&self, left: &Type, right: &Type) -> Type {
+        let mut matches = Vec::new();
+        self.map_over_union(left, |left| {
+            self.map_over_union(right, |right| {
+                let narrowed = if self.equality_can_match_disjoint(left, right) {
+                    self.narrow_enum_after_equality_match(left, right)
+                        .unwrap_or_else(|| left.clone())
+                } else {
+                    self.intersect(left, right)
+                };
+                if !narrowed.is_never() {
+                    matches.push(narrowed);
+                }
+            });
+        });
+        matches.sort();
+        matches.dedup();
+        self.unions(matches)
+    }
+
+    /// Check whether a type can contain None, including within TypeVar bounds.
+    fn may_be_none(&self, ty: &Type) -> bool {
+        let mut may_be_none = false;
+        self.map_over_union(ty, |ty| {
+            may_be_none |= match ty {
+                Type::Quantified(q) => self.may_be_none(&q.upper_bound(self.stdlib, self.heap)),
+                _ => self.is_subset_eq(&Type::None, ty),
+            };
+        });
+        may_be_none
+    }
+
+    /// Element type of a `list`, `set`, `frozenset`, or `deque`.
+    fn concrete_container_element_type(&self, ty: &Type) -> Option<Type> {
+        let Type::ClassType(cls) = ty else {
+            return None;
+        };
+        let obj = cls.class_object();
+        let is_concrete = obj == self.stdlib.list_object()
+            || obj == self.stdlib.set_object()
+            || obj == self.stdlib.frozenset_object()
+            || cls.is(KnownClass::CollectionsDeque);
+        if !is_concrete {
+            return None;
+        }
+        self.unwrap_iterable(ty)
+    }
+
+    /// Calculate the intersection of a number of types
+    pub fn intersects(&self, ts: &[Type]) -> Type {
+        match ts {
+            [] => self.heap.mk_class_type(self.stdlib.object().clone()),
+            [ty] => ty.clone(),
+            [ty0, ty1] => self.intersect(ty0, ty1),
+            [ty0, ts @ ..] => self.intersect(ty0, &self.intersects(ts)),
+        }
+    }
+
+    /// Refine corresponding gradual slots without combining distinct static type arguments.
+    fn refine_gradual_intersection(&self, left: &Type, right: &Type) -> Option<Type> {
+        if left == right || right.is_any() {
+            return Some(left.clone());
+        }
+        if left.is_any() {
+            return Some(right.clone());
+        }
+        match (left, right) {
+            (Type::ClassType(left), Type::ClassType(right))
+                if left.class_object() == right.class_object() =>
+            {
+                let mut cls = left.clone();
+                for ((slot, left), right) in cls
+                    .targs_mut()
+                    .as_mut()
+                    .iter_mut()
+                    .zip(left.targs().as_slice())
+                    .zip(right.targs().as_slice())
+                {
+                    *slot = self.refine_gradual_intersection(left, right)?;
+                }
+                Some(self.heap.mk_class_type(cls))
+            }
+            (Type::Tuple(Tuple::Concrete(left)), Type::Tuple(Tuple::Concrete(right)))
+                if left.len() == right.len() =>
+            {
+                let elements = left
+                    .iter()
+                    .zip(right)
+                    .map(|(left, right)| self.refine_gradual_intersection(left, right))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(self.heap.mk_concrete_tuple(elements))
+            }
+            (Type::Tuple(Tuple::Unbounded(left)), Type::Tuple(Tuple::Unbounded(right))) => Some(
+                Type::unbounded_tuple(self.refine_gradual_intersection(left, right)?),
+            ),
+            (Type::Type(left), Type::Type(right)) => Some(
+                self.heap
+                    .mk_type_of(self.refine_gradual_intersection(left, right)?),
+            ),
+            _ => None,
+        }
+    }
+
+    fn has_callable_guarantee(ty: &Type) -> bool {
+        match ty {
+            Type::Intersect(intersection) => {
+                intersection.0.iter().any(Self::has_callable_guarantee)
+            }
+            ty => ty.is_toplevel_callable(),
+        }
+    }
+
+    fn has_nominal_guarantee(ty: &Type) -> bool {
+        match ty {
+            Type::ClassType(_) | Type::SelfType(_) => true,
+            Type::Intersect(intersection) => intersection.0.iter().any(Self::has_nominal_guarantee),
+            _ => false,
+        }
+    }
+
+    /// Intersect known type guarantees without erasing concrete information or callable metadata.
+    pub fn intersect_guarantees(&self, ts: &[Type]) -> Type {
+        fn flatten<'a>(ty: &'a Type, members: &mut Vec<&'a Type>) {
+            match ty {
+                Type::Intersect(intersection) => {
+                    for member in &intersection.0 {
+                        flatten(member, members);
+                    }
+                }
+                ty => members.push(ty),
+            }
+        }
+
+        assert!(
+            !ts.is_empty(),
+            "a type guarantee intersection must be nonempty"
+        );
+        let mut members = Vec::new();
+        for ty in ts {
+            flatten(ty, &mut members);
+        }
+        members.sort();
+        members.dedup();
+        let gradual = self.unions(
+            members
+                .iter()
+                .filter(|ty| ty.is_any())
+                .map(|ty| (*ty).clone())
+                .collect(),
+        );
+        let mut concrete = members.into_iter().filter(|ty| !ty.is_any());
+        let Some(first) = concrete.next() else {
+            return gradual;
+        };
+        let is_mapping_member = |ty: &Type| {
+            matches!(ty, Type::TypedDict(_) | Type::PartialTypedDict(_))
+                || matches!(ty, Type::ClassType(class) if class.class_object() == self.stdlib.dict_object() || class.class_object() == self.stdlib.mapping_object())
+        };
+        let is_mapping_view = |ty: &Type| match ty {
+            Type::Intersect(intersection) => intersection.0.iter().all(&is_mapping_member),
+            ty => is_mapping_member(ty),
+        };
+        let result = concrete.fold(first.clone(), |left, right| {
+            self.distribute_over_union(&left, |left| {
+                self.distribute_over_union(right, |right| {
+                    if matches!(left, Type::Intersect(intersection) if intersection.0.iter().any(Type::is_any))
+                        || matches!(right, Type::Intersect(intersection) if intersection.0.iter().any(Type::is_any))
+                    {
+                        self.intersect_guarantees(&[left.clone(), right.clone()])
+                    } else if left.is_any() && right.is_any() {
+                        self.unions(vec![left.clone(), right.clone()])
+                    } else if left.is_any() || right.is_any() {
+                        let fallback = if left.is_any() { right } else { left };
+                        intersect(vec![left.clone(), right.clone()], fallback.clone(), self.heap)
+                    } else if (Self::has_callable_guarantee(left)
+                        && (Self::has_callable_guarantee(right)
+                            || Self::has_nominal_guarantee(right)))
+                        || (Self::has_callable_guarantee(right)
+                            && Self::has_nominal_guarantee(left))
+                    {
+                        // Signature compatibility preserves neither callable identity nor nominal attributes.
+                        intersect(vec![left.clone(), right.clone()], right.clone(), self.heap)
+                    } else if let Some(refined) = self.refine_gradual_intersection(left, right) {
+                        refined
+                    } else if matches!((left, right), (Type::TypedDict(_), Type::ClassType(cls)) | (Type::ClassType(cls), Type::TypedDict(_)) if cls.class_object() == self.stdlib.dict_object() || cls.class_object() == self.stdlib.mapping_object())
+                        || ((matches!(left, Type::Intersect(_))
+                            || matches!(right, Type::Intersect(_)))
+                            && is_mapping_view(left)
+                            && is_mapping_view(right))
+                    {
+                        // Mutation-safe assignability does not establish disjoint dictionary values.
+                        intersect(vec![left.clone(), right.clone()], right.clone(), self.heap)
+                    } else if (left.any(|ty| ty.is_any()) || right.any(|ty| ty.is_any()))
+                        && self.is_subset_eq(left, right)
+                        && self.is_subset_eq(right, left)
+                    {
+                        // Gradual assignability in both directions is not type equivalence.
+                        intersect(vec![left.clone(), right.clone()], right.clone(), self.heap)
+                    } else {
+                        self.intersect_with_fallback(left, right, IntersectFallback::Right)
+                    }
+                })
+            })
+        });
+        if gradual.is_never() {
+            result
+        } else {
+            // Meet concrete contracts before gradual evidence can affect assignability.
+            self.distribute_over_union(&result, |ty| {
+                intersect(vec![ty.clone(), gradual.clone()], ty.clone(), self.heap)
+            })
+        }
+    }
+
+    /// Whether two types have no possible runtime value in common for the `invalid-cast` check.
+    ///
+    /// This is intentionally incomplete: uncertain type forms return `false` to avoid noisy
+    /// diagnostics. Also gates parameter widening in `make_bound_method`, where returning `true`
+    /// when unsure would be unsound.
+    pub fn is_provably_disjoint(&self, left: &Type, right: &Type) -> bool {
+        // Normalize types with a precise nominal runtime class, where disjointness is high signal.
+        // Return `None` for structural and gradual forms to avoid noisy invalid-cast diagnostics.
+        let runtime_type = |ty: &Type| match ty {
+            Type::ClassType(cls) if !cls.class_object().is_protocol() => {
+                let mut cls = cls.clone();
+                for arg in cls.targs_mut().as_mut() {
+                    *arg = self.heap.mk_any_implicit();
+                }
+                Some(self.heap.mk_class_type(cls))
+            }
+            Type::ClassDef(cls) => Some(
+                self.heap.mk_class_type(
+                    self.get_metadata_for_class(cls)
+                        .metaclass(self.stdlib)
+                        .clone(),
+                ),
+            ),
+            Type::Literal(lit) => Some(
+                self.heap
+                    .mk_class_type(lit.value.general_class_type(self.stdlib).clone()),
+            ),
+            Type::LiteralString(_) => Some(self.heap.mk_class_type(self.stdlib.str().clone())),
+            Type::None => Some(self.heap.mk_class_type(self.stdlib.none_type().clone())),
+            Type::Tuple(_) => Some(
+                self.heap
+                    .mk_class_type(self.stdlib.tuple(self.heap.mk_any_implicit())),
+            ),
+            Type::TypedDict(_) | Type::PartialTypedDict(_) => Some(
+                self.heap.mk_class_type(
+                    self.stdlib
+                        .dict(self.heap.mk_any_implicit(), self.heap.mk_any_implicit()),
+                ),
+            ),
+            _ => None,
+        };
+        let normalize = |ty: &Type| match ty {
+            Type::Union(union) => union
+                .members
+                .iter()
+                .map(&runtime_type)
+                .collect::<Option<Vec<_>>>()
+                .map(|members| self.unions(members)),
+            _ => runtime_type(ty),
+        };
+        let [Some(left), Some(right)] = [left, right].map(normalize) else {
+            return false;
+        };
+        self.intersect_with_fallback(&left, &right, IntersectFallback::Right)
+            .is_never()
+    }
+
+    /// Outer-level uncertainty makes assignability insufficient evidence for subtraction.
+    /// Type arguments do not affect the runtime class tested by `isinstance`.
+    fn is_toplevel_gradual(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Any(_) => true,
+            Type::ClassType(cls) | Type::SelfType(cls) => self.extends_any(cls.class_object()),
+            _ => false,
+        }
+    }
+
+    fn subtract(&self, left: &Type, right: &Type) -> Type {
+        if self.is_toplevel_gradual(right) {
+            return left.clone();
+        }
+        self.distribute_over_union(left, |left| {
+            if self.is_toplevel_gradual(left) {
+                return left.clone();
+            }
+            if left.is_typed_dict() && !right.is_typed_dict() {
+                // Use runtime representation of TypedDict for subtraction w/ non-TypedDicts
+                // Normally, TypedDict is not assignable to dict to avoid unsafe aliasing
+                let runtime_class = self.heap.mk_class_type(self.stdlib.dict(
+                    self.heap.mk_class_type(self.stdlib.str().clone()),
+                    self.heap.mk_class_type(self.stdlib.object().clone()),
+                ));
+                if self.is_subset_eq(&runtime_class, right) {
+                    self.heap.mk_never()
+                } else {
+                    left.clone()
+                }
+            } else if self.is_subset_eq(left, right) {
+                self.heap.mk_never()
+            } else {
+                left.clone()
+            }
+        })
+    }
+
+    fn enum_instance<'b, 'c>(left: &'b Type, right: &'c Type) -> Option<(Instance<'b>, &'c Name)> {
+        let left = match left {
+            Type::ClassType(cls) => Instance::of_class(cls),
+            Type::SelfType(cls) => Instance::of_self_type(cls),
+            _ => return None,
+        };
+        if let Type::Literal(right) = right
+            && let Lit::Enum(right) = &right.value
+            && left.class == right.class.class_object()
+            && left.targs == right.class.targs()
+        {
+            Some((left, &right.member))
+        } else {
+            None
+        }
+    }
+
+    /// Narrow a type by removing values identity-equal to `right` (`is not` semantics).
+    fn narrow_is_not(&self, ty: &Type, right: &Type) -> Type {
+        self.distribute_over_union(ty, |t| match (t, right) {
+            (_, right) if Self::is_identity_literal(right) && Self::literal_equal(t, right) => {
+                self.heap.mk_never()
+            }
+            (Type::Sentinel(s1), Type::Sentinel(s2)) if s1 == s2 => self.heap.mk_never(),
+            (Type::ClassType(cls), Type::Literal(lit))
+                if cls.is(KnownClass::Bool)
+                    && let Lit::Bool(b) = &lit.value =>
+            {
+                Lit::Bool(!b).to_implicit_type()
+            }
+            (left, right) if let Some((instance, name)) = Self::enum_instance(left, right) => {
+                self.subtract_enum_member(instance, name)
+            }
+            _ => t.clone(),
+        })
+    }
+
+    fn resolve_narrowing_call(
+        &self,
+        func: &Expr,
+        args: &Arguments,
+        errors: &ErrorCollector,
+    ) -> Option<AtomicNarrowOp> {
+        let func_ty = self.expr_infer(func, errors);
+        if args.args.len() > 1 {
+            let second_arg = &args.args[1];
+            let op = match func_ty.callee_kind() {
+                Some(CalleeKind::Function(FunctionKind::IsInstance)) => Some(
+                    AtomicNarrowOp::IsInstance(second_arg.clone(), NarrowSource::Call),
+                ),
+                Some(CalleeKind::Function(FunctionKind::IsSubclass)) => {
+                    Some(AtomicNarrowOp::IsSubclass(second_arg.clone()))
+                }
+                _ => None,
+            };
+            if op.is_some() {
+                return op;
+            }
+        }
+        if func_ty.is_typeis() {
+            Some(AtomicNarrowOp::TypeIs(func_ty.clone(), args.clone()))
+        } else if func_ty.is_typeguard() {
+            Some(AtomicNarrowOp::TypeGuard(func_ty.clone(), args.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Extract element expressions from a literal container (list, tuple, set)
+    /// or a builtin container constructor call wrapping one (list/tuple/set/frozenset).
+    /// Returns `None` if the expression is not a container whose elements can
+    /// be statically enumerated.
+    fn literal_membership_exprs(&self, expr: &Expr, errors: &ErrorCollector) -> Option<Vec<Expr>> {
+        match expr {
+            Expr::List(list) => Some(list.elts.clone()),
+            Expr::Tuple(tuple) => Some(tuple.elts.clone()),
+            Expr::Set(set) => Some(set.elts.clone()),
+            Expr::Call(call) => {
+                const CONTAINER_NAMES: &[&str] = &["list", "tuple", "set", "frozenset"];
+                // Cheap syntactic pre-check: only proceed when the callee looks like
+                // it *could* be a builtin container constructor (bare name or
+                // `builtins.<name>`). This avoids an expensive `expr_infer` call for
+                // the common case of arbitrary function calls.
+                let callee_name = match &*call.func {
+                    Expr::Name(name) => name.id.as_str(),
+                    Expr::Attribute(attr) => attr.attr.as_str(),
+                    _ => return None,
+                };
+                if !CONTAINER_NAMES.contains(&callee_name) {
+                    return None;
+                }
+                if !call.arguments.keywords.is_empty() {
+                    return None;
+                }
+                // Confirm via type inference that it's actually the builtin, to guard
+                // against shadowing or unrelated attributes with the same name.
+                let is_builtin_container = match self.expr_infer(&call.func, errors) {
+                    Type::ClassDef(cls) => matches!(
+                        cls.known(),
+                        Some(
+                            KnownClass::List
+                                | KnownClass::Tuple
+                                | KnownClass::Set
+                                | KnownClass::FrozenSet
+                        )
+                    ),
+                    _ => false,
+                };
+                if !is_builtin_container {
+                    return None;
+                }
+                match &*call.arguments.args {
+                    [] => Some(Vec::new()),
+                    [expr] => self.literal_membership_exprs(expr, errors),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn tuple_membership_type(
+        &self,
+        tuple: &Tuple,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Option<Type> {
+        let elements = match tuple {
+            Tuple::Concrete(elts) => elts.clone(),
+            Tuple::Unbounded(elt) => vec![(**elt).clone()],
+            Tuple::Unpacked(unpacked) => {
+                let (prefix, middle, suffix) = unpacked.parts();
+                let mut elements = prefix.to_vec();
+                let middle = if let Type::Var(_) = middle {
+                    self.force_for_narrowing(middle, range, errors)
+                } else {
+                    middle.clone()
+                };
+                match middle {
+                    Type::Tuple(tuple) => {
+                        elements.push(self.tuple_membership_type(&tuple, range, errors)?)
+                    }
+                    Type::TypeVarTuple(_) | Type::Quantified(_) | Type::Unpack(_) => return None,
+                    _ => elements.push(middle),
+                }
+                elements.extend_from_slice(suffix);
+                elements
+            }
+        };
+        if elements.iter().any(|ty| self.behaves_like_any(ty)) {
+            None
+        } else if elements.is_empty() {
+            Some(self.heap.mk_never())
+        } else {
+            Some(self.unions(elements))
+        }
+    }
+
+    /// Unwrap a class-info target to the instance type used for narrowing. When the right-hand
+    /// side is `tuple` and the left-hand side is a heterogeneous tuple type, creates a TypeVarTuple
+    /// for precise narrowing. Otherwise falls back to standard class object unwrapping.
+    fn unwrap_class_info_target(&self, left: &Type, right: &Type) -> Option<(TParams, Type)> {
+        let right_is_tuple = match right {
+            Type::Type(f) if matches!(&**f, Type::Tuple(_)) => true,
+            Type::ClassDef(cls) => cls.is(KnownClass::Tuple),
+            _ => false,
+        };
+        let narrow_heterogeneous_tuple = right_is_tuple
+            && match left {
+                Type::Tuple(_) => true,
+                Type::ClassType(cls) => self.as_tuple(cls).is_some(),
+                _ => false,
+            };
+        let (tparams, target) = if narrow_heterogeneous_tuple {
+            Some(self.instantiate_type_var_tuple())
+        } else if matches!(right, Type::ClassDef(c) if c == self.stdlib.builtins_type().class_object())
+        {
+            // `isinstance(x, type)` narrows `x` to its class-object part. When `x` is already a
+            // type-expression value, that part is `type[inner]`: `type[int]` stays precise and
+            // gradual `type[Any]` stays gradual.
+            match left {
+                Type::Type(_) => Some((TParams::empty(), left.clone())),
+                Type::TypeForm(inner) => {
+                    Some((TParams::empty(), self.heap.mk_type_of((**inner).clone())))
+                }
+                _ => self.unwrap_class_object_silently(right),
+            }
+        } else {
+            self.unwrap_class_object_silently(right)
+        }?;
+        let tparams = TParams::new(
+            tparams
+                .iter()
+                .cloned()
+                .map(Quantified::without_default)
+                .collect(),
+        );
+        Some((tparams, target))
+    }
+
+    /// Run `f` with the freshened instance type produced by unwrapping `right` as class info.
+    fn with_fresh_class_info_target(
+        &self,
+        left: &Type,
+        right: &Type,
+        f: impl FnOnce(Type) -> Type,
+    ) -> Option<Type> {
+        let (tparams, right) = self.unwrap_class_info_target(left, right)?;
+        let (vs, right) = self
+            .solver()
+            .fresh_quantified(&tparams, right, self.uniques);
+        let result = f(right);
+        // These are safe to ignore, as the only possible specialization errors are handled elsewhere:
+        // * If `left` is an invalid specialization, the error has already been reported at its definition site.
+        // * Unsafe runtime protocol overlaps are separately checked for in special_calls.rs.
+        let _specialization_errors = self.finish_quantified(vs, false);
+        Some(result)
+    }
+
+    /// Strip top-level `Any` from `ty` for `isinstance` narrowing.
+    /// Justified because `isinstance` gives definite runtime evidence that lets us
+    /// eliminate the uncertainty of a top-level `Any`.
+    /// (Note: this sacrifices the gradual guarantee, which Pyrefly treats as a
+    /// guiding principle rather than a hard goal.)
+    ///
+    /// Returns `(non_any_part, had_any)`. `non_any_part` is `ty` with all top-level
+    /// `Any`s stripped (or `None` if `ty` is purely `Any`). `had_any` is true when
+    /// anything was stripped. When `false`, the caller can just do a naive intersection;
+    /// when `true`, it must also union in the isinstance target type, since an
+    /// `Any`-typed value may be the target at runtime.
+    fn strip_any_for_narrowing(
+        &self,
+        ty: &Type,
+        aliases: &mut SmallSet<TypeAliasData>,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> (Option<Type>, bool) {
+        match ty {
+            Type::Any(_) => (None, true),
+            Type::Union(union) => {
+                let mut definites = Vec::new();
+                let mut has_dynamic_alternative = false;
+                for member in &union.members {
+                    let (definite, has_dynamic) =
+                        self.strip_any_for_narrowing(member, aliases, range, errors);
+                    if let Some(definite) = definite {
+                        definites.push(definite);
+                    }
+                    has_dynamic_alternative |= has_dynamic;
+                }
+                let definite = if definites.is_empty() {
+                    None
+                } else {
+                    Some(self.unions(definites))
+                };
+                (definite, has_dynamic_alternative)
+            }
+            Type::Intersect(intersection) => {
+                let (parts, fallback) = &**intersection;
+                let parts = parts
+                    .iter()
+                    .filter_map(|part| self.strip_any_for_narrowing(part, aliases, range, errors).0)
+                    .collect::<Vec<_>>();
+                if parts.is_empty() {
+                    (None, true)
+                } else {
+                    (Some(intersect(parts, fallback.clone(), self.heap)), false)
+                }
+            }
+            Type::UntypedAlias(alias) => {
+                if !aliases.insert((**alias).clone()) {
+                    return (Some(ty.clone()), false);
+                }
+                let expanded = self.untype_alias(alias);
+                let result = self.strip_any_for_narrowing(&expanded, aliases, range, errors);
+                aliases.shift_remove(&**alias);
+                result
+            }
+            Type::Var(_) => {
+                let forced = self.force_for_narrowing(ty, range, errors);
+                self.strip_any_for_narrowing(&forced, aliases, range, errors)
+            }
+            _ => (Some(ty.clone()), false),
+        }
+    }
+
+    fn narrow_isinstance_from_definite(&self, left: &Type, right: &Type) -> Type {
+        self.distribute_over_union(left, |l| {
+            self.with_fresh_class_info_target(l, right, |right| {
+                if right.is_any() {
+                    // NOTE(grievejia): The most precise refinement would be `left`:
+                    // `isinstance(x, Any)` provides no concrete evidence about the type
+                    // of `x`, so keeping the original type is sound. In practice, that is
+                    // currently too strict for some primer projects. Refining to `Any` is
+                    // a gradual-typing compromise; we can revisit `left` in strict mode.
+                    right.clone()
+                } else {
+                    // TODO: falling back to Never when the lhs is a union is a hack to get
+                    // reasonable behavior in cases like this:
+                    //     def f(x: int | list[int]):
+                    //         if isinstance(x, Iterable):
+                    //             reveal_type(x)
+                    // We want to narrow x to just `list[int]`, rather than `(int & Iterable[Unknown]) | list[int]`
+                    // A type variable target (`cls: type[T]`) is unrelated to every concrete
+                    // member, so the hack would narrow the whole union to `Never`; overlap
+                    // with the TypeVar's bound is still checked when intersecting.
+                    let fallback = if left.is_union()
+                        && !matches!(&right, Type::Quantified(q) if q.is_type_var())
+                    {
+                        IntersectFallback::Never
+                    } else {
+                        IntersectFallback::Right
+                    };
+                    self.intersect_with_fallback(l, &right, fallback)
+                }
+            })
+            .unwrap_or_else(|| l.clone())
+        })
+    }
+
+    fn narrow_isinstance(
+        &self,
+        left: &Type,
+        right: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let (definite, has_dynamic_alternative) =
+            self.strip_any_for_narrowing(left, &mut SmallSet::new(), range, errors);
+        let mut res = Vec::new();
+        for right in self.as_class_info(right.clone()) {
+            if let Some(definite) = &definite {
+                res.push(self.narrow_isinstance_from_definite(definite, &right));
+            }
+            if definite.is_none() || has_dynamic_alternative {
+                res.push(
+                    self.with_fresh_class_info_target(left, &right, |right| right)
+                        .unwrap_or_else(|| left.clone()),
+                );
+            }
+        }
+        self.unions(res)
+    }
+
+    fn narrow_typeis_target_from_definite(&self, left: &Type, right: &Type) -> Type {
+        if right.is_any() {
+            intersect(vec![left.clone(), right.clone()], left.clone(), self.heap)
+        } else {
+            // TODO: falling back to Never when the lhs is a union is a hack to get
+            // reasonable behavior in cases like this:
+            //     def f(x: int | Callable[[], int]):
+            //         if callable(x):
+            //             reveal_type(x)
+            // Both mypy and pyright say that the type of `x` on the last line is
+            // `() -> int`, whereas if we didn't fall back to Never, pyrefly would
+            // say `(int & (...) -> object) | () -> int`. A naive implementation of
+            // calling an intersection type would then lead to the type of `x()`
+            // being `object | int`. This is a surprising and unhelpful type, so we
+            // use Never as the fallback for now.
+            let fallback = if left.is_union() {
+                IntersectFallback::Never
+            } else {
+                IntersectFallback::Right
+            };
+            self.intersect_with_fallback(left, right, fallback)
+        }
+    }
+
+    fn narrow_typeis(
+        &self,
+        left: &Type,
+        right: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let (definite, has_dynamic_alternative) =
+            self.strip_any_for_narrowing(left, &mut SmallSet::new(), range, errors);
+        self.distribute_over_union(right, |right| {
+            let mut res = Vec::new();
+            if let Some(definite) = &definite {
+                res.push(self.narrow_typeis_target_from_definite(definite, right));
+            }
+            if definite.is_none() || has_dynamic_alternative {
+                res.push(right.clone());
+            }
+            self.unions(res)
+        })
+    }
+
+    fn narrow_is_not_instance(
+        &self,
+        left: &Type,
+        right_expr: &Expr,
+        source: NarrowSource,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let force_allow_negative = matches!(source, NarrowSource::Pattern);
+        let class_infos = self.expr_as_class_info(right_expr, errors);
+        // Subtract each class info from each union member of `left` in turn,
+        // rather than computing per-target results and intersecting them.
+        // Intersecting `subtract(L, A)` with `subtract(L, B)` reintroduces
+        // any union member that overlaps with both A and B (e.g. `Iterable[Any]`
+        // overlaps with both `str` and `bytes`), so `isinstance(x, (str, bytes))`
+        // would leave the negative branch unchanged. Sequential per-element
+        // subtraction avoids that.
+        self.distribute_over_union(left, |l| {
+            let mut result = l.clone();
+            for (right, allows_negative_narrow) in &class_infos {
+                let allows_negative_narrow = *allows_negative_narrow || force_allow_negative;
+                if !allows_negative_narrow {
+                    continue;
+                }
+                if let Some((tparams, right)) = self.unwrap_class_info_target(&result, right) {
+                    let (vs, right) = self
+                        .solver()
+                        .fresh_quantified(&tparams, right, self.uniques);
+                    // For TypeVars, subtract from the concrete constraints
+                    // so that e.g. isinstance(x, (int, float)) with T(int, str, float)
+                    // narrows the else branch to str instead of leaving it as T.
+                    result = if let Type::Quantified(q) = &result {
+                        let concrete = q.upper_bound(self.stdlib, self.heap);
+                        let subtraction = self.subtract(&concrete, &right);
+                        self.intersect_with_fallback(
+                            &result,
+                            &subtraction,
+                            IntersectFallback::Right,
+                        )
+                    } else {
+                        self.subtract(&result, &right)
+                    };
+                    // These are safe to ignore, as the only possible specialization errors are handled elsewhere:
+                    // * If `left` is an invalid specialization, the error has already been reported at its definition site.
+                    // * Unsafe runtime protocol overlaps are separately checked for in special_calls.rs.
+                    let _specialization_errors = self.finish_quantified(vs, false);
+                }
+            }
+            result
+        })
+    }
+
+    /// Narrow `type(X) == Y`. This is `isinstance(X, Y)` narrowing, except that when `Y` is a
+    /// class (rather than, say, a `type[Y]` value that may hold a subclass), X's class must be
+    /// exactly `Y`, so members whose class is a proper subclass of `Y` are impossible.
+    fn narrow_type_eq(&self, left: &Type, right_expr: &Expr, errors: &ErrorCollector) -> Type {
+        let right = self.expr_infer(right_expr, errors);
+        let narrowed = self.narrow_isinstance(left, &right, right_expr.range(), errors);
+        let Type::ClassDef(cls) = &right else {
+            return narrowed;
+        };
+        // Protocols are structural, so a nominal subclass check says nothing about runtime classes.
+        if cls.is_protocol() {
+            return narrowed;
+        }
+        self.distribute_over_union(&narrowed, |t| {
+            let member = match t {
+                Type::ClassType(c) => Some(c.class_object()),
+                Type::Literal(lit) => {
+                    Some(lit.value.general_class_type(self.stdlib).class_object())
+                }
+                _ => None,
+            };
+            match member {
+                // The runtime class of a `NewType` value is the underlying class, so we can't
+                // rule it out by its declared subclass relationship.
+                Some(member)
+                    if member != cls
+                        && !member.is_protocol()
+                        && !self.get_metadata_for_class(member).is_new_type()
+                        && self.has_superclass(member, cls) =>
+                {
+                    self.heap.mk_never()
+                }
+                _ => t.clone(),
+            }
+        })
+    }
+
+    /// Narrow `type(X) != Y`. We can only do negative narrowing if Y is final,
+    /// because otherwise X could still be a subclass of Y.
+    fn narrow_type_not_eq(&self, left: &Type, right_expr: &Expr, errors: &ErrorCollector) -> Type {
+        let right = self.expr_infer(right_expr, errors);
+        // Only narrow if the RHS is a non-subclassable class type (e.g., `type(x) != bool`)
+        if let Type::ClassDef(cls) = &right
+            && !self.is_subclassable(cls)
+        {
+            self.distribute_over_union(left, |l| {
+                if let Some((tparams, unwrapped)) = self.unwrap_class_info_target(l, &right) {
+                    let (vs, unwrapped) =
+                        self.solver()
+                            .fresh_quantified(&tparams, unwrapped, self.uniques);
+                    let result = self.subtract(l, &unwrapped);
+                    let _specialization_errors = self.finish_quantified(vs, false);
+                    result
+                } else {
+                    l.clone()
+                }
+            })
+        } else {
+            left.clone()
+        }
+    }
+
+    /// Turn an expression into a list of (type, allows_negative_narrow) pairs.
+    /// allows_negative_narrow means that we can do `not isinstance`/`not issubclass` narrowing
+    /// with the type. We allow negative narrowing as long as it is not definitely unsafe - that
+    /// is, if we're unsure, we allow it.
+    fn expr_as_class_info(&self, e: &Expr, errors: &ErrorCollector) -> Vec<(Type, bool)> {
+        fn f<Ans: LookupAnswer>(
+            me: &AnswersSolver<'_, '_, Ans>,
+            e: &Expr,
+            res: &mut Vec<(Type, bool)>,
+            errors: &ErrorCollector,
+        ) {
+            match e {
+                Expr::BinOp(ExprBinOp {
+                    left,
+                    op: Operator::BitOr,
+                    right,
+                    ..
+                }) => {
+                    f(me, left, res, errors);
+                    f(me, right, res, errors);
+                }
+                Expr::Tuple(tuple) if !tuple.elts.iter().any(|e| matches!(e, Expr::Starred(_))) => {
+                    for e in &tuple.elts {
+                        f(me, e, res, errors);
+                    }
+                }
+                _ => {
+                    let t = me.expr_infer(e, errors);
+                    if let Type::Type(f) = &t
+                        && let Type::ClassType(cls) = &**f
+                    {
+                        // If `type[C]` may be a subclass of `C`, negative narrowing is unsafe.
+                        let allows_negative_narrow = !me.is_subclassable(cls.class_object());
+                        res.push((t, allows_negative_narrow));
+                    } else {
+                        for t in me.as_class_info(t) {
+                            res.push((t, true));
+                        }
+                    }
+                }
+            }
+        }
+        let mut res = Vec::new();
+        f(self, e, &mut res, errors);
+        res
+    }
+
+    fn issubclass_result(&self, instance_result: Type, original: &Type) -> Type {
+        // If a ClassDef is not narrowed by an `issubclass` call,
+        // preserve the information that this is a bare class reference.
+        if matches!(original, Type::ClassDef(cls) if instance_result == self.promote_silently(cls))
+        {
+            original.clone()
+        } else {
+            self.heap.mk_type_of(instance_result)
+        }
+    }
+
+    fn narrow_issubclass(
+        &self,
+        left: &Type,
+        right: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let mut res = Vec::new();
+
+        let narrow = |left: &Type, right| {
+            if let Some(left_untyped) = self.untype_opt(left.clone(), range, errors) {
+                self.with_fresh_class_info_target(&left_untyped, &right, |right| {
+                    self.issubclass_result(
+                        self.intersect_with_fallback(
+                            &left_untyped,
+                            &right,
+                            IntersectFallback::Right,
+                        ),
+                        left,
+                    )
+                })
+                .unwrap_or_else(|| left.clone())
+            } else {
+                left.clone()
+            }
+        };
+
+        for right in self.as_class_info(right.clone()) {
+            if self.unwrap_class_object_silently(&right).is_some() {
+                // Handle type vars specially: we need to enforce restrictions and avoid
+                // simplifying them away.
+                let mut quantifieds = Vec::new();
+                let mut nonquantifieds = Vec::new();
+                self.map_over_union(left, |left| {
+                    if let Type::Quantified(q) = left {
+                        quantifieds.push((**q).clone());
+                    } else {
+                        nonquantifieds.push(left.clone());
+                    }
+                });
+                for q in quantifieds {
+                    // The only time it's safe to simplify a quantified away is when the entire intersection is Never.
+                    let intersection =
+                        narrow(&q.upper_bound(self.stdlib, self.heap), right.clone());
+                    res.push(if matches!(&intersection, Type::Type(t) if t.is_never()) {
+                        intersection
+                    } else {
+                        intersect(
+                            vec![q.to_type(self.heap), right.clone()],
+                            right.clone(),
+                            self.heap,
+                        )
+                    })
+                }
+                if !nonquantifieds.is_empty() {
+                    res.push(narrow(&self.unions(nonquantifieds), right.clone()));
+                }
+            } else {
+                res.push(left.clone())
+            }
+        }
+        self.unions(res)
+    }
+
+    fn narrow_is_not_subclass(
+        &self,
+        left: &Type,
+        right_expr: &Expr,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let mut res = Vec::new();
+        let left_untyped = self.distribute_over_union(left, |left| {
+            if let Some(left_untyped) = self.untype_opt(left.clone(), right_expr.range(), errors) {
+                left_untyped
+            } else {
+                // If `left` cannot be untyped, then `issubclass` cannot narrow it, so the negation
+                // preserves it.
+                res.push(left.clone());
+                Type::never()
+            }
+        });
+        if !left_untyped.is_never() {
+            for (right, allows_negative_narrow) in self.expr_as_class_info(right_expr, errors) {
+                if allows_negative_narrow
+                    && let Some((tparams, right)) = self.unwrap_class_object_silently(&right)
+                {
+                    let (vs, right) = self
+                        .solver()
+                        .fresh_quantified(&tparams, right, self.uniques);
+                    res.push(self.issubclass_result(self.subtract(&left_untyped, &right), left));
+                    // These are safe to ignore, as the only possible specialization errors are handled elsewhere:
+                    // * If `left` is an invalid specialization, the error has already been reported at its definition site.
+                    // * Unsafe runtime protocol overlaps are separately checked for in special_calls.rs.
+                    let _specialization_errors = self.finish_quantified(vs, false);
+                } else {
+                    res.push(left.clone())
+                }
+            }
+        }
+        self.intersects(&res)
+    }
+
+    fn narrow_length_greater(&self, ty: &Type, len: usize) -> Type {
+        self.distribute_over_union(ty, |ty| match ty {
+            Type::Tuple(Tuple::Concrete(elts)) if elts.len() <= len => self.heap.mk_never(),
+            Type::Literal(lit)
+                if let Lit::Str(x) = &lit.value
+                    && x.len() <= len =>
+            {
+                self.heap.mk_never()
+            }
+            Type::ClassType(class)
+                if let Some(Tuple::Concrete(elts)) = self.as_tuple(class)
+                    && elts.len() <= len =>
+            {
+                self.heap.mk_never()
+            }
+            _ => ty.clone(),
+        })
+    }
+
+    fn narrow_length_less_than(&self, ty: &Type, len: usize) -> Type {
+        // TODO: simplify some tuple forms
+        // - unbounded tuples can be narrowed to empty tuple if len==1
+        // - unpacked tuples can be narrowed to concrete prefix+suffix if len==prefix.len()+suffix.len()+1
+        // this needs to be done in conjunction with https://github.com/facebook/pyrefly/issues/273
+        // otherwise the narrowed forms make weird unions when used with control flow
+        self.distribute_over_union(ty, |ty| match ty {
+            Type::Tuple(Tuple::Concrete(elts)) if elts.len() >= len => self.heap.mk_never(),
+            Type::Tuple(Tuple::Unpacked(f)) if f.prefix().len() + f.suffix().len() >= len => {
+                self.heap.mk_never()
+            }
+            Type::ClassType(class) if let Some(tuple) = self.as_tuple(class) => match tuple {
+                Tuple::Concrete(elts) if elts.len() >= len => self.heap.mk_never(),
+                Tuple::Unpacked(f) if f.prefix().len() + f.suffix().len() >= len => {
+                    self.heap.mk_never()
+                }
+                _ => ty.clone(),
+            },
+            _ => ty.clone(),
+        })
+    }
+
+    /// Removes `None` from every element of concrete tuples. A tuple with an element that is
+    /// always `None` cannot satisfy the condition, so it becomes `Never`.
+    fn narrow_tuple_elements_not_none(&self, ty: &Type) -> Type {
+        self.distribute_over_union(ty, |t| match t {
+            Type::Tuple(Tuple::Concrete(elts)) => {
+                let narrowed = elts.map(|elt| self.narrow_is_not(elt, &Type::None));
+                if narrowed.iter().any(Type::is_never) {
+                    self.heap.mk_never()
+                } else {
+                    self.heap.mk_tuple(Tuple::Concrete(narrowed))
+                }
+            }
+            _ => t.clone(),
+        })
+    }
+
+    /// Keep the union members consistent with `key` being present or absent.
+    fn narrow_key_membership(&self, ty: &Type, key: &Name, present: bool) -> Type {
+        self.distribute_over_union(ty, |member| {
+            let Type::TypedDict(typed_dict) = member else {
+                return member.clone();
+            };
+            if present {
+                match self.typed_dict_field(typed_dict, key) {
+                    Some(_) => member.clone(),
+                    None => match self.typed_dict_extra_items(typed_dict) {
+                        ExtraItems::Closed => self.heap.mk_never(),
+                        ExtraItems::Default | ExtraItems::Extra(_) => member.clone(),
+                    },
+                }
+            } else {
+                match self.typed_dict_field(typed_dict, key) {
+                    Some(field) if field.required => self.heap.mk_never(),
+                    Some(_) | None => member.clone(),
+                }
+            }
+        })
+    }
+
+    /// Unlike `is_dict_like`, this treats unions member-wise.
+    fn has_dict_like_member(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Union(union) => union
+                .members
+                .iter()
+                .any(|member| self.has_dict_like_member(member)),
+            _ => self.is_dict_like(ty),
+        }
+    }
+
+    /// Distribute facet filtering while preserving union and overload structure.
+    fn distribute_over_facet_members(&self, base: &Type, f: &impl Fn(&Type) -> Type) -> Type {
+        self.distribute_over_union(base, |member| {
+            if let Type::Overloaded(branches) = member {
+                let remaining = branches
+                    .iter()
+                    .map(|branch| self.distribute_over_facet_members(branch, f))
+                    .filter(|branch| !branch.is_never())
+                    .collect();
+                Type::combine_overload_results(remaining, self.heap)
+                    .unwrap_or_else(|| self.heap.mk_never())
+            } else {
+                f(member)
+            }
+        })
+    }
+
+    /// Narrow unions and overloads by keeping only members whose facet is identity-compatible with `right`.
+    fn narrow_facet_is(
+        &self,
+        base: &Type,
+        right: &Type,
+        facet: &FacetKind,
+        range: TextRange,
+    ) -> Type {
+        self.distribute_over_facet_members(base, &|t| {
+            let base_info = TypeInfo::of_ty(t.clone());
+            let facet_ty = self.get_facet_chain_type(
+                &base_info,
+                &FacetChain::new(Vec1::new(facet.clone())),
+                range,
+            );
+            if Self::is_identity_literal(right) && self.intersect(&facet_ty, right).is_never() {
+                self.heap.mk_never()
+            } else {
+                t.clone()
+            }
+        })
+    }
+
+    /// Narrow unions and overloads by removing members whose facet is identity-equal to `right`.
+    fn narrow_facet_is_not(
+        &self,
+        base: &Type,
+        right: &Type,
+        facet: &FacetKind,
+        range: TextRange,
+    ) -> Type {
+        self.distribute_over_facet_members(base, &|t| {
+            let base_info = TypeInfo::of_ty(t.clone());
+            let facet_ty = self.get_facet_chain_type(
+                &base_info,
+                &FacetChain::new(Vec1::new(facet.clone())),
+                range,
+            );
+            if Self::is_identity_literal(&facet_ty)
+                && Self::is_identity_literal(right)
+                && Self::literal_equal(right, &facet_ty)
+            {
+                self.heap.mk_never()
+            } else {
+                t.clone()
+            }
+        })
+    }
+
+    // Try to narrow a type based on the type of its facet.
+    // For example, if we have a `x.y == 0` check and `x` is some union,
+    // we can eliminate cases from the union where `x.y` is some other
+    // literal.
+    pub fn atomic_narrow_for_facet(
+        &self,
+        base: &Type,
+        facet: &FacetKind,
+        op: &AtomicNarrowOp,
+        allow_never_collapse: bool,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Option<Type> {
+        // We narrow `X.__class__ == Y` the same way as `type(X) == Y`
+        if let FacetKind::Attribute(attr) = facet
+            && *attr == dunder::CLASS
+        {
+            match op {
+                AtomicNarrowOp::Is(v) | AtomicNarrowOp::Eq(v) => {
+                    let right = self.expr_infer(v, errors);
+                    return Some(self.narrow_isinstance(base, &right, range, errors));
+                }
+                AtomicNarrowOp::IsNot(v) | AtomicNarrowOp::NotEq(v) => {
+                    return Some(self.narrow_type_not_eq(base, v, errors));
+                }
+                _ => {}
+            }
+        }
+        // Removes the members of `base` whose facet type `op` narrows to `Never`.
+        let drop_members_with_never_facet = |errors: &ErrorCollector| {
+            self.distribute_over_facet_members(base, &|t| {
+                let facet_ty = self.get_facet_chain_type(
+                    &TypeInfo::of_ty(t.clone()),
+                    &FacetChain::new(Vec1::new(facet.clone())),
+                    range,
+                );
+                if self.atomic_narrow(&facet_ty, op, range, errors).is_never() {
+                    self.heap.mk_never()
+                } else {
+                    t.clone()
+                }
+            })
+        };
+        match op {
+            AtomicNarrowOp::Is(v) => {
+                let right = self.expr_infer(v, errors);
+                Some(self.narrow_facet_is(base, &right, facet, range))
+            }
+            AtomicNarrowOp::IsNot(v) => {
+                let right = self.expr_infer(v, errors);
+                Some(self.narrow_facet_is_not(base, &right, facet, range))
+            }
+            AtomicNarrowOp::Eq(_) => Some(drop_members_with_never_facet(errors)),
+            AtomicNarrowOp::NotEq(v) => {
+                let right = self.expr_infer(v, errors);
+                Some(self.distribute_over_facet_members(base, &|t| {
+                    let base_info = TypeInfo::of_ty(t.clone());
+                    let facet_ty = self.get_facet_chain_type(
+                        &base_info,
+                        &FacetChain::new(Vec1::new(facet.clone())),
+                        range,
+                    );
+                    if Self::is_literal(&facet_ty)
+                        && Self::is_literal(&right)
+                        && Self::literal_equal(&right, &facet_ty)
+                    {
+                        self.heap.mk_never()
+                    } else {
+                        t.clone()
+                    }
+                }))
+            }
+            AtomicNarrowOp::In(v) | AtomicNarrowOp::NotIn(v)
+                if self.literal_membership_exprs(v, errors).is_some() =>
+            {
+                Some(drop_members_with_never_facet(errors))
+            }
+            // If `allow_never_collapse` is not set, we only filter union or overload members
+            // to avoid inferring `Never` excessively
+            AtomicNarrowOp::IsInstance(_, _) | AtomicNarrowOp::IsNotInstance(_, _)
+                if base.is_union()
+                    || matches!(base, Type::Overloaded(_))
+                    || allow_never_collapse =>
+            {
+                Some(drop_members_with_never_facet(&self.error_swallower()))
+            }
+            _ => None,
+        }
+    }
+
+    fn tuple_len_eq(
+        &self,
+        tuple: &Tuple,
+        len: usize,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match tuple {
+            Tuple::Concrete(elts) if elts.len() != len => self.heap.mk_never(),
+            Tuple::Unpacked(f) if f.prefix().len() + f.suffix().len() > len => self.heap.mk_never(),
+            Tuple::Unpacked(f) if f.prefix().len() + f.suffix().len() == len => {
+                self.heap.mk_concrete_tuple(
+                    f.prefix()
+                        .iter()
+                        .cloned()
+                        .chain(f.suffix().to_vec())
+                        .collect(),
+                )
+            }
+            Tuple::Unpacked(f)
+                if let (prefix, Type::Tuple(Tuple::Unbounded(middle)), suffix) = f.parts()
+                    && prefix.len() + suffix.len() < len =>
+            {
+                let middle_elements = vec![(**middle).clone(); len - prefix.len() - suffix.len()];
+                self.heap.mk_concrete_tuple(
+                    prefix
+                        .iter()
+                        .cloned()
+                        .chain(middle_elements)
+                        .chain(suffix.to_vec())
+                        .collect(),
+                )
+            }
+            Tuple::Unpacked(f) if matches!(f.middle(), Type::Var(_)) => {
+                let (prefix, middle_var, suffix) = f.parts();
+                let forced_middle = self.force_for_narrowing(middle_var, range, errors);
+                let new_tuple = Tuple::unpacked(prefix.to_vec(), forced_middle, suffix.to_vec());
+                self.tuple_len_eq(&simplify_tuples(new_tuple, self.heap), len, range, errors)
+            }
+            Tuple::Unbounded(elements) => {
+                self.heap.mk_concrete_tuple(vec![(**elements).clone(); len])
+            }
+            _ => self.heap.mk_tuple(tuple.clone()),
+        }
+    }
+
+    fn tuple_len_not_eq(
+        &self,
+        tuple: &Tuple,
+        len: usize,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match tuple {
+            Tuple::Concrete(elts) if elts.len() == len => self.heap.mk_never(),
+            Tuple::Unpacked(f) if matches!(f.middle(), Type::Var(_)) => {
+                let (prefix, middle_var, suffix) = f.parts();
+                let forced_middle = self.force_for_narrowing(middle_var, range, errors);
+                let new_tuple = Tuple::unpacked(prefix.to_vec(), forced_middle, suffix.to_vec());
+                self.tuple_len_not_eq(&simplify_tuples(new_tuple, self.heap), len, range, errors)
+            }
+            _ => self.heap.mk_tuple(tuple.clone()),
+        }
+    }
+
+    pub(crate) fn atomic_narrow(
+        &self,
+        ty: &Type,
+        op: &AtomicNarrowOp,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match op {
+            AtomicNarrowOp::Placeholder => ty.clone(),
+            AtomicNarrowOp::MatchSubjectElement(subject, index) => {
+                let element = self.get_facet_chain_type(
+                    self.get_idx(*subject),
+                    &FacetChain::new(Vec1::new(FacetKind::Index(*index as i64))),
+                    range,
+                );
+                self.intersect_with_fallback(ty, &element, IntersectFallback::Right)
+            }
+            AtomicNarrowOp::ClassCoverageGate(_) => ty.clone(),
+            AtomicNarrowOp::ClassCoverageGateNeg(keys) => {
+                // Subtract the class only when every positional slot's sub-pattern exhausts its
+                // matched slot, i.e. all slot-coverage keys resolved to `Never`.
+                if !keys.is_empty() && keys.iter().all(|key| self.get_idx(*key).ty().is_never()) {
+                    self.heap.mk_never()
+                } else {
+                    ty.clone()
+                }
+            }
+            AtomicNarrowOp::LenEq(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return ty.clone();
+                };
+                self.distribute_over_union(ty, |ty| match ty {
+                    Type::ClassType(class)
+                        if let Some(Tuple::Concrete(elts)) = self.as_tuple(class)
+                            && elts.len() != len =>
+                    {
+                        self.heap.mk_never()
+                    }
+                    Type::Tuple(tuple) => self.tuple_len_eq(tuple, len, range, errors),
+                    _ => ty.clone(),
+                })
+            }
+            AtomicNarrowOp::LenNotEq(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return ty.clone();
+                };
+                self.distribute_over_union(ty, |ty| match ty {
+                    Type::ClassType(class)
+                        if let Some(Tuple::Concrete(elts)) = self.as_tuple(class)
+                            && elts.len() == len =>
+                    {
+                        self.heap.mk_never()
+                    }
+                    Type::Tuple(tuple) => self.tuple_len_not_eq(tuple, len, range, errors),
+                    _ => ty.clone(),
+                })
+            }
+            AtomicNarrowOp::LenGt(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return ty.clone();
+                };
+                self.narrow_length_greater(ty, len)
+            }
+            AtomicNarrowOp::LenGte(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return ty.clone();
+                };
+                if len == 0 {
+                    return ty.clone();
+                }
+                self.narrow_length_greater(ty, len - 1)
+            }
+            AtomicNarrowOp::LenLt(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return self.heap.mk_never();
+                };
+                if len == 0 {
+                    return self.heap.mk_never();
+                }
+                self.narrow_length_less_than(ty, len)
+            }
+            AtomicNarrowOp::LenLte(v) => {
+                let right = self.expr_infer(v, errors);
+                let Type::Literal(f) = &right else {
+                    return ty.clone();
+                };
+                let Lit::Int(lit) = &f.value else {
+                    return ty.clone();
+                };
+                let Some(len) = lit.as_i64().and_then(|i| i.to_usize()) else {
+                    return ty.clone();
+                };
+                self.narrow_length_less_than(ty, len + 1)
+            }
+            AtomicNarrowOp::AnyElementIsNone => ty.clone(),
+            AtomicNarrowOp::NoElementIsNone => self.narrow_tuple_elements_not_none(ty),
+            AtomicNarrowOp::IsSequence => {
+                self.is_type_for_pattern(ty, |t| self.is_sequence_for_pattern(t))
+            }
+            AtomicNarrowOp::IsNotSequence => {
+                self.is_not_type_for_pattern(ty, |t| self.is_sequence_for_pattern(t))
+            }
+            AtomicNarrowOp::IsMapping => {
+                let mapping = self.heap.mk_class_type(
+                    self.stdlib
+                        .mapping(self.heap.mk_any_implicit(), self.heap.mk_any_implicit()),
+                );
+                self.is_type_for_pattern(ty, |t| self.is_subset_eq(t, &mapping))
+            }
+            AtomicNarrowOp::IsNotMapping => {
+                let mapping = self.heap.mk_class_type(
+                    self.stdlib
+                        .mapping(self.heap.mk_any_implicit(), self.heap.mk_any_implicit()),
+                );
+                self.is_not_type_for_pattern(ty, |t| self.is_subset_eq(t, &mapping))
+            }
+            AtomicNarrowOp::In(v) => {
+                // First, check for literal containers. We also unwrap builtin
+                // container constructor calls (list/tuple/set/frozenset) when
+                // their argument is itself a literal container.
+                if let Some(exprs) = self.literal_membership_exprs(v, errors) {
+                    // Bail out if any element is a starred expression (e.g., `x in [*y, 1]`).
+                    // We can't know all values at compile time when unpacking occurs.
+                    if exprs.iter().any(|e| matches!(e, Expr::Starred(_))) {
+                        return ty.clone();
+                    }
+                    let mut literal_types = Vec::new();
+                    for expr in exprs {
+                        let expr_ty = self.expr_infer(&expr, errors);
+                        match expr_ty {
+                            Type::Literal(_) | Type::None => {
+                                literal_types.push(expr_ty);
+                            }
+                            // Bare class names (e.g., `int`) infer to ClassDef.
+                            // Convert to type[...] so `x in (int, float)` can
+                            // narrow x to type[int] | type[float].
+                            Type::ClassDef(cls) => {
+                                literal_types.push(Type::type_of(self.promote_silently(&cls)));
+                            }
+                            Type::SpecializedClassDef(cls) => {
+                                literal_types.push(Type::type_of(Type::ClassType(cls)));
+                            }
+                            // Already-wrapped type[X] expressions pass through.
+                            Type::Type(ref f) if matches!(&**f, Type::ClassType(_)) => {
+                                literal_types.push(expr_ty);
+                            }
+                            _ => {
+                                return ty.clone();
+                            }
+                        }
+                    }
+                    return self.intersect(ty, &self.unions(literal_types));
+                }
+
+                // Check if the right operand is a TypedDict.
+                // If so, we can narrow the left operand to the union of the TypedDict's keys.
+                let right_ty = self.expr_infer(v, errors);
+                if let Type::Tuple(tuple) = &right_ty
+                    && let Some(member_ty) = self.tuple_membership_type(tuple, range, errors)
+                {
+                    return self.intersect(ty, &member_ty);
+                }
+                if let Type::TypedDict(typed_dict) = &right_ty {
+                    let fields = self.typed_dict_fields(typed_dict);
+                    if fields.is_empty() {
+                        // Empty TypedDict - the `in` check is always false
+                        return self.heap.mk_never();
+                    }
+                    let key_types: Vec<Type> = fields
+                        .keys()
+                        .map(|name| Lit::Str(name.as_str().into()).to_implicit_type())
+                        .collect();
+                    return self.intersect(ty, &self.unions(key_types));
+                }
+
+                // Check if the right operand is a mapping (e.g. dict[str, int]).
+                // If so, we can narrow the left operand to the mapping's key type.
+                if !self.behaves_like_any(&right_ty)
+                    && let Some((key_ty, _)) = self.unwrap_mapping(&right_ty)
+                    // Preserve an operand already assignable to the key type, including nested Any.
+                    && !self.is_subset_eq(ty, &key_ty)
+                {
+                    return self.intersect(ty, &key_ty);
+                }
+
+                // Membership against a named container narrows like a positive equality check.
+                if !self.behaves_like_any(&right_ty)
+                    && let Some(elem_ty) = self.concrete_container_element_type(&right_ty)
+                    && !self.behaves_like_any(&elem_ty)
+                    // This avoids widening a gradual operand into a union.
+                    && !self.is_subset_eq(ty, &elem_ty)
+                {
+                    return self.narrow_after_equality_match(ty, &elem_ty);
+                }
+
+                ty.clone()
+            }
+            AtomicNarrowOp::NotIn(v) => {
+                // First, check for literal containers. We also unwrap builtin
+                // container constructor calls (list/tuple/set/frozenset) when
+                // their argument is itself a literal container.
+                if let Some(exprs) = self.literal_membership_exprs(v, errors) {
+                    // Bail out if any element is a starred expression (e.g., `x not in [*y, 1]`).
+                    // We can't know all values at compile time when unpacking occurs.
+                    if exprs.iter().any(|e| matches!(e, Expr::Starred(_))) {
+                        return ty.clone();
+                    }
+                    let mut literal_types = Vec::new();
+                    for expr in exprs {
+                        let expr_ty = self.expr_infer(&expr, errors);
+                        match expr_ty {
+                            Type::Literal(_) | Type::None => {
+                                literal_types.push(expr_ty);
+                            }
+                            // Accept class objects so they don't trigger the
+                            // bail-out below — this allows mixed containers
+                            // like `(int, None)` to still narrow the non-class
+                            // elements. Class objects themselves are not
+                            // subtracted in the `not in` case (see comment in
+                            // distribute_over_union below).
+                            Type::ClassDef(cls) => {
+                                literal_types.push(Type::type_of(self.promote_silently(&cls)));
+                            }
+                            Type::SpecializedClassDef(cls) => {
+                                literal_types.push(Type::type_of(Type::ClassType(cls)));
+                            }
+                            Type::Type(ref f) if matches!(&**f, Type::ClassType(_)) => {
+                                literal_types.push(expr_ty);
+                            }
+                            _ => {
+                                return ty.clone();
+                            }
+                        }
+                    }
+                    return self.distribute_over_union(ty, |t| {
+                        let mut result = t.clone();
+                        for right in &literal_types {
+                            match (t, right) {
+                                (_, _) if Self::literal_equal(t, right) => {
+                                    result = self.heap.mk_never();
+                                }
+                                // We intentionally do NOT subtract class objects
+                                // (type[X]) here. `x not in (int, float)` does
+                                // not imply x is not type[int], because x could
+                                // be type[MyInt] (a subclass of int) which
+                                // satisfies type[int] but is not identity-equal
+                                // to `int` at runtime.
+                                (Type::ClassType(cls), Type::Literal(lit))
+                                    if cls.is(KnownClass::Bool)
+                                        && let Lit::Bool(b) = &lit.value =>
+                                {
+                                    result = Lit::Bool(!b).to_implicit_type();
+                                }
+                                (left, right)
+                                    if let Some((instance, name)) =
+                                        Self::enum_instance(left, right) =>
+                                {
+                                    result = self.subtract_enum_member(instance, name);
+                                }
+                                _ => {}
+                            }
+                        }
+                        result
+                    });
+                }
+
+                // Check if the right operand is a TypedDict.
+                // If so, we can narrow the left operand if it's exactly one of the TypedDict's keys.
+                let right_ty = self.expr_infer(v, errors);
+                if let Type::TypedDict(typed_dict) = &right_ty {
+                    let fields = self.typed_dict_fields(typed_dict);
+                    if fields.is_empty() {
+                        // Empty TypedDict - the `not in` check is always true
+                        return ty.clone();
+                    }
+                    let key_types: Vec<Type> = fields
+                        .keys()
+                        .map(|name| Lit::Str(name.as_str().into()).to_implicit_type())
+                        .collect();
+                    return self.distribute_over_union(ty, |t| {
+                        for key_type in &key_types {
+                            if Self::literal_equal(t, key_type) {
+                                return self.heap.mk_never();
+                            }
+                        }
+                        t.clone()
+                    });
+                }
+
+                ty.clone()
+            }
+            AtomicNarrowOp::Is(v) => {
+                let right = self.expr_infer(v, errors);
+                // Get our best approximation of ty & right.
+                self.intersect(ty, &right)
+            }
+            AtomicNarrowOp::IsNot(v) => {
+                let right = self.expr_infer(v, errors);
+                self.narrow_is_not(ty, &right)
+            }
+            AtomicNarrowOp::IsInstance(v, source) => {
+                let right = self.expr_infer(v, errors);
+                // For patterns, validation happens here since there's no call site.
+                // For calls, validation already happened in special_calls.rs.
+                if matches!(source, NarrowSource::Pattern) {
+                    let mut contains_subscript = false;
+                    v.visit(&mut |e| {
+                        if matches!(e, Expr::Subscript(_)) {
+                            contains_subscript = true;
+                        }
+                    });
+                    self.check_type_is_class_object(
+                        Some(ty.clone()),
+                        right.clone(),
+                        contains_subscript,
+                        v.range(),
+                        &FunctionKind::IsInstance,
+                        errors,
+                        ErrorKind::InvalidPattern,
+                    );
+                }
+                self.narrow_isinstance(ty, &right, v.range(), errors)
+            }
+            AtomicNarrowOp::IsNotInstance(v, source) => {
+                self.narrow_is_not_instance(ty, v, *source, errors)
+            }
+            AtomicNarrowOp::TypeEq(v) => self.narrow_type_eq(ty, v, errors),
+            // If type(X) != Y, X can still be a subclass of Y so we can't do negative refinement
+            // unless Y is final, in which case X cannot be a subclass of Y
+            AtomicNarrowOp::TypeNotEq(v) => self.narrow_type_not_eq(ty, v, errors),
+            AtomicNarrowOp::IsSubclass(v) => {
+                let right = self.expr_infer(v, errors);
+                self.narrow_issubclass(ty, &right, v.range(), errors)
+            }
+            AtomicNarrowOp::IsNotSubclass(v) => self.narrow_is_not_subclass(ty, v, errors),
+            // `hasattr` and `getattr` are handled in `narrow`
+            AtomicNarrowOp::HasAttr(_) => ty.clone(),
+            AtomicNarrowOp::NotHasAttr(_) => ty.clone(),
+            AtomicNarrowOp::HasKey(_) => ty.clone(),
+            AtomicNarrowOp::NotHasKey(_) => ty.clone(),
+            AtomicNarrowOp::GetAttr(_, _) => ty.clone(),
+            AtomicNarrowOp::NotGetAttr(_, _) => ty.clone(),
+            AtomicNarrowOp::TypeGuard(t, arguments) => {
+                if let CallTargetLookup::Ok(call_target) = self.as_call_target(t.clone()) {
+                    let args = arguments.args.map(CallArg::expr_maybe_starred);
+                    let kws = arguments.keywords.map(CallKeyword::new);
+                    // This error is raised elsewhere, swallow here to avoid duplicate errors
+                    let swallowed_errors = self.error_swallower();
+                    let ret = self
+                        .call_infer(
+                            *call_target,
+                            &args,
+                            &kws,
+                            range,
+                            &swallowed_errors,
+                            None,
+                            None,
+                            None,
+                        )
+                        .ty;
+                    if let Type::TypeGuard(t) = ret {
+                        return *t;
+                    }
+                }
+                ty.clone()
+            }
+            AtomicNarrowOp::NotTypeGuard(_, _) => ty.clone(),
+            AtomicNarrowOp::TypeIs(t, arguments) => {
+                let is_builtin_callable =
+                    t.callee_kind() == Some(CalleeKind::Function(FunctionKind::Callable));
+                if let CallTargetLookup::Ok(call_target) = self.as_call_target(t.clone()) {
+                    let args = arguments.args.map(CallArg::expr_maybe_starred);
+                    let kws = arguments.keywords.map(CallKeyword::new);
+                    // This error is raised elsewhere, swallow here to avoid duplicate errors
+                    let swallowed_errors = self.error_swallower();
+                    let ret = self
+                        .call_infer(
+                            *call_target,
+                            &args,
+                            &kws,
+                            range,
+                            &swallowed_errors,
+                            None,
+                            None,
+                            None,
+                        )
+                        .ty;
+                    if let Type::TypeIs(t) = ret {
+                        let target = if is_builtin_callable {
+                            // `callable` is annotated as `TypeIs[Callable[..., object]]` which is
+                            // too conservative and prone to false positives, see
+                            // https://github.com/facebook/pyrefly/issues/911
+                            self.heap.mk_callable_ellipsis(self.heap.mk_any_implicit())
+                        } else {
+                            *t
+                        };
+                        return self.narrow_typeis(ty, &target, range, errors);
+                    }
+                }
+                ty.clone()
+            }
+            AtomicNarrowOp::NotTypeIs(t, arguments) => {
+                if let CallTargetLookup::Ok(call_target) = self.as_call_target(t.clone()) {
+                    let args = arguments.args.map(CallArg::expr_maybe_starred);
+                    let kws = arguments.keywords.map(CallKeyword::new);
+                    // This error is raised elsewhere, swallow here to avoid duplicate errors
+                    let swallowed_errors = self.error_swallower();
+                    let ret = self
+                        .call_infer(
+                            *call_target,
+                            &args,
+                            &kws,
+                            range,
+                            &swallowed_errors,
+                            None,
+                            None,
+                            None,
+                        )
+                        .ty;
+                    if let Type::TypeIs(t) = ret {
+                        return self.subtract(ty, &t);
+                    }
+                }
+                ty.clone()
+            }
+            AtomicNarrowOp::IsTruthy | AtomicNarrowOp::IsFalsy => {
+                let boolval = matches!(op, AtomicNarrowOp::IsTruthy);
+                // Do not emit errors here: the narrowed range doesn't always correspond to a valid expression
+                // For example, narrowing generated for implicit else branches.
+                let silent = ErrorCollector::new(errors.module().clone(), ErrorStyle::Never);
+                let narrow_member = |t: &Type| -> Type {
+                    if self.as_bool(t, range, &silent) == Some(!boolval) {
+                        return self.heap.mk_never();
+                    } else if let Type::ClassType(cls) = t {
+                        if cls.is(KnownClass::Bool) {
+                            return Lit::Bool(boolval).to_implicit_type();
+                        }
+                        if !boolval {
+                            // Primitive truthiness assumes builtin behavior; overrides in
+                            // subclasses are outside this narrowing model.
+                            if cls.is(KnownClass::Int) {
+                                return LitInt::new(0).to_implicit_type();
+                            } else if cls.is(KnownClass::Str) {
+                                return Lit::Str("".into()).to_implicit_type();
+                            } else if cls.is(KnownClass::Bytes) {
+                                let empty = Vec::new();
+                                return Lit::Bytes(empty.into_boxed_slice()).to_implicit_type();
+                            }
+                        }
+                    }
+
+                    t.clone()
+                };
+                self.distribute_over_union(ty, |t| match t.as_quantified() {
+                    Some((q, current_narrow)) if q.is_type_var() => {
+                        // Narrow the TypeVar's concrete bound and intersect each resulting
+                        // union member back with the TypeVar so the narrowed type remains
+                        // assignable to `T`.
+                        let bound = current_narrow
+                            .cloned()
+                            .unwrap_or_else(|| q.upper_bound(self.stdlib, self.heap));
+                        let narrowed = self.distribute_over_union(&bound, &narrow_member);
+                        if narrowed == bound {
+                            t.clone()
+                        } else {
+                            let q_ty = q.clone().to_type(self.heap);
+                            self.distribute_over_union(&narrowed, |n| {
+                                intersect(vec![q_ty.clone(), n.clone()], n.clone(), self.heap)
+                            })
+                        }
+                    }
+                    _ => narrow_member(t),
+                })
+            }
+            AtomicNarrowOp::PolarsColumnMutation(kind) => {
+                polars_degrade_for_mutation(ty, kind, |callee| {
+                    self.polars_series_constructor(callee)
+                })
+            }
+            AtomicNarrowOp::Eq(v) => {
+                let right = self.expr_infer(v, errors);
+                if Self::is_literal(&right) {
+                    self.narrow_after_equality_match(ty, &right)
+                } else if !self.may_be_none(&right) {
+                    // For non-literal comparisons, only exclude None. Equality can
+                    // hold between values of different types.
+                    self.narrow_is_not(ty, &Type::None)
+                } else {
+                    ty.clone()
+                }
+            }
+            AtomicNarrowOp::NotEq(v) => {
+                let right = self.expr_infer(v, errors);
+                if Self::is_literal(&right) {
+                    self.distribute_over_union(ty, |t| match (t, &right) {
+                        (_, _) if Self::literal_equal(t, &right) => self.heap.mk_never(),
+                        (Type::ClassType(cls), Type::Literal(lit))
+                            if cls.is(KnownClass::Bool)
+                                && let Lit::Bool(b) = &lit.value =>
+                        {
+                            Lit::Bool(!b).to_implicit_type()
+                        }
+                        (left, right)
+                            if let Some((instance, name)) = Self::enum_instance(left, right) =>
+                        {
+                            self.subtract_enum_member(instance, name)
+                        }
+                        _ => t.clone(),
+                    })
+                } else {
+                    ty.clone()
+                }
+            }
+            AtomicNarrowOp::Call(func, args) | AtomicNarrowOp::NotCall(func, args) => {
+                if let Some(resolved_op) = self.resolve_narrowing_call(func, args, errors) {
+                    if matches!(op, AtomicNarrowOp::Call(..)) {
+                        self.atomic_narrow(ty, &resolved_op, range, errors)
+                    } else {
+                        self.atomic_narrow(ty, &resolved_op.negate(), range, errors)
+                    }
+                } else {
+                    ty.clone()
+                }
+            }
+        }
+    }
+
+    /// Narrow for pattern matching
+    fn is_type_for_pattern(&self, ty: &Type, is_type: impl Fn(&Type) -> bool) -> Type {
+        self.distribute_over_union(ty, |t| {
+            if is_type(t) {
+                t.clone()
+            } else {
+                self.heap.mk_never()
+            }
+        })
+    }
+
+    /// Narrow to exclude a type for pattern matching
+    fn is_not_type_for_pattern(&self, ty: &Type, is_type: impl Fn(&Type) -> bool) -> Type {
+        // Note: Any and classes that extend Any must be preserved (not narrowed to Never)
+        // since we can't know at static analysis time whether they're the pattern type or not
+        self.distribute_over_union(ty, |t| {
+            if self.behaves_like_any(t) {
+                t.clone()
+            } else if is_type(t) {
+                self.heap.mk_never()
+            } else {
+                t.clone()
+            }
+        })
+    }
+
+    pub(crate) fn get_facet_chain_type(
+        &self,
+        base: &TypeInfo,
+        facet_chain: &FacetChain,
+        range: TextRange,
+    ) -> Type {
+        // We don't want to throw any attribute access or indexing errors when narrowing - the same code is traversed
+        // separately for type checking, and there might be error context then we don't have here.
+        let ignore_errors = self.error_swallower();
+        let (first_facet, remaining_facets) = facet_chain.facets().clone().split_off_first();
+        self.narrowable_for_facet_chain(
+            base,
+            &first_facet,
+            &remaining_facets,
+            range,
+            &ignore_errors,
+        )
+    }
+
+    fn narrowable_for_facet_chain(
+        &self,
+        base: &TypeInfo,
+        first_facet: &FacetKind,
+        remaining_facets: &[FacetKind],
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        match first_facet {
+            FacetKind::Attribute(first_attr_name) => {
+                // Use a synthesized fake range for the attribute lookup itself to avoid
+                // overwriting typing traces (e.g. property getters, overload callees) keyed
+                // on the real `range`, which typically points at unrelated code such as the
+                // RHS of an equality narrow. The real `range` is still threaded through to
+                // recursive facet-chain narrowing so that errors there remain locatable.
+                let fake_range = TextRange::default();
+                match remaining_facets.split_first() {
+                    None => match base.type_at_facet(first_facet) {
+                        Some(ty) => self.force_for_narrowing(ty, range, errors),
+                        None => {
+                            self.narrowable_for_attr(base.ty(), first_attr_name, fake_range, errors)
+                        }
+                    },
+                    Some((next_name, remaining_facets)) => {
+                        let base = self.attr_infer(base, first_attr_name, fake_range, errors, None);
+                        self.narrowable_for_facet_chain(
+                            &base,
+                            next_name,
+                            remaining_facets,
+                            range,
+                            errors,
+                        )
+                    }
+                }
+            }
+            FacetKind::Index(idx) => {
+                // We synthesize a slice expression for the subscript here.
+                // For negative indices, we must produce `UnaryOp(USub, NumberLiteral(abs))`
+                // to match what the parser generates for e.g. `xs[-1]`.
+                // Use a synthesized fake range to avoid overwriting typing traces.
+                let synthesized_slice = synthesize_int_slice(*idx);
+                match remaining_facets.split_first() {
+                    None => match base.type_at_facet(first_facet) {
+                        Some(ty) => self.force_for_narrowing(ty, range, errors),
+                        None => self.subscript_infer_for_type(
+                            base.ty(),
+                            &synthesized_slice,
+                            range,
+                            errors,
+                        ),
+                    },
+                    Some((next_name, remaining_facets)) => {
+                        let base_ty = self.subscript_infer(
+                            base,
+                            &synthesized_slice,
+                            range,
+                            TypeFormContext::TypeExpression,
+                            errors,
+                        );
+                        self.narrowable_for_facet_chain(
+                            &base_ty,
+                            next_name,
+                            remaining_facets,
+                            range,
+                            errors,
+                        )
+                    }
+                }
+            }
+            FacetKind::Key(key) => {
+                // We synthesize a slice expression for the subscript here
+                // Use a synthesized fake range to avoid overwriting typing traces
+                let synthesized_slice = Ast::str_expr(key, TextRange::empty(TextSize::from(0)));
+                match remaining_facets.split_first() {
+                    None => match base.type_at_facet(first_facet) {
+                        Some(ty) => self.force_for_narrowing(ty, range, errors),
+                        None => self
+                            .subscript_infer(
+                                base,
+                                &synthesized_slice,
+                                range,
+                                TypeFormContext::TypeExpression,
+                                errors,
+                            )
+                            .into_ty(),
+                    },
+                    Some((next_name, remaining_facets)) => {
+                        let base_ty = self.subscript_infer(
+                            base,
+                            &synthesized_slice,
+                            range,
+                            TypeFormContext::TypeExpression,
+                            errors,
+                        );
+                        self.narrowable_for_facet_chain(
+                            &base_ty,
+                            next_name,
+                            remaining_facets,
+                            range,
+                            errors,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return a cloned `TypeInfo` with the base type replaced and attribute
+    /// facets rebased to the updated base type.
+    fn rebase_type_info(&self, type_info: &TypeInfo, new_ty: Type) -> TypeInfo {
+        let old_ty = type_info.ty();
+        let mut result = type_info.clone().with_ty(new_ty);
+        if !result.has_facets() || self.is_equivalent(old_ty, result.ty()) {
+            return result;
+        }
+        let fake_range = TextRange::default();
+        let ignore_errors = self.error_swallower();
+        let attributes = type_info.narrowed_attribute_types();
+        for (name, stored) in attributes {
+            let old = self.narrowable_for_attr(old_ty, name, fake_range, &ignore_errors);
+            let new = self.narrowable_for_attr(result.ty(), name, fake_range, &ignore_errors);
+            if self.is_equivalent(&old, &new) {
+                continue;
+            }
+            // Missing attributes add no constraint to an established refinement. A mixed
+            // union can still refine a gradual facet through its known members.
+            let mixed_error_with_concrete_facet = matches!(
+                &new,
+                Type::Union(union) if union.members.iter().any(Type::is_error)
+            ) && !stored.is_any()
+                && !matches!(stored, Type::Union(union) if union.members.iter().any(Type::is_any));
+            if (new.is_error() || mixed_error_with_concrete_facet)
+                && self.attr_error_from_missing(result.ty(), name)
+            {
+                continue;
+            }
+            let rebased = self.intersect(stored, &new);
+            if rebased.is_never() {
+                return TypeInfo::of_ty(self.heap.mk_never());
+            }
+            result = result.with_narrow(&Vec1::new(FacetKind::Attribute(name.clone())), rebased);
+        }
+        result
+    }
+
+    pub fn narrow(
+        &self,
+        type_info: &TypeInfo,
+        op: &NarrowOp,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> TypeInfo {
+        if op.is_placeholder() {
+            return type_info.clone();
+        }
+        match op {
+            NarrowOp::Atomic(
+                subject,
+                key_op @ (AtomicNarrowOp::HasKey(key) | AtomicNarrowOp::NotHasKey(key)),
+            ) => {
+                let key_present = matches!(key_op, AtomicNarrowOp::HasKey(_));
+                let resolved_chain = subject
+                    .as_ref()
+                    .and_then(|s| self.resolve_facet_chain(s.chain.clone()));
+                let base_ty = match (&subject, &resolved_chain) {
+                    (Some(_), Some(chain)) => self.get_facet_chain_type(type_info, chain, range),
+                    (Some(_), None) => return type_info.clone(),
+                    (None, _) => self.force_for_narrowing(type_info.ty(), range, errors),
+                };
+                let narrowed_base = self.narrow_key_membership(&base_ty, key, key_present);
+                let has_dict_member = self.has_dict_like_member(&narrowed_base);
+                let mut narrowed = match &resolved_chain {
+                    Some(chain) => type_info.with_narrow(chain.facets(), narrowed_base),
+                    None => type_info.clone().with_ty(narrowed_base),
+                };
+                if has_dict_member {
+                    let facet = FacetKind::Key(key.to_string());
+                    let facets = extend_facet_chain(resolved_chain.as_ref(), facet);
+                    if key_present {
+                        // `key in x` records presence only; subscript inference computes the value type.
+                        narrowed.record_present(&facets);
+                    } else {
+                        // `key not in x`: invalidate any narrow recorded for the key.
+                        narrowed.update_for_assignment(&facets, None);
+                    }
+                }
+                narrowed
+            }
+            NarrowOp::Atomic(subject, AtomicNarrowOp::HasAttr(attr)) => {
+                let resolved_chain = subject
+                    .as_ref()
+                    .and_then(|s| self.resolve_facet_chain(s.chain.clone()));
+                let base_ty = match (&subject, &resolved_chain) {
+                    (Some(_), Some(chain)) => self.get_facet_chain_type(type_info, chain, range),
+                    (Some(_), None) => return type_info.clone(),
+                    (None, _) => self.force_for_narrowing(type_info.ty(), range, errors),
+                };
+                // Narrow the attribute facet only if it doesn't exist on all members.
+                // The facet type is the union of attribute types from members that DO
+                // have the attribute, plus `Any` for members that don't. Preserving
+                // specific attribute types (rather than using a blanket `Any`) ensures
+                // fixpoint convergence when `hasattr` is used in loops with reassignment.
+                if let Some(narrow_ty) = self.hasattr_narrow_type(&base_ty, attr, range, errors) {
+                    let facet = FacetKind::Attribute(attr.clone());
+                    let facets = extend_facet_chain(resolved_chain.as_ref(), facet);
+                    type_info.with_narrow(&facets, narrow_ty)
+                } else {
+                    type_info.clone()
+                }
+            }
+            NarrowOp::Atomic(subject, AtomicNarrowOp::GetAttr(attr, default)) => {
+                let suppress_errors =
+                    ErrorCollector::new(errors.module().clone(), ErrorStyle::Never);
+                let default_ty = default.as_ref().map_or_else(
+                    || self.heap.mk_none(),
+                    |v| self.expr_infer(v, &suppress_errors),
+                );
+                // We can't narrow the type if the specified default is not falsy
+                if self.as_bool(&default_ty, range, &suppress_errors) != Some(false) {
+                    return type_info.clone();
+                }
+                let resolved_chain = subject
+                    .as_ref()
+                    .and_then(|s| self.resolve_facet_chain(s.chain.clone()));
+                let base_ty = match (&subject, &resolved_chain) {
+                    (Some(_), Some(chain)) => self.get_facet_chain_type(type_info, chain, range),
+                    (Some(_), None) => return type_info.clone(),
+                    (None, _) => self.force_for_narrowing(type_info.ty(), range, errors),
+                };
+                let attr_ty =
+                    self.attr_infer_for_type(&base_ty, attr, range, &suppress_errors, None);
+                let facet = FacetKind::Attribute(attr.clone());
+                let facets = extend_facet_chain(resolved_chain.as_ref(), facet);
+                // Given that the default is falsy:
+                // If the attribute does not exist we narrow to `Any`
+                // If the attribute exists we narrow it to be truthy
+                if attr_ty.is_error() {
+                    type_info.with_narrow(&facets, self.heap.mk_any_implicit())
+                } else {
+                    let narrowed_ty = self.atomic_narrow(
+                        &attr_ty,
+                        &AtomicNarrowOp::IsTruthy,
+                        range,
+                        &suppress_errors,
+                    );
+                    type_info.with_narrow(&facets, narrowed_ty)
+                }
+            }
+            NarrowOp::Atomic(None, op) => {
+                let ty = self.atomic_narrow(
+                    &self.force_for_narrowing(type_info.ty(), range, errors),
+                    op,
+                    range,
+                    errors,
+                );
+                self.rebase_type_info(type_info, ty)
+            }
+            NarrowOp::Atomic(Some(facet_subject), op) => {
+                let Some(resolved_chain) = self.resolve_facet_chain(facet_subject.chain.clone())
+                else {
+                    return type_info.clone();
+                };
+                let Some(op_for_narrow) = (match op {
+                    AtomicNarrowOp::Call(func, args) => {
+                        self.resolve_narrowing_call(func.as_ref(), args, errors)
+                    }
+                    AtomicNarrowOp::NotCall(func, args) => self
+                        .resolve_narrowing_call(func.as_ref(), args, errors)
+                        .map(|resolved_op| resolved_op.negate()),
+                    _ => Some(op.clone()),
+                }) else {
+                    return type_info.clone();
+                };
+                match (facet_subject.origin, resolved_chain.facets().as_slice()) {
+                    (FacetOrigin::GetMethod, _)
+                        if !self.supports_dict_get_subject(type_info, facet_subject, range) =>
+                    {
+                        return type_info.clone();
+                    }
+                    (FacetOrigin::MatchSubject, [FacetKind::Index(index)]) => {
+                        let index = usize::try_from(*index)
+                            .expect("Match subject indices are nonnegative tuple positions");
+                        // Keep element constraints in the evaluated tuple's type so that
+                        // joining alternatives preserves their correlation across cases.
+                        // For example, excluding (None, None) leaves a union of tuples
+                        // with either the first or the second element known to be present.
+                        let ty = self.distribute_over_union(type_info.ty(), |ty| match ty {
+                            Type::Tuple(Tuple::Concrete(elements)) if index < elements.len() => {
+                                match self.atomic_narrow(
+                                    &elements[index],
+                                    &op_for_narrow,
+                                    range,
+                                    errors,
+                                ) {
+                                    narrowed @ Type::Never(_) => narrowed,
+                                    narrowed => {
+                                        let mut elements = elements.clone();
+                                        elements[index] = narrowed;
+                                        self.heap.mk_concrete_tuple(elements)
+                                    }
+                                }
+                            }
+                            _ => ty.clone(),
+                        });
+                        return type_info.clone().with_ty(ty);
+                    }
+                    _ => {}
+                }
+                let ty = self.atomic_narrow(
+                    &self.get_facet_chain_type(type_info, &resolved_chain, range),
+                    &op_for_narrow,
+                    range,
+                    errors,
+                );
+                // A match-arm negation may build on a facet narrow from an earlier arm.
+                // If the accumulated facet is impossible, the whole subject is impossible.
+                if facet_subject.origin == FacetOrigin::MatchSubject
+                    && facet_subject.allow_never_collapse
+                    && ty.is_never()
+                {
+                    return type_info.clone().with_ty(ty);
+                }
+                let mut narrowed = type_info.with_narrow(resolved_chain.facets(), ty);
+                // For certain types of narrows, we can also narrow the parent of the current subject
+                // If `.get()` on a dict or TypedDict is falsy, the key may not be present at all
+                // We should invalidate any existing narrows
+                if let Some((last, prefix)) = resolved_chain.facets().split_last() {
+                    match Vec1::try_from(prefix) {
+                        Ok(prefix_facets) => {
+                            let prefix_chain = FacetChain::new(prefix_facets);
+                            let base_ty =
+                                self.get_facet_chain_type(type_info, &prefix_chain, range);
+                            let dict_get_key_falsy =
+                                matches!(op_for_narrow, AtomicNarrowOp::IsFalsy)
+                                    && matches!(last, FacetKind::Key(_));
+                            if dict_get_key_falsy {
+                                narrowed.update_for_assignment(resolved_chain.facets(), None);
+                            } else if let Some(narrowed_ty) = self.atomic_narrow_for_facet(
+                                &base_ty,
+                                last,
+                                &op_for_narrow,
+                                facet_subject.allow_never_collapse,
+                                range,
+                                errors,
+                            ) && narrowed_ty != base_ty
+                            {
+                                narrowed = narrowed.with_narrow(prefix_chain.facets(), narrowed_ty);
+                            }
+                        }
+                        _ => {
+                            let base_ty = type_info.ty();
+                            let dict_get_key_falsy =
+                                matches!(op_for_narrow, AtomicNarrowOp::IsFalsy)
+                                    && matches!(last, FacetKind::Key(_));
+                            if dict_get_key_falsy {
+                                narrowed.update_for_assignment(resolved_chain.facets(), None);
+                            } else if let Some(narrowed_ty) = self.atomic_narrow_for_facet(
+                                base_ty,
+                                last,
+                                &op_for_narrow,
+                                facet_subject.allow_never_collapse,
+                                range,
+                                errors,
+                            ) && narrowed_ty != *base_ty
+                            {
+                                narrowed = narrowed.clone().with_ty(narrowed_ty);
+                            }
+                        }
+                    };
+                }
+                narrowed
+            }
+            NarrowOp::And(ops) => {
+                let mut ops_iter = ops.iter();
+                if let Some(first_op) = ops_iter.next() {
+                    let mut ret = self.narrow(type_info, first_op, range, errors);
+                    for next_op in ops_iter {
+                        ret = self.narrow(&ret, next_op, range, errors);
+                    }
+                    ret
+                } else {
+                    type_info.clone()
+                }
+            }
+            NarrowOp::Or(ops) => {
+                let mut branches = ops.map(|op| self.narrow(type_info, op, range, errors));
+                // Unreachable branches would otherwise erase facet narrows in the join.
+                branches.retain(|branch| !branch.ty().is_never());
+                TypeInfo::join(
+                    branches,
+                    &|tys| self.unions(tys),
+                    &|got, want| self.is_subset_eq(got, want),
+                    JoinStyle::NarrowOf(type_info),
+                )
+            }
+        }
+    }
+
+    /// We only narrow `x.get("key")` if `x` resolves to a `dict`
+    fn supports_dict_get_subject(
+        &self,
+        type_info: &TypeInfo,
+        subject: &FacetSubject,
+        range: TextRange,
+    ) -> bool {
+        let Some(resolved_chain) = self.resolve_facet_chain(subject.chain.clone()) else {
+            return false;
+        };
+        let base_ty = if resolved_chain.facets().len() == 1 {
+            type_info.ty().clone()
+        } else {
+            let prefix: Vec<_> = resolved_chain
+                .facets()
+                .iter()
+                .take(resolved_chain.facets().len() - 1)
+                .cloned()
+                .collect();
+            match Vec1::try_from_vec(prefix) {
+                Ok(vec1) => {
+                    let prefix_chain = FacetChain::new(vec1);
+                    self.get_facet_chain_type(type_info, &prefix_chain, range)
+                }
+                Err(_) => return false,
+            }
+        };
+        self.is_dict_like(&base_ty)
+    }
+
+    fn is_flag_enum(&self, cls: &ClassType) -> bool {
+        self.get_enum_from_class(cls.class_object()).is_some()
+            && self.has_superclass(cls.class_object(), self.stdlib.enum_flag().class_object())
+    }
+
+    pub(crate) fn with_type_for_exhaustiveness_check(&self, info: &TypeInfo) -> TypeInfo {
+        info.clone().map_ty(|mut ty| {
+            self.expand_mut(&mut ty);
+            match ty {
+                Type::SelfType(cls) => Type::ClassType(cls),
+                ty => ty,
+            }
+        })
+    }
+
+    /// Whether the subject type is closed for exhaustiveness checking.
+    fn is_closed_type_for_exhaustiveness_check(&self, ty: &Type) -> bool {
+        match ty {
+            Type::ClassType(cls) => {
+                // Non-subclassable classes are exhaustible, with the exception of Flag enums,
+                // whose members can be combined into new members via bitwise ops
+                !self.is_flag_enum(cls) && !self.is_subclassable(cls.class_object())
+                    // bool is effectively Literal[True] | Literal[False]
+                    || cls.is(KnownClass::Bool)
+            }
+
+            // Literal types have explicit values
+            Type::Literal(_) => true,
+
+            // None is a singleton
+            Type::None => true,
+
+            // Unions are exhaustible if all members are exhaustible types
+            Type::Union(union) => {
+                !union.members.is_empty()
+                    && union
+                        .members
+                        .iter()
+                        .all(|m| self.is_closed_type_for_exhaustiveness_check(m))
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Formats the missing cases for a non-exhaustive match error message.
+    /// Returns None if the remaining type can't be formatted nicely.
+    fn format_missing_cases(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Literal(lit) => Some(format!("{}", lit.value)),
+            Type::None => Some("None".to_owned()),
+            Type::ClassType(cls) => {
+                let display = self.for_display(self.heap.mk_class_type(cls.clone()));
+                Some(format!("{}", display))
+            }
+            Type::Union(union) => {
+                let formatted: Option<Vec<String>> = union
+                    .members
+                    .iter()
+                    .map(|m| self.format_missing_cases(m))
+                    .collect();
+                formatted.map(|cases| cases.join(", "))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn check_match_exhaustiveness(
+        &self,
+        subject_idx: &Idx<Key>,
+        narrowing_subject: Option<&NarrowingSubject>,
+        narrow_ops_for_fall_through: &(NarrowOp, TextRange),
+        subject_range: &TextRange,
+        show_subject_expr: bool,
+        errors: &ErrorCollector,
+    ) {
+        let (op, narrow_range) = narrow_ops_for_fall_through;
+        let subject_info = self.with_type_for_exhaustiveness_check(self.get_idx(*subject_idx));
+        let error_kind = if self.is_closed_type_for_exhaustiveness_check(subject_info.ty()) {
+            ErrorKind::NonExhaustiveMatch
+        } else {
+            ErrorKind::NonExhaustiveMatchOpenType
+        };
+        let ignore_errors = self.error_swallower();
+        // Get the narrowed type of the match subject when none of the cases match
+        let mut remaining_ty = match narrowing_subject {
+            None | Some(NarrowingSubject::Name(_)) => self
+                .narrow(&subject_info, op, *narrow_range, &ignore_errors)
+                .ty()
+                .clone(),
+            Some(NarrowingSubject::Facets(_, facets)) => {
+                let Some(resolved_chain) = self.resolve_facet_chain(facets.chain.clone()) else {
+                    return;
+                };
+                // If the narrowing subject is the facet of some variable like `x.foo`,
+                // We need to make a `TypeInfo` rooted at `x` using the type of `x.foo`
+                let type_info = TypeInfo::of_ty(self.heap.mk_any_implicit());
+                let narrowing_subject_info =
+                    type_info.with_narrow(resolved_chain.facets(), subject_info.ty().clone());
+                let narrowed =
+                    self.narrow(&narrowing_subject_info, op, *narrow_range, &ignore_errors);
+                self.get_facet_chain_type(&narrowed, &resolved_chain, *subject_range)
+            }
+        };
+        self.expand_mut(&mut remaining_ty);
+        // If the result is `Never` then the cases were exhaustive
+        if remaining_ty.is_never() || remaining_ty.is_any() {
+            return;
+        }
+        let subject_display = self.for_display(subject_info.into_ty());
+        let remaining_display = self.for_display(remaining_ty.clone());
+        let ctx = TypeDisplayContext::new(&[&subject_display, &remaining_display]);
+        let displayed_subject = if show_subject_expr {
+            self.module().code_at(*subject_range).to_owned()
+        } else {
+            ctx.display(&subject_display).to_string()
+        };
+        let message = format!("Match on `{displayed_subject}` is not exhaustive");
+        let mut builder = errors.error_builder(*subject_range, error_kind, message);
+        if let Some(missing_cases) = self.format_missing_cases(&remaining_ty) {
+            builder = builder.with_detail(format!("Missing cases: {}", missing_cases));
+        }
+        builder.emit();
+    }
+
+    pub fn check_match_case_reachability(
+        &self,
+        subject_idx: &Idx<Key>,
+        narrowing_subject: Option<&NarrowingSubject>,
+        narrow_ops_for_case: &(NarrowOp, TextRange),
+        prev_case_negations: Option<&MatchCaseNegations>,
+        case_range: &TextRange,
+        errors: &ErrorCollector,
+    ) {
+        let (op, narrow_range) = narrow_ops_for_case;
+        let can_check_pattern = Self::is_match_case_reachability_op(op);
+        if !can_check_pattern && (narrowing_subject.is_some() || prev_case_negations.is_none()) {
+            return;
+        }
+        let subject_info = self.with_type_for_exhaustiveness_check(self.get_idx(*subject_idx));
+        let subject_ty = subject_info.ty().clone();
+        // Earlier cases can exhaust an expression subject even when the current
+        // pattern is unclassifiable. Otherwise, preserve the classifier's veto.
+        if !can_check_pattern && !subject_ty.is_never() {
+            return;
+        }
+        // Structural patterns such as tuples can narrow `object` to `Never`
+        // spuriously.
+        if subject_ty.is_object() {
+            return;
+        }
+        let ignore_errors = self.error_swallower();
+        let (mut narrowed_info, resolved_facet_chain, has_never_trigger_facet) =
+            match narrowing_subject {
+                None | Some(NarrowingSubject::Name(_)) => {
+                    let narrowed = self.narrow(&subject_info, op, *narrow_range, &ignore_errors);
+                    let has_never_trigger_facet =
+                        self.has_never_match_trigger_facet(&narrowed, op, *case_range);
+                    (narrowed, None, has_never_trigger_facet)
+                }
+                Some(NarrowingSubject::Facets(_, facets)) => {
+                    let Some(resolved_chain) = self.resolve_facet_chain(facets.chain.clone())
+                    else {
+                        return;
+                    };
+                    let type_info = TypeInfo::of_ty(self.heap.mk_any_implicit());
+                    let narrowing_subject_info =
+                        type_info.with_narrow(resolved_chain.facets(), subject_ty.clone());
+                    let narrowed =
+                        self.narrow(&narrowing_subject_info, op, *narrow_range, &ignore_errors);
+                    // No sub-facet check needed: the narrowed type already represents
+                    // the facet's type directly, so `is_never()` below is sufficient.
+                    (narrowed, Some(resolved_chain), false)
+                }
+            };
+        // Narrow by the current pattern first, then apply the earlier cases'
+        // negations. On an `Any` subject this lets `bool` become `bool` before
+        // subtracting an earlier `int`, which yields `Never`.
+        if let Some(negations) = prev_case_negations {
+            narrowed_info = self.narrow(
+                &narrowed_info,
+                &negations.op,
+                negations.range,
+                &ignore_errors,
+            );
+        }
+        let mut narrowed_ty = match resolved_facet_chain {
+            Some(resolved_chain) => {
+                self.get_facet_chain_type(&narrowed_info, &resolved_chain, *case_range)
+            }
+            None => narrowed_info.ty().clone(),
+        };
+        self.expand_mut(&mut narrowed_ty);
+        if !narrowed_ty.is_never() && !has_never_trigger_facet {
+            return;
+        }
+        // `subject_idx` is already `Never` when earlier cases settle reachability,
+        // so name the subject those negations started from.
+        let reported_ty = match (subject_ty.is_never(), prev_case_negations) {
+            (true, Some(negations)) => self
+                .with_type_for_exhaustiveness_check(self.get_idx(negations.declared_subject_idx))
+                .ty()
+                .clone(),
+            _ => subject_ty,
+        };
+        let subject_display = self.for_display(reported_ty);
+        self.error(
+            errors,
+            *case_range,
+            ErrorKind::UnreachableMatchCase,
+            format!("Case pattern can never match subject of type `{subject_display}`"),
+        );
+    }
+
+    /// Check whether we can reliably determine reachability for this op.
+    ///
+    /// Returns `true` only when we understand all sub-ops AND at least one
+    /// constrains a value or class tightly enough to produce `Never`
+    /// (a "trigger", e.g. `Eq`, `Is`, or `IsInstance`).
+    ///
+    /// Structural ops like `IsSequence`/`LenEq` are checkable but aren't
+    /// triggers on their own.
+    fn is_match_case_reachability_op(op: &NarrowOp) -> bool {
+        let (can_check, has_trigger) = classify_match_case_op(op);
+        can_check && has_trigger
+    }
+
+    fn has_never_match_trigger_facet(
+        &self,
+        type_info: &TypeInfo,
+        op: &NarrowOp,
+        range: TextRange,
+    ) -> bool {
+        match op {
+            NarrowOp::Atomic(
+                Some(facet),
+                AtomicNarrowOp::Eq(_)
+                | AtomicNarrowOp::Is(_)
+                | AtomicNarrowOp::IsInstance(_, NarrowSource::Pattern),
+            ) => {
+                let Some(resolved_chain) = self.resolve_facet_chain(facet.chain.clone()) else {
+                    return false;
+                };
+                let mut facet_ty = self.get_facet_chain_type(type_info, &resolved_chain, range);
+                self.expand_mut(&mut facet_ty);
+                facet_ty.is_never()
+            }
+            NarrowOp::And(ops) => ops
+                .iter()
+                .any(|op| self.has_never_match_trigger_facet(type_info, op, range)),
+            NarrowOp::Or(ops) => {
+                !ops.is_empty()
+                    && ops
+                        .iter()
+                        .all(|op| self.has_never_match_trigger_facet(type_info, op, range))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn resolve_facet_chain(&self, unresolved: UnresolvedFacetChain) -> Option<FacetChain> {
+        let resolved: Option<Vec<FacetKind>> = unresolved
+            .facets()
+            .iter()
+            .map(|kind| self.resolve_facet_kind(kind.clone()))
+            .collect();
+        resolved.map(|facets| FacetChain::new(Vec1::try_from_vec(facets).unwrap()))
+    }
+
+    pub fn resolve_facet_kind(&self, unresolved: UnresolvedFacetKind) -> Option<FacetKind> {
+        match unresolved {
+            UnresolvedFacetKind::Attribute(name) => Some(FacetKind::Attribute(name)),
+            UnresolvedFacetKind::Index(idx) => Some(FacetKind::Index(idx)),
+            UnresolvedFacetKind::Key(key) => Some(FacetKind::Key(key)),
+            UnresolvedFacetKind::VariableSubscript(expr_name) => {
+                let suppress_errors = self.error_swallower();
+                let ty = self.expr_infer(&Expr::Name(expr_name), &suppress_errors);
+                match &ty {
+                    Type::Literal(lit) if let Lit::Int(lit_int) = &lit.value => {
+                        lit_int.as_i64().map(FacetKind::Index)
+                    }
+                    Type::Literal(lit) if let Lit::Str(s) = &lit.value => {
+                        Some(FacetKind::Key(s.to_string()))
+                    }
+                    _ => None,
+                }
+            }
+            UnresolvedFacetKind::MatchArg { class, index } => {
+                // Resolve the positional slot to an attribute name via the class's `__match_args__`
+                let suppress_errors = self.error_swallower();
+                let class_range = class.range();
+                let Type::ClassDef(cls) = self.expr_infer(&class, &suppress_errors) else {
+                    return None;
+                };
+                let instance = self.promote_silently(&cls);
+                let match_args = self.attr_infer_for_type(
+                    &instance,
+                    &dunder::MATCH_ARGS,
+                    class_range,
+                    &suppress_errors,
+                    None,
+                );
+                if let Type::Tuple(Tuple::Concrete(ts)) = &match_args
+                    && let Some(Type::Literal(lit)) = ts.get(index)
+                    && let Lit::Str(attr_name) = &lit.value
+                {
+                    Some(FacetKind::Attribute(Name::new(attr_name)))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn is_literal(ty: &Type) -> bool {
+        match ty {
+            Type::None | Type::Literal(_) | Type::Sentinel(_) => true,
+            ty => ty.is_ellipsis_value(),
+        }
+    }
+
+    /// Is `ty` a literal with a stable memory address?
+    /// This determines whether some narrowing operations are safe.
+    fn is_identity_literal(ty: &Type) -> bool {
+        match ty {
+            Type::None => true,
+            Type::Literal(f) => matches!(f.value, Lit::Bool(_) | Lit::Enum(_)),
+            ty => ty.is_ellipsis_value(),
+        }
+    }
+
+    fn literal_equal(left: &Type, right: &Type) -> bool {
+        if left.is_ellipsis_value() && right.is_ellipsis_value() {
+            return true;
+        }
+        match (left, right) {
+            (Type::None, Type::None) => true,
+            (Type::Sentinel(s1), Type::Sentinel(s2)) => s1 == s2,
+            (Type::Literal(left), Type::Literal(right)) => left.value == right.value,
+            _ => false,
+        }
+    }
+}
+
+/// Classifies a match case's narrow op as (can_check, has_trigger).
+///
+/// The two dimensions can't be collapsed into a single bool because And/Or need to
+/// distinguish "structural but checkable" from "unknown and uncheckable" in sub-ops.
+fn classify_match_case_op(op: &NarrowOp) -> (bool, bool) {
+    match op {
+        NarrowOp::Atomic(_, AtomicNarrowOp::Eq(_) | AtomicNarrowOp::Is(_)) => (true, true),
+        NarrowOp::Atomic(_, AtomicNarrowOp::IsInstance(_, NarrowSource::Pattern)) => (true, true),
+        NarrowOp::Atomic(
+            _,
+            AtomicNarrowOp::IsSequence
+            | AtomicNarrowOp::IsMapping
+            | AtomicNarrowOp::LenEq(_)
+            | AtomicNarrowOp::LenGte(_)
+            // The gate never narrows positively, so an enclosing
+            // `IsInstance` has to supply the trigger.
+            | AtomicNarrowOp::ClassCoverageGate(_),
+        ) => (true, false),
+        NarrowOp::And(ops) | NarrowOp::Or(ops) => {
+            let mut has_trigger = false;
+            for op in ops {
+                let (can_check, op_has_trigger) = classify_match_case_op(op);
+                if !can_check {
+                    return (false, false);
+                }
+                has_trigger |= op_has_trigger;
+            }
+            (true, has_trigger)
+        }
+        _ => (false, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_match_case_op;
+    use crate::binding::narrow::AtomicNarrowOp;
+    use crate::binding::narrow::NarrowOp;
+
+    fn placeholder() -> NarrowOp {
+        NarrowOp::Atomic(None, AtomicNarrowOp::Placeholder)
+    }
+
+    fn gate() -> NarrowOp {
+        NarrowOp::Atomic(None, AtomicNarrowOp::ClassCoverageGate(Box::new([])))
+    }
+
+    #[test]
+    fn coverage_gate_is_checkable_but_not_a_trigger() {
+        assert_eq!(classify_match_case_op(&gate()), (true, false));
+    }
+
+    #[test]
+    fn coverage_gate_does_not_qualify_alone() {
+        assert_eq!(
+            classify_match_case_op(&NarrowOp::And(vec![gate()])),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn unknown_sub_op_blocks_the_whole_op() {
+        // `Placeholder` is unclassifiable, so an `And` containing one is never
+        // checkable, even alongside otherwise-classifiable sub-ops.
+        assert_eq!(
+            classify_match_case_op(&NarrowOp::And(vec![gate(), placeholder()])),
+            (false, false)
+        );
+    }
+}

@@ -1,0 +1,169 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use lsp_types::CompletionRequest;
+use lsp_types::SemanticTokensRequest;
+use lsp_types::Uri;
+use pyrefly_lsp_test::object_model::InitializeSettings;
+use pyrefly_lsp_test::object_model::LspInteraction;
+use serde_json::json;
+
+#[test]
+fn test_semantic_tokens_for_unsaved_file() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings::default())
+        .unwrap();
+
+    let uri = Uri::parse("untitled:Untitled-1").unwrap();
+    let text = r#"def foo():
+    return 1
+
+foo()
+"#;
+    interaction.client.did_open_uri(&uri, "python", text);
+
+    interaction
+        .client
+        .send_request::<SemanticTokensRequest>(json!({
+            "textDocument": { "uri": uri.to_string() }
+        }))
+        .expect_response_with(|response| match response {
+            Some(xs) => !xs.data.is_empty(),
+            _ => false,
+        })
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_publish_diagnostics_preserves_unsaved_file_uri() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings {
+            configuration: Some(Some(
+                json!([{"pyrefly": {"displayTypeErrors": "force-on"}}]),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let uri = Uri::parse("untitled:Untitled-Diagnostics").unwrap();
+    interaction
+        .client
+        .did_open_uri(&uri, "python", "x: str = 1\n");
+    interaction
+        .client
+        .expect_publish_diagnostics_uri(&uri, 1)
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_no_diagnostics_for_non_python_unsaved_file() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings {
+            configuration: Some(Some(
+                json!([{"pyrefly": {"displayTypeErrors": "force-on"}}]),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let uri = Uri::parse("untitled:Untitled-Text").unwrap();
+    interaction
+        .client
+        .did_open_uri(&uri, "plaintext", "x: str = 1\n");
+    interaction
+        .client
+        .expect_publish_diagnostics_uri(&uri, 0)
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_completion_for_unsaved_file() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings::default())
+        .unwrap();
+
+    let uri = Uri::parse("untitled:Untitled-2").unwrap();
+    let text = r#"import math
+math.
+"#;
+    interaction.client.did_open_uri(&uri, "python", text);
+
+    interaction
+        .client
+        .send_request::<CompletionRequest>(json!({
+            "textDocument": {"uri": uri.to_string()},
+            "position": {"line": 1, "character": 5}
+        }))
+        .expect_completion_response_with(|list| !list.items.is_empty())
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_semantic_tokens_for_inmemory_file() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings::default())
+        .unwrap();
+
+    let uri = Uri::parse("inmemory:/repl-python-00000000-0000-0000-0000-000000000001").unwrap();
+    let text = r#"def foo():
+    return 1
+
+foo()
+"#;
+    interaction.client.did_open_uri(&uri, "python", text);
+
+    interaction
+        .client
+        .send_request::<SemanticTokensRequest>(json!({
+            "textDocument": { "uri": uri.to_string() }
+        }))
+        .expect_response_with(|response| match response {
+            Some(xs) => !xs.data.is_empty(),
+            _ => false,
+        })
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_completion_for_inmemory_file() {
+    let interaction = LspInteraction::new();
+    interaction
+        .initialize(InitializeSettings::default())
+        .unwrap();
+
+    let uri = Uri::parse("inmemory:/repl-python-00000000-0000-0000-0000-000000000002").unwrap();
+    let text = r#"import math
+math.
+"#;
+    interaction.client.did_open_uri(&uri, "python", text);
+
+    interaction
+        .client
+        .send_request::<CompletionRequest>(json!({
+            "textDocument": {"uri": uri.to_string()},
+            "position": {"line": 1, "character": 5}
+        }))
+        .expect_completion_response_with(|list| !list.items.is_empty())
+        .unwrap();
+
+    interaction.shutdown().unwrap();
+}

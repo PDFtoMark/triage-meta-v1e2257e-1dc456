@@ -1,0 +1,1102 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use crate::test::util::TestEnv;
+use crate::testcase;
+
+fn proxy_method_env() -> TestEnv {
+    TestEnv::one_with_path(
+        "shape_extensions",
+        "shape_extensions/__init__.pyi",
+        r#"
+class ProxyMethod[T]: ...
+"#,
+    )
+}
+
+testcase!(
+    test_specified_variance_gets_respected,
+    r#"
+from typing import Generic, TypeVar
+
+T = TypeVar("T", contravariant=True)
+
+# Intentionally set up 2 type variables:
+# - U needs to has its variance inferred (to be covariant)
+# - T has its variance specified incorrectly -- but downstream logic is expected to respect it.
+class Foo[U](Generic[T]):  # E: Type parameter `T` is not included in the type parameter list
+    def m0(self) -> T: ...  # E: Type variable `T` is contravariant but is used in covariant position
+    def m1(self) -> U: ...
+
+t_good: Foo[int, int] = Foo[int, float]()
+t_bad: Foo[int, float] = Foo[int, int]()  # E:
+
+u_good: Foo[float, int] = Foo[int, int]()
+u_bad: Foo[int, int] = Foo[float, int]()  # E:
+"#,
+);
+
+testcase!(
+    test_covariance_inference_class,
+    r#"
+from typing import Sequence, Any
+class ShouldBeCovariant[T](Sequence[T]):
+    def __getitem__(self, *args, **kwargs) -> Any: ...
+    def __len__(self) -> int: ...
+
+vco2_1: ShouldBeCovariant[float] = ShouldBeCovariant[int]()
+vco2_2: ShouldBeCovariant[int] = ShouldBeCovariant[float]()  # E:
+"#,
+);
+
+testcase!(
+    test_type_var_tuple_variance,
+    r#"
+class Covariant[*Ts]:
+    def get(self) -> tuple[*Ts]: ...
+
+fixed_covariant: Covariant[object] = Covariant[int]()
+fixed_covariant_bad: Covariant[int] = Covariant[object]()  # E:
+unpacked_covariant: Covariant[*tuple[object, ...]] = Covariant[*tuple[int, ...]]()
+unpacked_covariant_bad: Covariant[*tuple[int, ...]] = Covariant[*tuple[object, ...]]()  # E:
+
+class Contravariant[*Ts]:
+    def put(self, value: tuple[*Ts]) -> None: ...
+
+fixed_contravariant: Contravariant[int] = Contravariant[object]()
+fixed_contravariant_bad: Contravariant[object] = Contravariant[int]()  # E:
+unpacked_contravariant: Contravariant[*tuple[int, ...]] = Contravariant[*tuple[object, ...]]()
+unpacked_contravariant_bad: Contravariant[*tuple[object, ...]] = Contravariant[*tuple[int, ...]]()  # E:
+"#,
+);
+
+testcase!(
+    bug = "T2 and T3 should be resolved when we traverse methods. They will be bivariant until then. For T1, we raise an error because we already know it's invariant in list.",
+    test_general_variance,
+    r#"
+class ClassA[T1, T2, T3](list[T1]):
+    def method1(self, a: T2) -> None:
+        ...
+
+    def method2(self) -> T3:
+            ...
+
+def func_a(p1: ClassA[float, int, int], p2: ClassA[int, float, float]):
+    v1: ClassA[int, int, int] = p1  # E:
+    v2: ClassA[float, float, int] = p1 # E:
+    v3: ClassA[float, int, float] = p1
+
+    v4: ClassA[int, int, int] = p2 # E:
+    v5: ClassA[int, int, float] = p2
+"#,
+);
+
+testcase!(
+    test_bivariant,
+    r#"
+class A[T]:
+    def f(self, x: B[T]) -> B[T]:
+        return x
+
+class B[U]:
+    def g(self, x: A[U]) -> A[U]:
+        return x
+
+a = A[int]()
+b = B[int]()
+
+# We follow mypy and pyright's lead in treating bivariant type parameters as invariant.
+x: A[float] = b.g(a)  # E: `A[int]` is not assignable to `A[float]`
+"#,
+);
+
+testcase!(
+    test_invariant_callable,
+    r#"
+from typing import Callable
+
+class ShouldBeInvariant[T]:
+
+    def f (self, x: Callable[[T], T]):
+        return x
+
+square: Callable[[int], int] = lambda x: x ** 2
+
+a: Callable[[int], int] = ShouldBeInvariant[int]().f(square)
+b: Callable[[float], int]= ShouldBeInvariant[float]().f(square)  # E: # E:
+"#,
+);
+
+testcase!(
+    test_proxy_method_target_participates_in_variance_inference,
+    proxy_method_env(),
+    r#"
+from shape_extensions import ProxyMethod
+
+class ProxySink[T]:
+    __call__: ProxyMethod["put"]
+    def put(self, x: T) -> None: ...
+
+class ProxyBox[T]:
+    __call__: ProxyMethod["replace"]
+    def replace(self, x: T) -> T: ...
+
+sink_ok: ProxySink[int] = ProxySink[object]()
+sink_bad: ProxySink[object] = ProxySink[int]()  # E:
+
+box_bad_1: ProxyBox[float] = ProxyBox[int]()  # E:
+box_bad_2: ProxyBox[int] = ProxyBox[float]()  # E:
+"#,
+);
+
+testcase!(
+    test_invariant_dict,
+    r#"
+class ShouldBeInvariant[K, V](dict[K, V]):
+    pass
+
+vinv3_1: ShouldBeInvariant[float, str] = ShouldBeInvariant[int, str]()  # E:
+"#,
+);
+
+testcase!(
+    test_infer_variance,
+    r#"
+from typing import Sequence
+
+class ShouldBeCovariant2[T](Sequence[T]):
+    pass
+
+class ShouldBeCovariant3[U]:
+    def method(self) -> ShouldBeCovariant2[U]:
+        ...
+
+vco3_1: ShouldBeCovariant3[float] = ShouldBeCovariant3[int]()  # OK
+vco3_2: ShouldBeCovariant3[int] = ShouldBeCovariant3[float]()  # E:
+"#,
+);
+
+testcase!(
+    test_attrs,
+    r#"
+class ShouldBeInvariant5[T]:
+    def __init__(self, x: T) -> None:
+        self.x = x
+
+vinv5_1: ShouldBeInvariant5[float] = ShouldBeInvariant5[int](1)  # E:
+"#,
+);
+
+testcase!(
+    test_dunder_new_does_not_constrain_variance,
+    r#"
+from typing import Self
+
+class ShouldBeCovariant[T]:
+    def __new__(cls, value: T) -> Self: ...
+    def get(self) -> T: ...
+
+upcast: ShouldBeCovariant[float] = ShouldBeCovariant[int](1)
+downcast: ShouldBeCovariant[int] = ShouldBeCovariant[float](1.0)  # E:
+"#,
+);
+
+testcase!(
+    test_attrs_set_and_get,
+    r#"
+class ShouldBeCovariant1[T]:
+    def __getitem__(self, index: int) -> T:
+        ...
+
+vco1_1: ShouldBeCovariant1[float] = ShouldBeCovariant1[int]()  # OK
+vco1_2: ShouldBeCovariant1[int] = ShouldBeCovariant1[float]()  # E:
+
+class ShouldBeContravariant2[T]:
+    def __init__(self, value: T) -> None:
+        pass
+
+    def set_value(self, value: T):
+        pass
+
+vcontra1_1: ShouldBeContravariant2[float] = ShouldBeContravariant2[int](1)  # E:
+vcontra1_2: ShouldBeContravariant2[int] = ShouldBeContravariant2[float](1.2)  # OK
+"#,
+);
+
+testcase!(
+    test_infer_variance_and_private_field,
+    r#"
+from typing import Generic, TypeVar, Iterator
+
+T = TypeVar("T", infer_variance=True)
+
+class ShouldBeCovariant1(Generic[T]):
+    def __getitem__(self, index: int) -> T:
+        ...
+
+    def __iter__(self) -> Iterator[T]:
+        ...
+
+vco1_1: ShouldBeCovariant1[float] = ShouldBeCovariant1[int]()  # OK
+vco1_2: ShouldBeCovariant1[int] = ShouldBeCovariant1[float]()  # E:
+
+K = TypeVar("K", infer_variance=True)
+
+class ShouldBeCovariant5(Generic[K]):
+    def __init__(self, x: K) -> None:
+        self._x = x
+
+    def x(self) -> K:
+        return self._x
+
+vo5_1: ShouldBeCovariant5[float] = ShouldBeCovariant5[int](1)  # OK
+vo5_2: ShouldBeCovariant5[int] = ShouldBeCovariant5[float](1.0)  # E:
+
+# we are making sure we don't treat __dunder__ attributes as private.
+class ShouldBeInvariant6(Generic[K]):
+    def __init__(self, x: K) -> None:
+        self.__x__ = x
+
+    def x(self) -> K:
+        return self.__x__
+
+vo6_1: ShouldBeInvariant6[float] = ShouldBeInvariant6[int](1)  # E:
+vo6_2: ShouldBeInvariant6[int] = ShouldBeInvariant6[float](1.0)  # E:
+"#,
+);
+
+testcase!(
+    test_private_field,
+    r#"
+class ShouldBeCovariant5[K]:
+    def __init__(self, x: K) -> None:
+        self._x = x
+
+    def x(self) -> K:
+        return self._x
+
+vo5_1: ShouldBeCovariant5[float] = ShouldBeCovariant5[int](1)  # OK
+vo5_2: ShouldBeCovariant5[int] = ShouldBeCovariant5[float](1.0)  # E:
+"#,
+);
+
+testcase!(
+    test_dataclass_frozen_variance,
+    r#"
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ShouldBeCovariant4[T]:
+    x: T
+
+vo4_1: ShouldBeCovariant4[float] = ShouldBeCovariant4[int](1)  # OK
+vo4_4: ShouldBeCovariant4[int] = ShouldBeCovariant4[float](1.0)  # E:
+"#,
+);
+
+testcase!(
+    test_property,
+    r#"
+from typing import *
+class ShouldBeInvariant1[K]:
+    def __init__(self, value: K) -> None:
+        self._value = value
+
+    @property
+    def value(self) -> K:
+        return self._value
+
+    @value.setter
+    def value(self, value: K) -> None:
+        self._value = value
+
+vinv1_1: ShouldBeInvariant1[float] = ShouldBeInvariant1[int](1)  # E:
+vinv1_2: ShouldBeInvariant1[int] = ShouldBeInvariant1[float](1.1)  # E:
+"#,
+);
+
+testcase!(
+    test_protocol_property_invariant,
+    r#"
+from typing import Protocol, TypeVar
+
+TypeT = TypeVar("TypeT")
+
+class HasP(Protocol[TypeT]):
+    @property
+    def p(self) -> TypeT: ...
+    @p.setter
+    def p(self, p: TypeT, /) -> None: ...
+"#,
+);
+
+testcase!(
+    test_sequence_inheritance,
+    r#"
+from typing import Sequence
+
+class A[T](B[Sequence[T]]):
+    ...
+
+class B[T]:
+    def f(self, x:T) -> T:
+        return x
+
+b = B[int]()
+
+y = b.f(3)
+z = b.f(3.0) # E:
+"#,
+);
+
+testcase!(
+    test_self_referential_covariance,
+    r#"
+class FooInferred[Node]:
+    def __init__(self, *options: FooInferred[Node]) -> None: ...
+    def __or__[OtherNode](self, other: FooInferred[OtherNode]) -> FooInferred[Node | OtherNode]:
+        # Node should be inferred as covariant since it only appears in covariant positions
+        # (the return type of __or__, and __init__ is skipped for variance inference)
+        return FooInferred[Node | OtherNode](self, other)
+
+# If FooInferred is covariant, this should work:
+# FooInferred[int] <: FooInferred[int | str] because int <: int | str
+foo_int: FooInferred[int] = FooInferred[int]()
+foo_str: FooInferred[str] = FooInferred[str]()
+foo_union: FooInferred[int | str] = foo_int | foo_str
+"#,
+);
+
+// Regression test: recursive-only evidence converges to provisional invariant,
+// which is exposed as invariant at the legacy solver boundary.
+// The self parameter is excluded from variance inference to avoid self-referential cycles.
+testcase!(
+    test_self_referential_no_hang,
+    r#"
+class C[T]:
+    def f(self, a: C[T]) -> None:
+        pass
+
+good: C[int] = C[int]()
+bad1: C[float] = C[int]()  # E:
+bad2: C[int] = C[float]()  # E:
+"#,
+);
+
+testcase!(
+    test_nested_fallback_reliability,
+    r#"
+from typing import Callable, Generic, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class CovariantWrapper(Generic[T_co]): ...
+
+class RecursiveCarrier[T]:
+    def recurse(self) -> RecursiveCarrier[CovariantWrapper[T]]: ...
+
+# Both classes combine grounded contravariant evidence from `consume` with provisional
+# covariant evidence reached through `RecursiveCarrier`. They differ only in which evidence
+# variance inference visits first.
+class GroundedFirst[T]:
+    def consume(self, value: T) -> None: ...
+    def produce(self) -> RecursiveCarrier[CovariantWrapper[T]]: ...
+
+# GroundedFirst should be contravariant; this direction is the false positive.
+grounded_should_be_allowed: GroundedFirst[int] = GroundedFirst[object]()
+grounded_must_error: GroundedFirst[object] = GroundedFirst[int]()  # E:
+
+class ProvisionalFirst[T]:
+    def produce(self) -> RecursiveCarrier[CovariantWrapper[T]]: ...
+    def consume(self, value: T) -> None: ...
+
+# ProvisionalFirst should be contravariant; this direction is the false positive.
+provisional_should_be_allowed: ProvisionalFirst[int] = ProvisionalFirst[object]()
+provisional_must_error: ProvisionalFirst[object] = ProvisionalFirst[int]()  # E:
+
+class Phantom[T]: ...
+
+# Starting a base-class path at the composition identity must preserve the
+# contravariance introduced by Callable after the unresolved Phantom edge.
+class CallbackBase[T](Phantom[Callable[[T], None]]): ...
+
+callback_allowed: CallbackBase[int] = CallbackBase[object]()
+callback_must_error: CallbackBase[object] = CallbackBase[int]()  # E:
+"#,
+);
+
+testcase!(
+    test_receiver_annotation_skipped_for_variance_inference,
+    r#"
+from typing import Callable
+
+class Container[T]:
+    def __init__(self, value: T):
+        self._value: T = value
+
+    def to_value_T(self: Container[T]) -> T:
+        return self._value
+
+check_covariant: Container[object] = Container[int](1)
+check_bad: Container[int] = Container[object](object())  # E:
+
+direct_call: int = Container.to_value_T(Container[int](1))
+direct_call_bad: str = Container.to_value_T(Container[int](1))  # E:
+
+class ReceiverAndValue[T]:
+    def put(self: ReceiverAndValue[T], value: T) -> None: ...
+
+receiver_ok: ReceiverAndValue[int] = ReceiverAndValue[object]()
+receiver_bad: ReceiverAndValue[object] = ReceiverAndValue[int]()  # E:
+
+class StaticInput[T]:
+    @staticmethod
+    def consume(value: T) -> None: ...
+
+static_ok: StaticInput[int] = StaticInput[object]()
+static_bad: StaticInput[object] = StaticInput[int]()  # E:
+
+class CallableField[T]:
+    callback: Callable[["CallableField[T]"], T]
+
+callable_field_bad: CallableField[object] = CallableField[int]()  # E:
+
+class PropertyGetter[T]:
+    @property
+    def value(self: PropertyGetter[T]) -> T: ...
+
+property_ok: PropertyGetter[object] = PropertyGetter[int]()
+property_bad: PropertyGetter[int] = PropertyGetter[object]()  # E:
+
+class PropertySetter[T]:
+    @property
+    def value(self: PropertySetter[T]) -> T: ...
+    @value.setter
+    def value(self: PropertySetter[T], value: T) -> None: ...
+
+property_setter_bad1: PropertySetter[object] = PropertySetter[int]()  # E:
+property_setter_bad2: PropertySetter[int] = PropertySetter[object]()  # E:
+
+class ClassGetter[T]:
+    @classmethod
+    def get(cls: type[ClassGetter[T]]) -> T: ...
+
+classmethod_ok: ClassGetter[object] = ClassGetter[int]()
+classmethod_bad: ClassGetter[int] = ClassGetter[object]()  # E:
+"#,
+);
+
+// Test variance inference with stdlib generic that has covariant type parameter
+testcase!(
+    test_class_variance_with_mapping,
+    r#"
+from collections.abc import Mapping
+
+class Container[T]:
+    def get(self) -> Mapping[str, T]:
+        ...
+
+def widen(c: Container[int]) -> Container[float]:
+    return c  # OK - T is covariant since Mapping's V type is covariant
+"#,
+);
+
+testcase!(
+    test_variance_enforcement_in_base_classes,
+    r#"
+from typing import TypeVar, Generic
+
+T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Co(Generic[T_co]): ...
+class Contra(Generic[T_contra]): ...
+class Inv(Generic[T]): ...
+class CoContra(Generic[T_co, T_contra]): ...
+
+class Class1(
+    Inv[T_co]  # E: Type variable `T_co` is covariant but is used in invariant position
+): ...
+class Class2(
+    Inv[T_contra]  # E: Type variable `T_contra` is contravariant but is used in invariant position
+): ...
+
+class Co_Child3(
+    Co[T_contra]  # E: Type variable `T_contra` is contravariant but is used in covariant position
+): ...
+class Contra_Child3(
+    Contra[T_co]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+class Contra_Child5(
+    Contra[Co[T_co]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+
+class CoContra_Child2(
+    CoContra[T_co, T_co]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+class CoContra_Child3(
+    CoContra[T_contra, T_contra]  # E: Type variable `T_contra` is contravariant but is used in covariant position
+): ...
+class CoContra_Child5(
+    CoContra[Co[T_co], Co[T_co]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+
+class CoToContraToContra(
+    Contra[Co[Contra[T_contra]]]  # E: Type variable `T_contra` is contravariant but is used in covariant position
+): ...
+class ContraToContraToContra(
+    Contra[Contra[Contra[T_co]]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+
+Co_TA = Co[T_co]
+Contra_TA = Contra[T_contra]
+
+class CoToContraToContra_WithTA(
+    Contra_TA[Co_TA[Contra_TA[T_contra]]]  # E: Type variable `T_contra` is contravariant but is used in covariant position
+): ...
+class ContraToContraToContra_WithTA(
+    Contra_TA[Contra_TA[Contra_TA[T_co]]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_protocols_variance_conformance,
+    r#"
+from typing import Protocol, TypeVar
+
+T1 = TypeVar("T1")
+T1_co = TypeVar("T1_co", covariant=True)
+T1_contra = TypeVar("T1_contra", contravariant=True)
+
+class AnotherBox(Protocol[T1]):  # E: Type variable `T1` in class `AnotherBox` is declared as invariant, but could be covariant based on its usage
+    def content(self) -> T1: ...
+
+class Protocol4(Protocol[T1]):  # E: Type variable `T1` in class `Protocol4` is declared as invariant, but could be contravariant based on its usage
+    def m1(self, p0: T1) -> None: ...
+
+class Protocol5(Protocol[T1_co]):
+    def m1(self, p0: T1_co) -> None: ...  # E: Type variable `T1_co` is covariant but is used in contravariant position
+
+class Protocol6(Protocol[T1]):  # E: Type variable `T1` in class `Protocol6` is declared as invariant, but could be covariant based on its usage
+    def m1(self) -> T1: ...
+
+class Protocol7(Protocol[T1_contra]):
+    def m1(self) -> T1_contra: ...  # E: Type variable `T1_contra` is contravariant but is used in covariant position
+
+class Protocol12(Protocol[T1]):  # E: Type variable `T1` in class `Protocol12` is declared as invariant, but could be covariant based on its usage
+    def __init__(self, x: T1) -> None: ...
+"#,
+);
+
+testcase!(
+    test_shallow_covariant_in_param,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+
+class Foo(Generic[T_co]):
+    def f(self, x: T_co) -> None: ...  # E: Type variable `T_co` is covariant but is used in contravariant position
+"#,
+);
+
+testcase!(
+    test_shallow_receiver_not_checked,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+
+class Foo(Generic[T_co]):
+    def f(self: T_co) -> None: ...
+"#,
+);
+
+testcase!(
+    test_constrained_typevar_protocol_variance_mismatch,
+    r#"
+from typing import Protocol, TypeVar
+
+T = TypeVar("T", str, bytes)
+
+class Foo(Protocol[T]):  # E: could be covariant
+    def value(self) -> T: ...
+
+class Bar(Protocol[T]):  # E: could be contravariant
+    def consume(self, x: T) -> None: ...
+"#,
+);
+
+testcase!(
+    test_mixed_typevar_protocol_variance_mismatch,
+    r#"
+from typing import Protocol, TypeVar
+
+T = TypeVar("T", str, bytes)
+B = TypeVar("B", bound=float)
+U = TypeVar("U")
+
+# Eligible siblings force the diagnostic loop to run, but only those siblings warn.
+class Producer(Protocol[T, B]):  # E: `T` in class `Producer` is declared as invariant, but could be covariant  # E: `B` in class `Producer` is declared as invariant, but could be covariant
+    def value(self) -> tuple[T, B]: ...
+
+class Consumer(Protocol[T, B]):  # E: `T` in class `Consumer` is declared as invariant, but could be contravariant  # E: `B` in class `Consumer` is declared as invariant, but could be contravariant
+    def consume(self, x: T, y: B) -> None: ...
+
+class UnconstrainedProducer(Protocol[T, U]):  # E: `T` in class `UnconstrainedProducer` is declared as invariant, but could be covariant  # E: `U` in class `UnconstrainedProducer` is declared as invariant, but could be covariant
+    def value(self) -> tuple[T, U]: ...
+"#,
+);
+
+testcase!(
+    test_constrained_typevar_protocol_declared_variance,
+    r#"
+from typing import Protocol, TypeVar
+
+T = TypeVar("T", int, float)
+T_co = TypeVar("T_co", int, float, covariant=True)
+T_contra = TypeVar("T_contra", int, float, contravariant=True)
+
+class InvariantProducer(Protocol[T]):  # E: could be covariant
+    def value(self) -> T: ...
+
+class Producer(Protocol[T_co]):
+    def value(self) -> T_co: ...
+
+class Consumer(Protocol[T_contra]):
+    def consume(self, x: T_contra) -> None: ...
+
+# Overlapping constraints make declared variance observable in subtyping.
+def check(
+    p_inv: InvariantProducer[int],
+    p_int: Producer[int],
+    p_float: Producer[float],
+    c_int: Consumer[int],
+    c_float: Consumer[float],
+) -> None:
+    invariant_bad: InvariantProducer[float] = p_inv  # E: `InvariantProducer[int]` is not assignable to `InvariantProducer[float]`
+    producer_ok: Producer[float] = p_int
+    producer_bad: Producer[int] = p_float  # E: `Producer[float]` is not assignable to `Producer[int]`
+    consumer_ok: Consumer[int] = c_float
+    consumer_bad: Consumer[float] = c_int  # E: `Consumer[int]` is not assignable to `Consumer[float]`
+
+class InvalidProducer(Protocol[T_contra]):
+    def value(self) -> T_contra: ...  # E: Type variable `T_contra` is contravariant but is used in covariant position
+"#,
+);
+
+testcase!(
+    test_shallow_contravariant_in_return,
+    r#"
+from typing import TypeVar, Generic
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Foo(Generic[T_contra]):
+    def f(self) -> T_contra: ...  # E: Type variable `T_contra` is contravariant but is used in covariant position
+"#,
+);
+
+// Deep check: we should NOT raise an error here
+testcase!(
+    test_deep_covariant_in_contra_return,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Contra(Generic[T_contra]): ...
+
+class Foo(Generic[T_co]):  
+    def f(self) -> Contra[T_co]: ...
+"#,
+);
+
+// Deep check: we should NOT raise an error here
+testcase!(
+    test_deep_covariant_in_co_param,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+
+class Co(Generic[T_co]): ...
+
+class Foo(Generic[T_co]):  
+    def f(self, x: Co[T_co]) -> None: ...
+"#,
+);
+
+// Deep check: we should NOT raise an error here
+testcase!(
+    test_deep_callable_param_in_return,
+    r#"
+from typing import TypeVar, Generic, Callable
+T_co = TypeVar("T_co", covariant=True)
+
+class Foo(Generic[T_co]):  
+    def f(self) -> Callable[[T_co], None]: ...
+"#,
+);
+
+// Deep check: we should NOT raise an error here
+testcase!(
+    test_deep_callable_return_in_param,
+    r#"
+from typing import TypeVar, Generic, Callable
+T_co = TypeVar("T_co", covariant=True)
+
+class Foo(Generic[T_co]):  
+    def f(self, x: Callable[[], T_co]) -> None: ...
+"#,
+);
+
+// Deep check: we should NOT raise an error here
+testcase!(
+    test_deep_double_callable,
+    r#"
+from typing import TypeVar, Generic, Callable
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Foo(Generic[T_contra]):
+    def f(self) -> Callable[[Callable[[T_contra], None]], None]: ...
+"#,
+);
+
+// We skip checking fields
+testcase!(
+    test_field_covariant_in_mutable,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+
+class Foo(Generic[T_co]):
+    x: T_co 
+"#,
+);
+
+// We skip checking fields
+testcase!(
+    test_field_contravariant_in_mutable,
+    r#"
+from typing import TypeVar, Generic
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Foo(Generic[T_contra]):
+    x: T_contra  
+"#,
+);
+
+testcase!(
+    test_base_covariant_in_invariant,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T = TypeVar("T")
+
+class Inv(Generic[T]): ...
+
+class Foo(
+    Inv[T_co]  # E: Type variable `T_co` is covariant but is used in invariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_base_contravariant_in_invariant,
+    r#"
+from typing import TypeVar, Generic
+T_contra = TypeVar("T_contra", contravariant=True)
+T = TypeVar("T")
+
+class Inv(Generic[T]): ...
+
+class Foo(
+    Inv[T_contra]  # E: Type variable `T_contra` is contravariant but is used in invariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_base_covariant_in_contravariant,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Contra(Generic[T_contra]): ...
+
+class Foo(
+    Contra[T_co]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_base_contravariant_in_covariant,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Co(Generic[T_co]): ...
+
+class Foo(
+    Co[T_contra]  # E: Type variable `T_contra` is contravariant but is used in covariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_base_nested_double,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Co(Generic[T_co]): ...
+class Contra(Generic[T_contra]): ...
+
+# pyright errors and mypy does not
+class Foo(
+    Contra[Co[T_co]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_base_nested_triple_error,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Contra(Generic[T_contra]): ...
+
+# pyright errors and mypy does not
+class Foo(
+    Contra[Contra[Contra[T_co]]]  # E: Type variable `T_co` is covariant but is used in contravariant position
+): ...
+"#,
+);
+
+testcase!(
+    test_inherited_contravariance_from_parent,
+    r#"
+from typing import Self
+
+class SupportsLT[ComparableT]:  # contravariant
+    def __lt__(self, other: ComparableT, /) -> Self: ...
+
+def upcast_lt(arg: SupportsLT[object]) -> SupportsLT[float]:
+    return arg
+
+class Impl[T](SupportsLT[T]):  ...  # contravariant via inheritance
+
+def upcast(x: Impl[object]) -> Impl[float]:
+    return x
+"#,
+);
+
+testcase!(
+    test_base_nested_triple_ok,
+    r#"
+from typing import TypeVar, Generic
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class Co(Generic[T_co]): ...
+class Contra(Generic[T_contra]): ...
+
+# contra * co * contra = co, so T_co in covariant position - OK
+class Foo(Contra[Co[Contra[T_co]]]): ...
+"#,
+);
+
+// A mutable attribute makes the class invariant in the type parameter, even
+// though methods using the same type parameter would make it covariant.
+// This is important because even though pyrefly allows disabling the
+// bad-override-mutable-attribute error, variance must still be inferred correctly.
+testcase!(
+    test_mutable_attribute_makes_class_invariant,
+    r#"
+class A[T]:
+    p: T
+
+    def m(self) -> T:
+        return self.p
+
+def foo(x: A[int]) -> A[int | str]:
+    return x  # E: Returned type `A[int]` is not assignable to declared return type `A[int | str]`
+"#,
+);
+
+// Regression test for https://github.com/facebook/pyrefly/issues/1343
+testcase!(
+    test_covariant_typevar_in_contravariant_position,
+    r#"
+from typing import Protocol, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class Box(Protocol[T_co]):
+    def get(self) -> T_co: ...
+    def set(self, value: T_co) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+"#,
+);
+
+testcase!(
+    test_variance_error_in_overload,
+    r#"
+from typing import Any, Generic, overload, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class C(Generic[T_co]):
+    @overload
+    def f(self, x: int) -> int: ...
+    @overload
+    def f(self, x: T_co) -> str: ...  # E: `T_co` is covariant but is used in contravariant position
+    def f(self, x: Any) -> Any: ...
+    "#,
+);
+
+testcase!(
+    test_variance_error_in_overload_reported_on_correct_line,
+    r#"
+from typing import Generic, overload, TypeVar
+
+_T_co = TypeVar("_T_co", covariant=True)
+
+class Foo(Generic[_T_co]):
+    @overload
+    def foo(self) -> None: ...
+    @overload
+    def foo(self, instance: _T_co) -> None: ...  # E: `_T_co` is covariant but is used in contravariant position
+    def foo(self, instance: _T_co | None = ...) -> None: ...
+    "#,
+);
+
+// Overloads without an implementation are built from the final `@overload`
+// definition itself, which is a different construction path from overloads with
+// a concrete implementation.
+testcase!(
+    test_variance_error_in_overload_protocol_no_implementation,
+    r#"
+from typing import Protocol, TypeVar, overload
+
+T_co = TypeVar("T_co", covariant=True)
+
+class P(Protocol[T_co]):
+    @overload
+    def f(self, x: int) -> None: ...
+    @overload
+    def f(self, x: T_co) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+    "#,
+);
+
+// The error must track the *offending* overload, not a fixed index: here the
+// violation is in the FIRST arm, so the error belongs there.
+testcase!(
+    test_variance_error_in_overload_first_arm,
+    r#"
+from typing import Generic, overload, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class C(Generic[T_co]):
+    @overload
+    def f(self, x: T_co) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+    @overload
+    def f(self, x: int) -> None: ...
+    def f(self, x: object) -> None: ...
+    "#,
+);
+
+// Each violating overload is reported independently, on its own line.
+testcase!(
+    test_variance_error_in_overload_both_arms,
+    r#"
+from typing import Generic, overload, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class C(Generic[T_co]):
+    @overload
+    def f(self, x: T_co) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+    @overload
+    def f(self, x: T_co, y: int) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+    def f(self, x: T_co, y: int = ...) -> None: ...
+    "#,
+);
+
+// Return position is covariant: a contravariant TypeVar there is the violation,
+// and it must land on the arm that returns it (the second), not the first.
+testcase!(
+    test_variance_error_in_overload_contravariant_return,
+    r#"
+from typing import Generic, overload, TypeVar
+
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class C(Generic[T_contra]):
+    @overload
+    def f(self, x: T_contra) -> None: ...
+    @overload
+    def f(self, x: int) -> T_contra: ...  # E: `T_contra` is contravariant but is used in covariant position
+    def f(self, x: object) -> T_contra | None: ...
+    "#,
+);
+
+// The offending arm is itself generic (an `OverloadType::Forall`), exercising
+// the Forall branch of the per-signature range lookup.
+testcase!(
+    test_variance_error_in_overload_generic_arm,
+    r#"
+from typing import Generic, overload, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+U = TypeVar("U")
+
+class C(Generic[T_co]):
+    @overload
+    def f(self, x: int) -> None: ...
+    @overload
+    def f(self, x: T_co, y: U) -> U: ...  # E: `T_co` is covariant but is used in contravariant position
+    def f(self, x: object, y: object = ...) -> object: ...
+    "#,
+);
+
+// Negative: correct positions across overloads must not over-report.
+testcase!(
+    test_variance_overload_no_false_positive,
+    r#"
+from typing import Generic, overload, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+T_contra = TypeVar("T_contra", contravariant=True)
+
+class C(Generic[T_co, T_contra]):
+    @overload
+    def f(self, x: T_contra) -> T_co: ...
+    @overload
+    def f(self, x: int) -> T_co: ...
+    def f(self, x: object) -> T_co: ...
+    "#,
+);
+
+// Regression guard: single (non-overloaded) methods still go through the
+// unchanged `visit_toplevel_callable` path and are still flagged.
+testcase!(
+    test_variance_error_in_single_method,
+    r#"
+from typing import Generic, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+class C(Generic[T_co]):
+    def f(self, x: T_co) -> None: ...  # E: `T_co` is covariant but is used in contravariant position
+    "#,
+);

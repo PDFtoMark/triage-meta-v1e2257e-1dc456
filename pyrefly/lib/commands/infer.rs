@@ -1,0 +1,1711 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+use std::path::Path;
+
+use clap::Parser;
+use pyrefly_config::args::ConfigOverrideArgs;
+use pyrefly_config::base::InferReturnTypes;
+use pyrefly_config::finder::ConfigFinder;
+use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::qname::QName;
+use pyrefly_python::short_identifier::ShortIdentifier;
+use pyrefly_util::forgetter::Forgetter;
+use pyrefly_util::fs_anyhow;
+use pyrefly_util::includes::Includes;
+use pyrefly_util::thread_pool::ThreadCount;
+use ruff_python_ast::Stmt;
+use ruff_python_ast::helpers::is_docstring_stmt;
+use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use starlark_map::Hashed;
+
+use crate::annotation::format_annotation;
+use crate::binding::binding::Key;
+use crate::commands::check::Handles;
+use crate::commands::config_finder::ConfigConfigurerWrapper;
+use crate::commands::files::FilesArgs;
+use crate::commands::util::CommandExitStatus;
+use crate::export::definitions::DefinitionStyle;
+use crate::export::definitions::Definitions;
+use crate::lsp::wasm::inlay_hints::ParameterAnnotation;
+use crate::state::ide::ImportEdit;
+use crate::state::ide::insert_from_import_edit;
+use crate::state::lsp::AnnotationKind;
+use crate::state::require::Require;
+use crate::state::state::State;
+use crate::types::class::Class;
+use crate::types::heap::TypeHeap;
+use crate::types::simplify::unions_with_literals;
+use crate::types::stdlib::Stdlib;
+use crate::types::types::Type;
+
+#[deny(clippy::missing_docs_in_private_items)]
+/// Flags for controlling the behavior of the autotype command
+#[derive(Debug, Clone, Parser)]
+pub struct InferFlags {
+    // Default should be false for all of them and then we can override to easily customize
+    /// Whether to add type annotations to container types like lists and dictionaries
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    pub containers: Option<bool>,
+    /// Whether to add return type annotations to functions
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    pub return_types: Option<bool>,
+    /// Whether to add type annotations to function parameters
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    pub parameter_types: Option<bool>,
+    /// Whether to automatically add imports for types used in annotations
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    pub imports: Option<bool>,
+    /// Print what would change and exit (1 if any changes, else 0), without writing any files.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl InferFlags {
+    pub fn default() -> Self {
+        Self {
+            containers: Some(false),
+            return_types: Some(true),
+            parameter_types: Some(true),
+            imports: Some(true),
+            dry_run: false,
+        }
+    }
+
+    pub fn containers(&self) -> bool {
+        self.containers.unwrap_or(false)
+    }
+
+    pub fn return_types(&self) -> bool {
+        self.return_types.unwrap_or(true)
+    }
+
+    pub fn parameter_types(&self) -> bool {
+        self.parameter_types.unwrap_or(true)
+    }
+
+    pub fn imports(&self) -> bool {
+        self.imports.unwrap_or(true)
+    }
+
+    pub fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+}
+
+/// Arguments for the autotype command which automatically adds type annotations to Python code
+#[deny(clippy::missing_docs_in_private_items)]
+#[derive(Debug, Parser, Clone)]
+pub struct InferArgs {
+    /// Which files to check.
+    #[command(flatten)]
+    files: FilesArgs,
+
+    /// Type checking arguments and configuration
+    #[command(flatten)]
+    config_override: ConfigOverrideArgs,
+
+    /// Flags controlling the behavior of the autotype command
+    #[command(flatten)]
+    flags: InferFlags,
+}
+
+impl ParameterAnnotation {
+    fn to_inlay_hint(self) -> Option<(TextSize, Type, AnnotationKind)> {
+        if let Some(ty) = self.ty {
+            if ty.is_any() || self.has_annotation {
+                return None;
+            }
+            Some((self.text_size, ty, AnnotationKind::Parameter))
+        } else {
+            None
+        }
+    }
+}
+
+fn is_container(hint: &Type) -> bool {
+    match hint {
+        Type::ClassType(c) => c.name().eq("list") || c.name().eq("dict"),
+        _ => false,
+    }
+}
+
+/// Returns the name to import for a given QName. For top-level names, this is
+/// the name itself. For nested classes (e.g., `Outer.Inner`), this walks up
+/// the parent chain to find the outermost class that should be imported.
+fn importable_name_for_qname(qname: &QName) -> String {
+    let mut nesting = qname.parent();
+    if nesting.is_toplevel() {
+        return qname.id().to_string();
+    }
+    // Walk up the parent chain to find the outermost non-toplevel context
+    while let Some(parent) = nesting.parent() {
+        if parent.is_toplevel() {
+            let short_id = nesting
+                .identifier()
+                .expect("non-toplevel NestingContext must have an identifier");
+            return qname.module().code_at(short_id.range()).to_owned();
+        }
+        nesting = parent;
+    }
+    unreachable!("NestingContext chain should always end with Toplevel")
+}
+
+/// Whether an annotation can reuse a binding, needs an import, or is unsafe.
+enum AnnotationImport {
+    Existing,
+    Insert,
+    Unavailable,
+}
+
+/// Formats inlay hints as annotation strings and collects the set of imports
+/// needed for the types that pass filtering. Returns the formatted annotations
+/// and a set of `(source_module, importable_name)` pairs to import.
+fn format_hints(
+    inlay_hints: Vec<(ruff_text_size::TextSize, Type, AnnotationKind)>,
+    stdlib: &Stdlib,
+    enum_members: &dyn Fn(&Class) -> Option<usize>,
+    heap: &TypeHeap,
+    current_module_name: ModuleName,
+    plan_import: &dyn Fn(ModuleName, &str) -> AnnotationImport,
+) -> (
+    Vec<(ruff_text_size::TextSize, String)>,
+    HashSet<(ModuleName, String)>,
+) {
+    let mut qualified_hints = Vec::new();
+    let mut needed_imports = HashSet::new();
+    for (position, hint, kind) in inlay_hints {
+        let is_container = is_container(&hint);
+        let contains_self_type = hint.any(|sub_type| matches!(sub_type, Type::SelfType(_)));
+        // Collect QNames before hint_to_string consumes the type. Each QName
+        // carries the defining module, so we know exactly where to import from.
+        let mut hint_imports = Vec::new();
+        hint.universe(&mut |sub_type| {
+            if matches!(sub_type, Type::SelfType(_)) {
+                return;
+            }
+            // A DataFrame/Series renders as its underlying class, which `universe` does not visit.
+            let qname = match sub_type {
+                Type::DataFrame(schema) => Some(schema.underlying.qname()),
+                Type::Series(schema) => Some(schema.underlying.qname()),
+                _ => sub_type.qname(),
+            };
+            if let Some(qname) = qname {
+                let module_name = qname.module_name();
+                if module_name != ModuleName::builtins() && module_name != current_module_name {
+                    hint_imports.push((module_name, importable_name_for_qname(qname)));
+                }
+            }
+        });
+        if contains_self_type {
+            hint_imports.push((ModuleName::typing(), "Self".to_owned()));
+        }
+        let mut typing_imports = BTreeSet::new();
+        let mut uses_incomplete = false;
+        let formatted_hint = hint_to_string(
+            hint,
+            stdlib,
+            enum_members,
+            heap,
+            &mut typing_imports,
+            &mut uses_incomplete,
+        );
+        // TODO: Put these behind a flag
+        if formatted_hint.contains("Any") {
+            continue;
+        }
+        if formatted_hint.contains("@") {
+            continue;
+        }
+        if formatted_hint.contains("Unknown") {
+            continue;
+        }
+        if formatted_hint.contains("Never") {
+            continue;
+        }
+        if formatted_hint.contains("Overload") {
+            continue;
+        }
+        if uses_incomplete {
+            continue;
+        }
+        if formatted_hint == "None" && kind == AnnotationKind::Parameter {
+            continue;
+        }
+        if !is_container && kind == AnnotationKind::Variable {
+            continue;
+        }
+        hint_imports.extend(
+            typing_imports
+                .into_iter()
+                .map(|name| (ModuleName::typing(), name.to_owned())),
+        );
+        let mut imports = Vec::new();
+        let mut safe = true;
+        for (module, name) in hint_imports {
+            match plan_import(module, &name) {
+                AnnotationImport::Existing => {}
+                AnnotationImport::Insert => imports.push((module, name)),
+                AnnotationImport::Unavailable => {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+        if !safe {
+            continue;
+        }
+        needed_imports.extend(imports);
+        match kind {
+            AnnotationKind::Parameter => {
+                qualified_hints.push((position, format!(": {formatted_hint}")));
+            }
+            AnnotationKind::Return => {
+                qualified_hints.push((position, format!(" -> {formatted_hint}")));
+            }
+            AnnotationKind::Variable => {
+                qualified_hints.push((position, format!(": {formatted_hint}")));
+            }
+        }
+    }
+    (qualified_hints, needed_imports)
+}
+
+fn hint_to_string(
+    hint: Type,
+    stdlib: &Stdlib,
+    enum_members: &dyn Fn(&Class) -> Option<usize>,
+    heap: &TypeHeap,
+    typing_imports: &mut BTreeSet<&'static str>,
+    uses_incomplete: &mut bool,
+) -> String {
+    let hint = hint.promote(stdlib);
+    let hint = hint.explicit_any().clean_var();
+    let hint = match hint {
+        Type::Union(u) => unions_with_literals(u.members, stdlib, enum_members, heap),
+        _ => hint,
+    };
+    format_annotation(&hint, typing_imports, uses_incomplete)
+}
+
+impl InferArgs {
+    pub fn run(
+        mut self,
+        wrapper: Option<ConfigConfigurerWrapper>,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<CommandExitStatus> {
+        self.config_override.validate()?;
+        // The infer command must analyze function bodies to produce meaningful
+        // return type annotations. Ensure both settings are enabled unless
+        // the user explicitly set them via CLI.
+        self.config_override
+            .set_check_unannotated_defs_if_unset(true);
+        self.config_override
+            .set_infer_return_types_if_unset(InferReturnTypes::Checked);
+        let (files_to_check, config_finder, _) =
+            self.files.resolve(self.config_override, wrapper)?;
+        Self::run_inner(files_to_check, config_finder, self.flags, thread_count)
+    }
+
+    pub fn run_inner(
+        files_to_check: Box<dyn Includes>,
+        config_finder: ConfigFinder,
+        flags: InferFlags,
+        thread_count: ThreadCount,
+    ) -> anyhow::Result<CommandExitStatus> {
+        let expanded_file_list = config_finder.checkpoint(files_to_check.files_iter())?;
+        let state = State::new(config_finder, thread_count);
+        let holder = Forgetter::new(state, false);
+        let handles = Handles::new(expanded_file_list);
+        // Use Exports as the default require level for dependency modules —
+        // only the files being inferred need Everything.
+        let mut forgetter = Forgetter::new(
+            holder.as_ref().new_transaction(Require::Exports, None),
+            true,
+        );
+
+        let mut cancellable_transaction = holder.as_ref().cancellable_transaction();
+        let transaction = forgetter.as_mut();
+
+        let (handles, _, sourcedb_errors) = handles.all(holder.as_ref().config_finder());
+        if !sourcedb_errors.is_empty() {
+            for error in sourcedb_errors {
+                error.print();
+            }
+            return Err(anyhow::anyhow!("Failed to query sourcedb."));
+        }
+        // Type-check all handles at once so the work can be parallelised across
+        // the thread pool, instead of checking one file at a time sequentially.
+        transaction.run(&handles, Require::Everything, None);
+        let mut any_changes = false;
+        for handle in handles {
+            let Some(ast) = transaction.get_ast(&handle) else {
+                continue;
+            };
+            let definitions = Definitions::new(
+                &ast.body,
+                handle.module(),
+                handle.path().is_init(),
+                *handle.sys_info(),
+            );
+            let postponed = ast.body.iter().any(|stmt| {
+                matches!(stmt, Stmt::ImportFrom(import)
+                    if import.level == 0
+                        && import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                        && import.names.iter().any(|name| name.name.as_str() == "annotations"))
+            });
+            let leading_imports_end = ast
+                .body
+                .iter()
+                .skip_while(|stmt| is_docstring_stmt(stmt))
+                .take_while(|stmt| matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)))
+                .last()
+                .map_or(TextSize::new(0), |stmt| stmt.range().end());
+            let stdlib = transaction.get_stdlib(&handle);
+            let inferred_types: Option<Vec<(ruff_text_size::TextSize, Type, AnnotationKind)>> =
+                transaction.inferred_types(&handle, flags.return_types(), flags.containers());
+            let parameter_annotations = if flags.parameter_types() {
+                transaction.infer_parameter_annotations(&handle, &mut cancellable_transaction)
+            } else {
+                Vec::new()
+            };
+            // Map them to the inferred_types pattern
+            let mut parameter_types: Vec<(TextSize, Type, AnnotationKind)> = parameter_annotations
+                .into_iter()
+                .filter_map(|p| p.to_inlay_hint())
+                .collect();
+            if let Some(inferred_types) = inferred_types {
+                parameter_types.extend(inferred_types);
+                let heap = TypeHeap::new();
+                let (annotations, needed_imports) = format_hints(
+                    parameter_types,
+                    &stdlib,
+                    &|cls| {
+                        transaction
+                            .ad_hoc_solve(&handle, "infer_enum_metadata", |solver| {
+                                solver.get_expandable_enum_member_count(cls)
+                            })
+                            .flatten()
+                    },
+                    &heap,
+                    handle.module(),
+                    &|module, name| {
+                        let name = Name::new(name);
+                        if let Some(definition) = definitions.definitions.get(&name) {
+                            let reusable = !definition.needs_anywhere
+                                && (postponed || definition.range.end() <= leading_imports_end)
+                                && match &definition.style {
+                                    DefinitionStyle::Import(source) if *source == module => true,
+                                    DefinitionStyle::Import(_) | DefinitionStyle::ImportAsEq(_) => {
+                                        // Identical aliases may import a module rather than a name.
+                                        // Compare the actual local value with the defining export.
+                                        let key = Key::Definition(
+                                            ShortIdentifier::from_text_range(definition.range),
+                                        );
+                                        transaction.ad_hoc_solve(
+                                            &handle,
+                                            "infer_import_identity",
+                                            |solver| {
+                                                let Some(expected) = solver
+                                                    .try_get_from_export(module, name.clone())
+                                                else {
+                                                    return false;
+                                                };
+                                                !expected.is_any()
+                                                    && solver
+                                                        .get_hashed_opt(Hashed::new(&key))
+                                                        .is_some_and(|existing| {
+                                                            existing.ty() == expected
+                                                        })
+                                            },
+                                        ) == Some(true)
+                                    }
+                                    _ => false,
+                                };
+                            if reusable {
+                                AnnotationImport::Existing
+                            } else {
+                                AnnotationImport::Unavailable
+                            }
+                        } else if transaction
+                            .import_handle(&handle, module, None)
+                            .finding()
+                            .is_some()
+                        {
+                            AnnotationImport::Insert
+                        } else {
+                            AnnotationImport::Unavailable
+                        }
+                    },
+                );
+                let file_path = handle.path().as_path();
+                // Build import edits once so dry-run and write share them.
+                let imports: Vec<ImportEdit> = if flags.imports() && !needed_imports.is_empty() {
+                    needed_imports
+                        .into_iter()
+                        .map(|(module_name, name)| {
+                            insert_from_import_edit(&ast, module_name, &name)
+                        })
+                        .filter(|edit| !edit.insert_text.is_empty())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if flags.dry_run() {
+                    if !annotations.is_empty() || !imports.is_empty() {
+                        any_changes = true;
+                        println!(
+                            "{}: would add {} annotation(s) and {} import(s)",
+                            file_path.display(),
+                            annotations.len(),
+                            imports.len()
+                        );
+                    }
+                } else {
+                    Self::apply_edits_to_file(file_path, annotations, imports)?;
+                }
+            }
+        }
+        Ok(if flags.dry_run() && any_changes {
+            CommandExitStatus::UserError
+        } else {
+            CommandExitStatus::Success
+        })
+    }
+
+    /// Apply all edits from one AST snapshot in descending offset order.
+    fn apply_edits_to_file(
+        file_path: &Path,
+        annotations: Vec<(TextSize, String)>,
+        imports: Vec<ImportEdit>,
+    ) -> anyhow::Result<()> {
+        let mut result = fs_anyhow::read_to_string(file_path)?;
+        let mut edits: Vec<(TextRange, String)> = imports
+            .into_iter()
+            .map(|edit| (edit.range, edit.insert_text))
+            .chain(
+                annotations
+                    .into_iter()
+                    .map(|(position, text)| (TextRange::empty(position), text)),
+            )
+            .collect();
+        edits.sort_by(|(range1, text1), (range2, text2)| {
+            range2
+                .start()
+                .cmp(&range1.start())
+                .then_with(|| text1.cmp(text2))
+        });
+        for (range, edit_text) in edits {
+            result.replace_range(range.start().to_usize()..range.end().to_usize(), &edit_text);
+        }
+        fs_anyhow::write(file_path, result)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use pretty_assertions::assert_str_eq;
+    use pyrefly_util::globs::FilteredGlobs;
+    use pyrefly_util::globs::Globs;
+    use pyrefly_util::globs::HiddenDirFilter;
+    use pyrefly_util::thread_pool::TEST_THREAD_COUNT;
+    use tempfile;
+
+    use super::*;
+    use crate::test::util::TestEnv;
+
+    fn assert_annotations(input: &str, output: &str, flags: Option<InferFlags>) {
+        let flags = flags.unwrap_or_else(InferFlags::default);
+        let tdir = tempfile::tempdir().unwrap();
+        let path = tdir.path().join("test.py");
+        fs_anyhow::write(&path, input).unwrap();
+        let mut t = TestEnv::new();
+        t.add(&path.display().to_string(), input);
+        let includes =
+            Globs::new(vec![format!("{}/**/*", tdir.path().display()).to_owned()]).unwrap();
+        let f_globs = Box::new(FilteredGlobs::new(
+            includes,
+            Globs::empty(),
+            None,
+            HiddenDirFilter::Disabled,
+        ));
+        let config_finder = t.config_finder();
+        let result = InferArgs::run_inner(f_globs, config_finder, flags, TEST_THREAD_COUNT);
+        assert!(
+            result.is_ok(),
+            "autotype command failed: {:?}",
+            result.err()
+        );
+
+        let got_file = fs_anyhow::read_to_string(&path).unwrap();
+        assert_str_eq!(
+            output,
+            got_file,
+            "File content after autotype doesn't match expected output"
+        );
+    }
+
+    fn assert_imports_and_annotations(file_one: &str, file_two: &str, output: &str) {
+        let configuration = r#"
+        project_includes = [
+            "file_one.py",
+            "file_two.py",
+        ]
+        project_excludes = []
+        "#;
+        let tdir = tempfile::TempDir::with_prefix("pyrefly_infer_test").unwrap();
+        let file_one_path = tdir.path().join("file_one.py");
+        fs_anyhow::write(&file_one_path, file_one).unwrap();
+        let file_two_path = tdir.path().join("file_two.py");
+        fs_anyhow::write(&file_two_path, file_two).unwrap();
+        let config_path = tdir.path().join("pyrefly.toml");
+        fs_anyhow::write(&config_path, configuration).unwrap();
+        let mut t = TestEnv::new();
+        t.add(&file_one_path.display().to_string(), file_one);
+        t.add(&file_two_path.display().to_string(), file_two);
+        t.add(&config_path.display().to_string(), configuration);
+        let args = InferArgs::parse_from(["infer", "--config", &config_path.display().to_string()]);
+        let result = args.run(None, TEST_THREAD_COUNT);
+        assert!(result.is_ok(), "infer command failed: {:?}", result.err());
+
+        let got_file = fs_anyhow::read_to_string(&file_one_path).unwrap();
+        assert_str_eq!(
+            output,
+            got_file,
+            "File content after infer doesn't match expected output"
+        );
+    }
+
+    #[test]
+    fn infer_dataframe_return_uses_plain_class() -> anyhow::Result<()> {
+        let tdir = tempfile::TempDir::with_prefix("pyrefly_infer_df").unwrap();
+        let frame_dir = tdir.path().join("polars").join("dataframe");
+        fs_anyhow::create_dir_all(&frame_dir)?;
+        fs_anyhow::write(
+            &tdir.path().join("polars").join("__init__.py"),
+            "from polars.dataframe.frame import DataFrame as DataFrame\n",
+        )?;
+        fs_anyhow::write(&frame_dir.join("__init__.py"), "")?;
+        fs_anyhow::write(
+            &frame_dir.join("frame.py"),
+            "class DataFrame:\n    def __init__(self, data: object = None) -> None: ...\n",
+        )?;
+
+        let input = "import polars as pl\ndef make():\n    return pl.DataFrame({\"a\": [1]})\n";
+        let test_path = tdir.path().join("test.py");
+        fs_anyhow::write(&test_path, input)?;
+        let config_path = tdir.path().join("pyrefly.toml");
+        fs_anyhow::write(
+            &config_path,
+            "project_includes = [\"test.py\"]\nproject_excludes = []\n",
+        )?;
+
+        let args = InferArgs::parse_from(["infer", "--config", &config_path.display().to_string()]);
+        let result = args.run(None, TEST_THREAD_COUNT);
+        assert!(result.is_ok(), "infer command failed: {:?}", result.err());
+
+        let got = fs_anyhow::read_to_string(&test_path)?;
+        // Emits the plain class and adds its import, discovered from the stripped class QName.
+        assert!(
+            got.contains("-> DataFrame:"),
+            "expected a plain class return annotation, got:\n{got}"
+        );
+        assert!(
+            !got.contains("DataFrame["),
+            "the schema display form is not legal annotation syntax, got:\n{got}"
+        );
+        assert!(
+            got.contains("from polars.dataframe.frame import DataFrame"),
+            "the plain class import must be added, got:\n{got}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_literal() -> anyhow::Result<()> {
+        // Test return type annotation for integer literal
+        assert_annotations(
+            r#"
+def foo():
+    return 1
+"#,
+            r#"
+def foo() -> int:
+    return 1
+"#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_literal_string() -> anyhow::Result<()> {
+        // Test return type annotation for integer literal
+        assert_annotations(
+            r#"
+def foo():
+    return ""
+"#,
+            r#"
+def foo() -> str:
+    return ""
+"#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_boolean_literal() -> anyhow::Result<()> {
+        // Test boolean return type
+        assert_annotations(
+            r#"
+    def is_valid():
+        return True
+    "#,
+            r#"
+    def is_valid() -> bool:
+        return True
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+
+    fn test_parameter() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(a, b, c):
+        return c
+    example(1, 2, 3)
+    "#,
+            r#"
+    def example(a: int, b: int, c: int):
+        return c
+    example(1, 2, 3)
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_constructor_parameter() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.return_types = Some(false);
+        assert_annotations(
+            r#"
+class Example:
+    def __init__(self, value):
+        self.value = value
+
+Example(42)
+"#,
+            r#"
+class Example:
+    def __init__(self, value: int):
+        self.value = value
+
+Example(42)
+"#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+
+    fn test_parameter_unions() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(a, b, c):
+        return c
+    example(1, 2, 3)
+    x = 2
+    example("a", "b", x)
+    "#,
+            r#"
+    def example(a: int | str, b: int | str, c: int):
+        return c
+    example(1, 2, 3)
+    x = 2
+    example("a", "b", x)
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+
+    fn test_default_parameters() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(a, b, c = None):
+        return c
+    example(1, 2, 3)
+    x = 2
+    example("a", "b", x)
+    "#,
+            r#"
+    def example(a: int | str, b: int | str, c: int | None = None):
+        return c
+    example(1, 2, 3)
+    x = 2
+    example("a", "b", x)
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+
+    fn test_default_parameters_infer_default_type() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(c = 1):
+        return c
+    example("a")
+    "#,
+            r#"
+    def example(c: int | str = 1):
+        return c
+    example("a")
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_return_intersection() -> anyhow::Result<()> {
+        // `Author & Falsy` has no annotation syntax, so its fallback type `Author` is written.
+        assert_annotations(
+            r#"
+class Genre: ...
+class Author:
+    genre: Genre | None
+def f(author: Author | None):
+    return author and author.genre
+"#,
+            r#"
+class Genre: ...
+class Author:
+    genre: Genre | None
+def f(author: Author | None) -> Author | Genre | None:
+    return author and author.genre
+"#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_return_none() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(c):
+        c + 1
+    "#,
+            r#"
+    def example(c) -> None:
+        c + 1
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_none_parameter() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def example(c = None):
+        pass
+    example(None)
+    "#,
+            r#"
+    def example(c = None) -> None:
+        pass
+    example(None)
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fully_annotated_function_skipped() -> anyhow::Result<()> {
+        // Parameters on a fully annotated function should not be re-inferred.
+        assert_annotations(
+            r#"
+    def example(a: int, b: str) -> None:
+        pass
+    example(1, "hello")
+    "#,
+            r#"
+    def example(a: int, b: str) -> None:
+        pass
+    example(1, "hello")
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_parameter_no_call_site() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"
+    def foo(a=2) -> None:
+        pass
+    "#,
+            r#"
+    def foo(a: int=2) -> None:
+        pass
+    "#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_container() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.containers = Some(true);
+        assert_annotations(
+            r#"
+    def foo() -> None:
+        x = []
+        x.append(1)
+    "#,
+            r#"
+    def foo() -> None:
+        x: list[int] = []
+        x.append(1)
+    "#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_dictionary() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.containers = Some(true);
+        assert_annotations(
+            r#"
+    def foo() -> None:
+        x = {}
+        x["a"] = 1
+    "#,
+            r#"
+    def foo() -> None:
+        x: dict[str, int] = {}
+        x["a"] = 1
+    "#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_empty_dictionary() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.containers = Some(true);
+
+        assert_annotations(
+            r#"
+    def foo() -> None:
+        x = {"a": 1}
+        x["a"] = 1
+    "#,
+            r#"
+    def foo() -> None:
+        x = {"a": 1}
+        x["a"] = 1
+    "#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    // TEST FLAGS
+    #[test]
+    fn test_no_parameter_flag() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.parameter_types = Some(false);
+        assert_annotations(
+            r#"
+    def example(c = 1):
+        return c
+    example("a")
+    "#,
+            r#"
+    def example(c = 1):
+        return c
+    example("a")
+    "#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_containers_empty_dictionary() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.containers = Some(false);
+        assert_annotations(
+            r#"
+    def foo() -> None:
+        x = {}
+        x["a"] = 1
+    "#,
+            r#"
+    def foo() -> None:
+        x = {}
+        x["a"] = 1
+    "#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_return_literal_string() -> anyhow::Result<()> {
+        // Test return type annotation for integer literal
+        let mut flags = InferFlags::default();
+        flags.return_types = Some(false);
+
+        assert_annotations(
+            r#"
+def foo():
+    return ""
+"#,
+            r#"
+def foo():
+    return ""
+"#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unannotated_dunder_new_return_is_inserted_as_self() -> anyhow::Result<()> {
+        let mut flags = InferFlags::default();
+        flags.parameter_types = Some(false);
+
+        assert_annotations(
+            r#"
+class C:
+    def __new__(cls):
+        return super().__new__(cls)
+"#,
+            r#"
+from typing import Self
+class C:
+    def __new__(cls) -> Self:
+        return super().__new__(cls)
+"#,
+            Some(flags),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_callable_annotations_use_python_syntax() -> anyhow::Result<()> {
+        assert_annotations(
+            r#"def call_it(fn):
+    return fn()
+
+call_it(lambda: 0)
+
+def make_formatter():
+    def format_one(n: int) -> str:
+        return str(n)
+    return format_one
+
+class Runner:
+    def run(self) -> None:
+        pass
+
+def swallow(fn):
+    fn()
+
+swallow(Runner().run)
+
+def maybe_callback(flag: bool):
+    if flag:
+        return lambda: 1
+    return None
+
+def callbacks():
+    return [lambda: 1]
+"#,
+            r#"from typing import Callable
+def call_it(fn: Callable[[], int]):
+    return fn()
+
+call_it(lambda: 0)
+
+def make_formatter() -> Callable[[int], str]:
+    def format_one(n: int) -> str:
+        return str(n)
+    return format_one
+
+class Runner:
+    def run(self) -> None:
+        pass
+
+def swallow(fn: Callable[[], None]) -> None:
+    fn()
+
+swallow(Runner().run)
+
+def maybe_callback(flag: bool):
+    if flag:
+        return lambda: 1
+    return None
+
+def callbacks():
+    return [lambda: 1]
+"#,
+            None,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports() -> anyhow::Result<()> {
+        let file_one = r#"
+        from file_two import get_a
+        def foo():
+            return get_a()
+        "#;
+        let file_two = r#"
+        class ExampleA:
+            pass
+        def get_a():
+            return ExampleA()
+        "#;
+        let output = r#"
+        from file_two import get_a, ExampleA
+        def foo() -> ExampleA:
+            return get_a()
+        "#;
+        assert_imports_and_annotations(file_one, file_two, output);
+        Ok(())
+    }
+    #[test]
+    fn test_multiple_imports() -> anyhow::Result<()> {
+        let file_one = r#"
+        from file_two import get_a, get_b
+        def foo():
+            return get_a()
+        def bar():
+            return get_b()
+        "#;
+        let file_two = r#"
+        class ExampleA:
+            pass
+        class ExampleB:
+            pass
+        def get_a():
+            return ExampleA()
+        def get_b():
+            return ExampleB()
+        "#;
+        let output = r#"
+        from file_two import get_a, get_b, ExampleB, ExampleA
+        def foo() -> ExampleA:
+            return get_a()
+        def bar() -> ExampleB:
+            return get_b()
+        "#;
+        assert_imports_and_annotations(file_one, file_two, output);
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_reuse_callable_reexport() {
+        let input = "from collections.abc import Callable\ndef g(x: int) -> int:\n    return x\ndef f():\n    return g\n";
+        let expected = input.replace("def f():", "def f() -> Callable[[int], int]:");
+        assert_annotations(input, &expected, None);
+    }
+
+    #[test]
+    fn test_imports_reuse_self_reexport() {
+        let input = "from typing_extensions import Self\nclass A:\n    def __new__(cls):\n        return object.__new__(cls)\n";
+        let mut flags = InferFlags::default();
+        flags.parameter_types = Some(false);
+        let expected = input.replace("def __new__(cls):", "def __new__(cls) -> Self:");
+        assert_annotations(input, &expected, Some(flags));
+    }
+
+    #[test]
+    fn test_imports_reject_unrelated_callable() {
+        for source in ["file_two", "missing_module"] {
+            let input = format!(
+                "from {source} import Callable as Callable\ndef g(x: int) -> int:\n    return x\ndef f():\n    return g\n"
+            );
+            assert_imports_and_annotations(&input, "class Callable: pass\n", &input);
+        }
+    }
+
+    #[test]
+    fn test_imports_do_not_reuse_same_module_as_class() {
+        let input = "import datetime as datetime\ndef f():\n    return datetime.datetime.now()\n";
+        assert_annotations(input, input, None);
+    }
+
+    #[test]
+    fn test_imports_do_not_reuse_module_as_class() -> anyhow::Result<()> {
+        let tdir = tempfile::tempdir()?;
+        fs_anyhow::write(
+            &tdir.path().join("implementation.py"),
+            "class facade: pass\ndef make() -> facade:\n    return facade()\n",
+        )?;
+        fs_anyhow::write(
+            &tdir.path().join("facade.py"),
+            "from implementation import facade as facade, make as make\n",
+        )?;
+        let path = tdir.path().join("main.py");
+        let input = "import facade as facade\ndef f():\n    return facade.make()\n";
+        fs_anyhow::write(&path, input)?;
+        let path_arg = path.display().to_string();
+        let status = InferArgs::parse_from([
+            "infer",
+            path_arg.as_str(),
+            "--parameter-types=false",
+            "--skip-interpreter-query",
+        ])
+        .run(None, TEST_THREAD_COUNT)?;
+        assert_eq!(status, CommandExitStatus::Success);
+        assert_str_eq!(fs_anyhow::read_to_string(&path)?, input);
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_reuse_class_reexport() -> anyhow::Result<()> {
+        let tdir = tempfile::tempdir()?;
+        fs_anyhow::write(
+            &tdir.path().join("implementation.py"),
+            "class Foo: pass\ndef make() -> Foo:\n    return Foo()\n",
+        )?;
+        fs_anyhow::write(
+            &tdir.path().join("facade.py"),
+            "from implementation import Foo as Foo, make as make\n",
+        )?;
+        fs_anyhow::write(&tdir.path().join("other.py"), "class Foo: pass\n")?;
+        let path = tdir.path().join("main.py");
+        let path_arg = path.display().to_string();
+        for (source, alias) in [
+            ("facade", ""),
+            ("facade", " as Foo"),
+            ("other", ""),
+            ("other", " as Foo"),
+        ] {
+            let input = format!(
+                "from {source} import Foo{alias}\nfrom facade import make\ndef foo():\n    return make()\n"
+            );
+            fs_anyhow::write(&path, &input)?;
+            let status = InferArgs::parse_from([
+                "infer",
+                path_arg.as_str(),
+                "--parameter-types=false",
+                "--skip-interpreter-query",
+            ])
+            .run(None, TEST_THREAD_COUNT)?;
+            assert_eq!(status, CommandExitStatus::Success);
+            let expected = if source == "facade" {
+                input.replace("def foo():", "def foo() -> Foo:")
+            } else {
+                input
+            };
+            assert_str_eq!(fs_anyhow::read_to_string(&path)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_preserve_existing_alias_bindings() {
+        let input = r#"from file_two import marker as Foo, make
+def foo():
+    return make()
+assert Foo == 17
+"#;
+        let dependency = r#"class Foo: pass
+marker = 17
+def make() -> Foo:
+    return Foo()
+"#;
+        assert_imports_and_annotations(input, dependency, input);
+    }
+
+    #[test]
+    fn test_imports_preserve_guarded_annotations() -> anyhow::Result<()> {
+        let tdir = tempfile::tempdir()?;
+        let path = tdir.path().join("main.py");
+        let config_path = tdir.path().join("pyrefly.toml");
+        let config_arg = config_path.display().to_string();
+        fs_anyhow::write(
+            &config_path,
+            "project_includes = [\"main.py\"]\nproject_excludes = []\n",
+        )?;
+        fs_anyhow::write(
+            &tdir.path().join("file_two.py"),
+            r#"from __future__ import annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from optional_dep import ExampleA
+def get_a() -> ExampleA:
+    raise NotImplementedError
+"#,
+        )?;
+        fs_anyhow::write(
+            &tdir.path().join("optional_dep.py"),
+            "class ExampleA: pass\nraise ImportError(\"optional backend absent\")\n",
+        )?;
+        for guarded in [
+            "if TYPE_CHECKING:\n    from optional_dep import ExampleA\n",
+            "try:\n    from optional_dep import ExampleA\nexcept ImportError:\n    pass\n",
+            "value = 0\nfrom optional_dep import ExampleA\n",
+        ] {
+            let prefix = format!(
+                "from __future__ import annotations\nfrom typing import TYPE_CHECKING\nfrom file_two import get_a\n{guarded}"
+            );
+            let input = format!("{prefix}def foo():\n    return get_a()\n");
+            let expected = format!("{prefix}def foo() -> ExampleA:\n    return get_a()\n");
+            for dry_run in [false, true] {
+                fs_anyhow::write(&path, &input)?;
+                let mut args = vec!["infer", "--config", config_arg.as_str()];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let status = InferArgs::parse_from(args).run(None, TEST_THREAD_COUNT)?;
+                assert_eq!(
+                    status,
+                    if dry_run {
+                        CommandExitStatus::UserError
+                    } else {
+                        CommandExitStatus::Success
+                    }
+                );
+                assert_str_eq!(
+                    fs_anyhow::read_to_string(&path)?,
+                    if dry_run {
+                        input.as_str()
+                    } else {
+                        expected.as_str()
+                    }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_skip_unreachable_defining_module() -> anyhow::Result<()> {
+        let tdir = tempfile::tempdir()?;
+        let nested = tdir.path().join("nested");
+        let facade = nested.join("facade");
+        let hidden = tdir.path().join("hidden");
+        fs_anyhow::create_dir_all(&facade)?;
+        fs_anyhow::create_dir_all(&hidden)?;
+        fs_anyhow::write(
+            &nested.join("pyrefly.toml"),
+            "search-path = [\".\"]\ndisable-search-path-heuristics = true\n",
+        )?;
+        fs_anyhow::write(
+            &facade.join("pyrefly.toml"),
+            "search-path = [\"../../hidden\"]\ndisable-search-path-heuristics = true\n",
+        )?;
+        fs_anyhow::write(&hidden.join("secret.py"), "class Foo: pass\n")?;
+        fs_anyhow::write(
+            &facade.join("__init__.py"),
+            "from secret import Foo as Foo\ndef make() -> Foo:\n    return Foo()\n",
+        )?;
+        let path = nested.join("main.py");
+        let path_arg = path.display().to_string();
+        let input = "from facade import make\ndef foo():\n    return make()\n";
+        for dry_run in [false, true] {
+            fs_anyhow::write(&path, input)?;
+            let mut args = vec![
+                "infer",
+                path_arg.as_str(),
+                "--parameter-types=false",
+                "--skip-interpreter-query",
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let status = InferArgs::parse_from(args).run(None, TEST_THREAD_COUNT)?;
+            assert_eq!(status, CommandExitStatus::Success);
+            assert_str_eq!(fs_anyhow::read_to_string(&path)?, input);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_with_similar_names_outside_initial_block() {
+        let input = r#"import file_two
+def foo():
+    return file_two.make()
+from file_two import FooBar
+"#;
+        let dependency = r#"class Foo: pass
+class FooBar: pass
+def make() -> Foo:
+    return Foo()
+"#;
+        let expected = r#"from file_two import Foo
+import file_two
+def foo() -> Foo:
+    return file_two.make()
+from file_two import FooBar
+"#;
+        assert_imports_and_annotations(input, dependency, expected);
+    }
+
+    #[test]
+    fn test_imports_do_not_duplicate_existing_names() {
+        let input = r#"from file_two import make, Foo
+def foo():
+    return make()
+"#;
+        let dependency = r#"class Foo: pass
+def make() -> Foo:
+    return Foo()
+"#;
+        let expected = r#"from file_two import make, Foo
+def foo() -> Foo:
+    return make()
+"#;
+        assert_imports_and_annotations(input, dependency, expected);
+    }
+
+    #[test]
+    fn test_imports_preserve_later_import_offsets() {
+        let input = r#"def foo():
+    return 1
+from file_two import marker
+MissingClass()
+MissingClass()
+"#;
+        let dependency = "marker = 1\nclass MissingClass: pass\n";
+        let expected = r#"def foo() -> int:
+    return 1
+from file_two import marker
+MissingClass()
+MissingClass()
+"#;
+        assert_imports_and_annotations(input, dependency, expected);
+    }
+
+    #[test]
+    fn test_imports_leave_unrelated_unknown_names_unchanged() -> anyhow::Result<()> {
+        let tdir = tempfile::tempdir()?;
+        let path = tdir.path().join("test.py");
+        let config_path = tdir.path().join("pyrefly.toml");
+        let config_arg = config_path.display().to_string();
+        let input = "from dependency import marker\nMissingClass()\nMissingClass()\n";
+        fs_anyhow::write(
+            &tdir.path().join("dependency.py"),
+            "marker = 1\nclass MissingClass: pass\n",
+        )?;
+        for config in ["", "\n[errors]\nunknown-name = \"ignore\"\n"] {
+            fs_anyhow::write(
+                &config_path,
+                format!("project_includes = [\"test.py\"]\nproject_excludes = []\n{config}"),
+            )?;
+            for flags in [
+                vec![],
+                vec!["--imports=false"],
+                vec!["--dry-run"],
+                vec!["--imports=false", "--dry-run"],
+            ] {
+                fs_anyhow::write(&path, input)?;
+                let mut args = vec!["infer", "--config", config_arg.as_str()];
+                args.extend(flags);
+                let status = InferArgs::parse_from(args).run(None, TEST_THREAD_COUNT)?;
+                assert_eq!(status, CommandExitStatus::Success);
+                assert_str_eq!(fs_anyhow::read_to_string(&path)?, input);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_best_import_selected_when_multiple_modules_export_same_name() -> anyhow::Result<()> {
+        // When multiple modules export the same name, only the best import
+        // should be added (shortest public module path).
+        let configuration = r#"
+        project_includes = [
+            "file_one.py",
+            "short.py",
+            "_private/long_path.py",
+        ]
+        project_excludes = []
+        "#;
+        let tdir = tempfile::TempDir::with_prefix("pyrefly_infer_test").unwrap();
+
+        let file_one = r#"
+from short import get_a
+def foo():
+    return get_a()
+"#;
+        // short.py exports MyClass — public, short path
+        let file_short = r#"
+class MyClass:
+    pass
+def get_a():
+    return MyClass()
+"#;
+        // _private/long_path.py also exports MyClass — private, longer path
+        let private_dir = tdir.path().join("_private");
+        std::fs::create_dir_all(&private_dir).unwrap();
+        let file_private = r#"
+class MyClass:
+    pass
+"#;
+
+        let file_one_path = tdir.path().join("file_one.py");
+        fs_anyhow::write(&file_one_path, file_one).unwrap();
+        let file_short_path = tdir.path().join("short.py");
+        fs_anyhow::write(&file_short_path, file_short).unwrap();
+        let file_private_path = private_dir.join("long_path.py");
+        fs_anyhow::write(&file_private_path, file_private).unwrap();
+        let config_path = tdir.path().join("pyrefly.toml");
+        fs_anyhow::write(&config_path, configuration).unwrap();
+
+        let mut t = TestEnv::new();
+        t.add(&file_one_path.display().to_string(), file_one);
+        t.add(&file_short_path.display().to_string(), file_short);
+        t.add(&file_private_path.display().to_string(), file_private);
+        t.add(&config_path.display().to_string(), configuration);
+        let args = InferArgs::parse_from(["infer", "--config", &config_path.display().to_string()]);
+        let result = args.run(None, TEST_THREAD_COUNT);
+        assert!(result.is_ok(), "infer command failed: {:?}", result.err());
+
+        let got_file = fs_anyhow::read_to_string(&file_one_path).unwrap();
+        // Should import from "short" (public, 1 component), not from
+        // "_private.long_path" (private, 2 components).
+        assert!(
+            got_file.contains("from short import get_a, MyClass\n"),
+            "Expected import from 'short' module, got:\n{}",
+            got_file,
+        );
+        assert!(
+            !got_file.contains("_private"),
+            "Should not import from private module, got:\n{}",
+            got_file,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_after_future_import() -> anyhow::Result<()> {
+        // New imports must be inserted after `from __future__ import annotations`,
+        // not before it, to produce valid Python.
+        let file_one = r#"from __future__ import annotations
+from file_two import get_a
+def foo():
+    return get_a()
+"#;
+        let file_two = r#"
+class ExampleA:
+    pass
+def get_a():
+    return ExampleA()
+"#;
+        let output = r#"from __future__ import annotations
+from file_two import get_a, ExampleA
+def foo() -> ExampleA:
+    return get_a()
+"#;
+        assert_imports_and_annotations(file_one, file_two, output);
+        Ok(())
+    }
+
+    #[test]
+    fn test_imports_after_future_import_with_docstring() -> anyhow::Result<()> {
+        // New imports must be inserted after both the docstring and `from __future__ import`.
+        let file_one = r#""""Module docstring."""
+from __future__ import annotations
+from file_two import get_a
+def foo():
+    return get_a()
+"#;
+        let file_two = r#"
+class ExampleA:
+    pass
+def get_a():
+    return ExampleA()
+"#;
+        let output = r#""""Module docstring."""
+from __future__ import annotations
+from file_two import get_a, ExampleA
+def foo() -> ExampleA:
+    return get_a()
+"#;
+        assert_imports_and_annotations(file_one, file_two, output);
+        Ok(())
+    }
+
+    // -- dry-run tests --
+
+    fn run_dry_run(input: &str) -> (CommandExitStatus, String) {
+        let flags = InferFlags {
+            dry_run: true,
+            ..InferFlags::default()
+        };
+        let tdir = tempfile::tempdir().unwrap();
+        let path = tdir.path().join("test.py");
+        fs_anyhow::write(&path, input).unwrap();
+        let mut t = TestEnv::new();
+        t.add(&path.display().to_string(), input);
+        let includes =
+            Globs::new(vec![format!("{}/**/*", tdir.path().display()).to_owned()]).unwrap();
+        let f_globs = Box::new(FilteredGlobs::new(
+            includes,
+            Globs::empty(),
+            None,
+            HiddenDirFilter::Disabled,
+        ));
+        let config_finder = t.config_finder();
+        let status = InferArgs::run_inner(f_globs, config_finder, flags, TEST_THREAD_COUNT)
+            .expect("run_inner should not error");
+        let on_disk = fs_anyhow::read_to_string(&path).unwrap();
+        (status, on_disk)
+    }
+
+    #[test]
+    fn test_dry_run_changes_present_exits_1_and_file_unchanged() -> anyhow::Result<()> {
+        // A file that would receive annotations: dry-run must leave it unchanged
+        // and return UserError (exit 1).
+        let input = r#"
+def foo():
+    return 1
+"#;
+        let (status, on_disk) = run_dry_run(input);
+        assert_eq!(
+            status,
+            CommandExitStatus::UserError,
+            "dry-run with changes should return UserError"
+        );
+        assert_str_eq!(input, on_disk, "dry-run must not modify the file");
+        Ok(())
+    }
+
+    #[test]
+    fn test_dry_run_no_changes_exits_0() -> anyhow::Result<()> {
+        // A fully-annotated file: dry-run must return Success (exit 0).
+        let input = r#"
+def foo() -> int:
+    return 1
+"#;
+        let (status, on_disk) = run_dry_run(input);
+        assert_eq!(
+            status,
+            CommandExitStatus::Success,
+            "dry-run with no changes should return Success"
+        );
+        assert_str_eq!(input, on_disk, "dry-run must not modify the file");
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_dry_run_still_writes_regression() -> anyhow::Result<()> {
+        // Without --dry-run, infer must still annotate the file (R6 regression guard).
+        let input = r#"
+def foo():
+    return 1
+"#;
+        let expected = r#"
+def foo() -> int:
+    return 1
+"#;
+        assert_annotations(input, expected, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dry_run_multiple_files_any_change_exits_1() -> anyhow::Result<()> {
+        // Two files: one missing annotations, one fully annotated.
+        // Dry-run must exit 1 (any file would change) and leave BOTH files unmodified.
+        let unannotated = "def foo():\n    return 1\n";
+        let annotated = "def bar() -> int:\n    return 2\n";
+        let configuration =
+            "project_includes = [\"unannotated.py\", \"annotated.py\"]\nproject_excludes = []\n";
+        let tdir = tempfile::TempDir::with_prefix("pyrefly_infer_test_multi").unwrap();
+        let unannotated_path = tdir.path().join("unannotated.py");
+        let annotated_path = tdir.path().join("annotated.py");
+        let config_path = tdir.path().join("pyrefly.toml");
+        fs_anyhow::write(&unannotated_path, unannotated).unwrap();
+        fs_anyhow::write(&annotated_path, annotated).unwrap();
+        fs_anyhow::write(&config_path, configuration).unwrap();
+
+        let mut t = TestEnv::new();
+        t.add(&unannotated_path.display().to_string(), unannotated);
+        t.add(&annotated_path.display().to_string(), annotated);
+        t.add(&config_path.display().to_string(), configuration);
+
+        let args = InferArgs::parse_from([
+            "infer",
+            "--dry-run",
+            "--config",
+            &config_path.display().to_string(),
+        ]);
+        let status = args.run(None, TEST_THREAD_COUNT)?;
+
+        assert_eq!(
+            status,
+            CommandExitStatus::UserError,
+            "dry-run with at least one changed file should return UserError"
+        );
+        assert_str_eq!(
+            unannotated,
+            fs_anyhow::read_to_string(&unannotated_path).unwrap(),
+            "dry-run must not modify unannotated.py"
+        );
+        assert_str_eq!(
+            annotated,
+            fs_anyhow::read_to_string(&annotated_path).unwrap(),
+            "dry-run must not modify annotated.py"
+        );
+        Ok(())
+    }
+}

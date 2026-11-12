@@ -1,0 +1,514 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::sync::LazyLock;
+
+use dupe::Dupe;
+use pyrefly_build::handle::Handle;
+use pyrefly_config::finder::ConfigFinder;
+use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_python::short_identifier::ShortIdentifier;
+use pyrefly_python::symbol_kind::SymbolKind;
+use pyrefly_util::gas::Gas;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ModModule;
+use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtImportFrom;
+use ruff_python_ast::helpers::is_docstring_stmt;
+use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
+use starlark_map::Hashed;
+use starlark_map::small_map::SmallMap;
+use starlark_map::smallmap;
+
+use crate::binding::binding::Binding;
+use crate::binding::binding::BindingClass;
+use crate::binding::binding::ClassBinding;
+use crate::binding::binding::Key;
+use crate::binding::bindings::Bindings;
+use crate::binding::narrow::identifier_and_chain_for_expr;
+use crate::binding::narrow::identifier_and_chain_prefix_for_expr;
+use crate::export::exports::Export;
+use crate::state::lsp::ImportFormat;
+
+const KEY_TO_DEFINITION_INITIAL_GAS: Gas = Gas::new(100);
+
+pub enum IntermediateDefinition {
+    Local(Export),
+    NamedImport(TextRange, ModuleName, Name, Option<TextRange>),
+    /// The flag records whether the module was bound to an explicit alias.
+    Module(TextRange, ModuleName, bool),
+}
+
+/// An edit that imports a single name into a module.
+///
+/// - `range` is a zero-length insertion point.
+/// - `insert_text` is the text to insert at `range`. For merge edits this may be
+///   a suffix such as `, x`, not a full import line. It is empty when the name
+///   is already imported.
+/// - `display_text` is the human-readable import (`from m import x`) for UI
+///   display.
+/// - `module_name` is the resolved module the name is imported from (the `m` in
+///   `from m import x`), used for UI labels like `(import m)`.
+pub(crate) struct ImportEdit {
+    pub range: TextRange,
+    pub insert_text: String,
+    pub display_text: String,
+    pub module_name: String,
+}
+
+pub fn key_to_intermediate_definition(
+    bindings: &Bindings,
+    key: &Key,
+) -> Option<IntermediateDefinition> {
+    let def_key = find_definition_key_from(bindings, key)?;
+    create_intermediate_definition_from(bindings, def_key)
+}
+
+/// If `key` is already a definition, return it.
+/// Otherwise, follow the use-def chain in bindings, and return non-None if we could reach a definition.
+fn find_definition_key_from<'a>(bindings: &'a Bindings, key: &'a Key) -> Option<&'a Key> {
+    let mut gas = KEY_TO_DEFINITION_INITIAL_GAS;
+    let mut current_idx = bindings.key_to_idx_hashed_opt(Hashed::new(key))?;
+    let base_key_of_assign_target = |expr: &Expr| {
+        if let Some((id, _)) = identifier_and_chain_for_expr(expr) {
+            Some(Key::BoundName(ShortIdentifier::new(&id)))
+        } else if let Some((id, _)) = identifier_and_chain_prefix_for_expr(expr) {
+            Some(Key::BoundName(ShortIdentifier::new(&id)))
+        } else {
+            None
+        }
+    };
+    while !gas.stop() {
+        let current_key = bindings.idx_to_key(current_idx);
+        match current_key {
+            Key::Definition(..) | Key::Import(..) => {
+                // These keys signal that we've reached a definition within the current module
+                return Some(current_key);
+            }
+            _ => {}
+        }
+        match bindings.get(current_idx) {
+            // TypeAliasRef is a terminal binding — the name directly references
+            // another type alias. Treat it as a definition for IDE purposes.
+            Binding::TypeAliasRef(..) => {
+                return Some(current_key);
+            }
+            Binding::IterableValueComprehension(..) | Binding::IterableValueLoop(..) => {
+                return Some(current_key);
+            }
+            Binding::Forward(k)
+            | Binding::PromoteForward(k)
+            | Binding::ForwardToFirstUse(k)
+            | Binding::Narrow(k, _, _) => {
+                current_idx = *k;
+            }
+            Binding::LoopPhi(phi) => current_idx = phi.0,
+            // A `Key::ModuleAlias` binding's `prev` leads back to the original
+            // `import foo as x`, one link per submodule import. Each link points to an earlier
+            // binding, so the chain can't loop and following it doesn't spend gas.
+            Binding::Module(x) if let (Key::ModuleAlias(..), Some(prev)) = (current_key, x.2) => {
+                gas.restore();
+                current_idx = prev;
+            }
+            Binding::Phi(_, branches) if !branches.is_empty() => {
+                current_idx = branches[0].value_key
+            }
+            Binding::PossibleLegacyTParam(legacy_tparam, ..) => {
+                current_idx = bindings.get(*legacy_tparam).idx();
+            }
+            Binding::AssignToSubscript(x)
+                if let Some(key) = base_key_of_assign_target(&Expr::Subscript(x.0.clone())) =>
+            {
+                current_idx = bindings.key_to_idx(&key);
+            }
+            Binding::AssignToAttribute(x)
+                if let Some(key) = base_key_of_assign_target(&Expr::Attribute(x.attr.clone())) =>
+            {
+                current_idx = bindings.key_to_idx(&key);
+            }
+            Binding::OuterClassTypeParameter(k, _) => {
+                current_idx = *k;
+            }
+            _ => {
+                // We have reached the end of the forwarding chain, and did not find any definitions
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Given a `def_key` which is guaranteed to point to a definition, do our best to construct a
+/// `IntermediateDefinition` that holds the most exact information for it.
+fn create_intermediate_definition_from(
+    bindings: &Bindings,
+    def_key: &Key,
+) -> Option<IntermediateDefinition> {
+    let mut gas = KEY_TO_DEFINITION_INITIAL_GAS;
+    let mut current_binding = bindings.get(bindings.key_to_idx(def_key));
+
+    while !gas.stop() {
+        match current_binding {
+            Binding::Forward(k) | Binding::PromoteForward(k) | Binding::ForwardToFirstUse(k) => {
+                current_binding = bindings.get(*k)
+            }
+            Binding::PossibleLegacyTParam(legacy_tparam, ..) => {
+                current_binding = bindings.get(bindings.get(*legacy_tparam).idx());
+            }
+            Binding::Import(x) => {
+                return Some(IntermediateDefinition::NamedImport(
+                    def_key.range(),
+                    x.module,
+                    x.name.clone(),
+                    x.original_name_range,
+                ));
+            }
+            Binding::Module(x) => {
+                let imported_module_name = if x.1.len() == 1 {
+                    // This corresponds to the case for `import x.y` -- the corresponding key would
+                    // always be `Key::Import(x)`, so the actual module that corresponds to the key
+                    // should be `x` instead of `x.y`.
+                    ModuleName::from_name(&x.1[0])
+                } else {
+                    // This corresponds to all other cases (e.g. `import x.y as z` or `from x.y
+                    // import z`) -- the corresponding key would be `Key::Definition(z)` so the
+                    // actual module that corresponds to the key must be `x.y`.
+                    x.0.dupe()
+                };
+                return Some(IntermediateDefinition::Module(
+                    def_key.range(),
+                    imported_module_name,
+                    matches!(def_key, Key::Definition(..)),
+                ));
+            }
+            Binding::Function { decorated_idx, .. } => {
+                let func = bindings.get(*decorated_idx);
+                let undecorated = bindings.get(func.undecorated_idx);
+                let symbol_kind = if undecorated.class_key.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                return Some(IntermediateDefinition::Local(Export {
+                    location: undecorated.def.name.range,
+                    symbol_kind: Some(symbol_kind),
+                    docstring_range: func.docstring_range,
+                    deprecation: None,
+                    is_final: false,
+                    special_export: None,
+                }));
+            }
+            Binding::ClassDef(idx, ..) => {
+                return match bindings.get(*idx) {
+                    BindingClass::FunctionalClassDef(..) => {
+                        Some(IntermediateDefinition::Local(Export {
+                            location: def_key.range(),
+                            symbol_kind: Some(SymbolKind::Class),
+                            docstring_range: None,
+                            deprecation: None,
+                            is_final: false,
+                            special_export: None,
+                        }))
+                    }
+                    BindingClass::ClassDef(ClassBinding {
+                        def,
+                        docstring_range,
+                        ..
+                    }) => Some(IntermediateDefinition::Local(Export {
+                        location: def.name.range,
+                        symbol_kind: Some(SymbolKind::Class),
+                        docstring_range: *docstring_range,
+                        deprecation: None,
+                        is_final: false,
+                        special_export: None,
+                    })),
+                };
+            }
+            Binding::IterableValueComprehension(_, _, target_range) => {
+                return Some(IntermediateDefinition::Local(Export {
+                    location: *target_range,
+                    symbol_kind: Some(SymbolKind::Variable),
+                    docstring_range: None,
+                    deprecation: None,
+                    is_final: false,
+                    special_export: None,
+                }));
+            }
+            // A receiver-constrained class assignment is a same-scope
+            // rebind whose visible result is class-shaped. The first patch
+            // resolves navigation/metadata through the original class
+            // receiver: even on a compatible refining write, jumping to
+            // definition from the LHS lands on the original class, since
+            // that is the binding the receiver semantics treat as the
+            // canonical identity for future writes. (The refined RHS class
+            // is still reachable by hovering or jumping from the RHS
+            // expression itself.) The same applies to receiver-bearing
+            // multi-target and unpacked rebinds.
+            Binding::NameAssign(na) if let Some(receiver_idx) = na.receiver_idx => {
+                current_binding = bindings.get(receiver_idx);
+            }
+            Binding::MultiTargetAssign(_, _, _, Some(receiver)) => {
+                current_binding = bindings.get(receiver.idx);
+            }
+            Binding::UnpackedValue(value) if let Some(receiver) = &value.receiver => {
+                current_binding = bindings.get(receiver.idx);
+            }
+            _ => {
+                return Some(IntermediateDefinition::Local(Export {
+                    location: def_key.range(),
+                    symbol_kind: current_binding.symbol_kind(),
+                    docstring_range: None,
+                    deprecation: None,
+                    is_final: false,
+                    special_export: None,
+                }));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn insert_import_edit(
+    ast: &ModModule,
+    config_finder: &ConfigFinder,
+    handle_to_insert_import: Handle,
+    handle_to_import_from: Handle,
+    export_name: &str,
+    import_format: ImportFormat,
+) -> ImportEdit {
+    let module = import_module_name(
+        config_finder,
+        &handle_to_insert_import,
+        &handle_to_import_from,
+        import_format,
+    );
+    insert_from_import_edit(ast, module, export_name)
+}
+
+/// Select the module spelling without planning an edit or scanning the AST.
+pub(crate) fn import_module_name(
+    config_finder: &ConfigFinder,
+    handle_to_insert_import: &Handle,
+    handle_to_import_from: &Handle,
+    import_format: ImportFormat,
+) -> ModuleName {
+    let use_absolute_import = match import_format {
+        ImportFormat::Absolute => true,
+        ImportFormat::Relative => {
+            handle_require_absolute_import(config_finder, handle_to_import_from)
+        }
+    };
+    if use_absolute_import {
+        handle_to_import_from.module()
+    } else if let Some(relative_module) = ModuleName::relative_module_name_between(
+        handle_to_insert_import.path().as_path(),
+        handle_to_import_from.path().as_path(),
+    ) {
+        relative_module
+    } else {
+        handle_to_import_from.module()
+    }
+}
+
+/// Common alias -> module mappings used for auto-imports.
+/// These are modeled after Pylance's built-in aliases.
+static COMMON_MODULE_ALIASES: LazyLock<SmallMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        smallmap! {
+            "np" => "numpy",
+            "pd" => "pandas",
+            "tf" => "tensorflow",
+            "mpl" => "matplotlib",
+            "plt" => "matplotlib.pyplot",
+            "m" => "math",
+            "sp" => "scipy",
+            "spio" => "scipy.io",
+            "pn" => "panel",
+            "hv" => "holoviews",
+        }
+    });
+
+pub fn common_alias_target_module(alias: &str) -> Option<&'static str> {
+    COMMON_MODULE_ALIASES.get(alias).copied()
+}
+
+/// Prepare an import edit after the module docstring and future-import header.
+pub(crate) fn prepare_import_insertion(ast: &ModModule, import_text: String) -> (TextSize, String) {
+    prepare_import_insertion_in_range(ast, ast.range, import_text)
+}
+
+/// Prepare an import within a source region, such as a notebook cell, using the existing AST.
+pub(crate) fn prepare_import_insertion_in_range(
+    ast: &ModModule,
+    range: TextRange,
+    mut import_text: String,
+) -> (TextSize, String) {
+    if let Some(first_stmt) = ast.body.iter().find(|stmt| {
+        range.contains(stmt.range().start())
+            && !is_docstring_stmt(stmt)
+            && !matches!(stmt, Stmt::ImportFrom(import)
+                if import.level == 0
+                    && import.module.as_ref().is_some_and(|module| module.id.as_str() == "__future__"))
+    }) {
+        return (first_stmt.range().start(), import_text);
+    }
+    // Appending after a header needs a line boundary, even without a final newline.
+    if !range.is_empty() {
+        import_text.insert(0, '\n');
+    }
+    (range.end(), import_text)
+}
+
+/// Insert `import <module>` (optionally with an alias) at the top of the file.
+/// Returns (position, import text, completion label).
+pub fn import_regular_import_edit(
+    ast: &ModModule,
+    handle_to_import_from: Handle,
+    alias: Option<&str>,
+) -> (TextSize, String, String) {
+    let module_name_to_import = handle_to_import_from.module();
+    let (import_text, completion_label) = match alias {
+        Some(alias) => (
+            format!("import {} as {}\n", module_name_to_import.as_str(), alias),
+            alias.to_owned(),
+        ),
+        None => (
+            format!("import {}\n", module_name_to_import.as_str()),
+            module_name_to_import.as_str().to_owned(),
+        ),
+    };
+    let (position, import_text) = prepare_import_insertion(ast, import_text);
+    (position, import_text, completion_label)
+}
+
+/// Plan an import from a module whose spelling is already known.
+pub(crate) fn insert_from_import_edit(
+    ast: &ModModule,
+    module_name_to_import: ModuleName,
+    export_name: &str,
+) -> ImportEdit {
+    let display_text = format!(
+        "from {} import {}",
+        module_name_to_import.as_str(),
+        export_name
+    );
+    if let Some((range, insert_text)) =
+        find_import_merge_edit(ast, module_name_to_import.as_str(), export_name)
+    {
+        return ImportEdit {
+            range,
+            insert_text,
+            display_text,
+            module_name: module_name_to_import.to_string(),
+        };
+    }
+
+    let (position, insert_text) = prepare_import_insertion(ast, format!("{display_text}\n"));
+    ImportEdit {
+        range: TextRange::empty(position),
+        insert_text,
+        display_text,
+        module_name: module_name_to_import.to_string(),
+    }
+}
+
+fn find_import_merge_edit(
+    ast: &ModModule,
+    module_name: &str,
+    export_name: &str,
+) -> Option<(TextRange, String)> {
+    let mut merge_edit = None;
+    for stmt in import_block_stmts(ast) {
+        match stmt {
+            Stmt::Import(import) => {
+                if import.names.iter().any(|alias| {
+                    alias.asname.as_ref().map_or_else(
+                        || alias.name.as_str().split('.').next() == Some(export_name),
+                        |name| name.as_str() == export_name,
+                    )
+                }) {
+                    return None;
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                let same_module = import_from_module_matches(import, module_name);
+                for alias in &import.names {
+                    let local_name = alias
+                        .asname
+                        .as_ref()
+                        .map_or(alias.name.as_str(), |name| name.as_str());
+                    // A merge must not move a new binding after an existing one.
+                    // Wildcard imports may bind the name even though it is absent from the AST.
+                    if alias.name.as_str() == "*" {
+                        return None;
+                    }
+                    if local_name == export_name {
+                        return if same_module && alias.name.as_str() == export_name {
+                            Some((TextRange::empty(stmt.range().start()), String::new()))
+                        } else {
+                            None
+                        };
+                    }
+                }
+                if same_module
+                    && merge_edit.is_none()
+                    && let Some(alias) = import.names.last()
+                {
+                    merge_edit = Some((
+                        TextRange::empty(alias.range().end()),
+                        format!(", {export_name}"),
+                    ));
+                }
+            }
+            _ => unreachable!("import block contains only import statements"),
+        }
+    }
+    merge_edit
+}
+
+fn import_block_stmts<'a>(ast: &'a ModModule) -> impl Iterator<Item = &'a Stmt> {
+    ast.body
+        .iter()
+        .skip_while(|stmt| is_docstring_stmt(stmt))
+        .take_while(|stmt| matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)))
+}
+
+fn import_from_module_matches(import_from: &StmtImportFrom, module_name: &str) -> bool {
+    let dots = ".".repeat(import_from.level as usize);
+    let module = import_from
+        .module
+        .as_ref()
+        .map(|module| module.as_str())
+        .unwrap_or("");
+    format!("{dots}{module}") == module_name
+}
+
+/// Some handles must be imported in absolute style,
+/// even if the user has `importFormat: "relative"` in their settings.
+///
+/// For now, we use the following criteria:
+/// 1. Bundled typeshed
+/// 2. In search path or site packages
+fn handle_require_absolute_import(config_finder: &ConfigFinder, handle: &Handle) -> bool {
+    if matches!(
+        handle.path().details(),
+        ModulePathDetails::BundledTypeshed(_)
+    ) {
+        return true;
+    }
+    let config = config_finder.python_file(handle.module_kind(), handle.path());
+    config
+        .search_path()
+        .any(|search_path| handle.path().as_path().starts_with(search_path))
+        || config
+            .site_package_path()
+            .any(|search_path| handle.path().as_path().starts_with(search_path))
+}

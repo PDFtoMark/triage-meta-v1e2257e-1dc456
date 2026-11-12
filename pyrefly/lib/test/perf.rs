@@ -1,0 +1,363 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use crate::test::util::TestEnv;
+use crate::test::util::testcase_for_macro;
+use crate::testcase;
+
+// Nested calls must infer each receiver and default only once, including failed lookups.
+#[test]
+fn test_builtin_getattr_nested_arguments() -> anyhow::Result<()> {
+    let mut code = String::from(
+        "from typing import Any, assert_type\nclass C:\n    child: C\ndef test(c: C) -> None:\n",
+    );
+    let mut contextual = String::new();
+    for (name, expected) in [("child", "C"), ("missing", "Any")] {
+        let mut receiver = String::from("c");
+        let mut default = String::from("None");
+        for _ in 0..24 {
+            receiver = format!("getattr({receiver}, {name:?})");
+            default = format!("getattr(c, {name:?}, {default})");
+        }
+        code.push_str(&format!("    assert_type({receiver}, {expected})\n"));
+        code.push_str(&format!("    assert_type({default}, {expected} | None)\n"));
+        contextual.push_str(&format!(
+            "def contextual_{name}(c: C) -> {expected} | None:\n    return {default}\n",
+        ));
+    }
+    code.push_str(&contextual);
+    testcase_for_macro(TestEnv::new(), &code, file!(), line!())
+}
+
+// At some point in the past, this test took many minutes and consumed 50Gb of RAM.
+testcase!(
+    test_quadratic,
+    r#"
+from typing import TypeVar
+_T = TypeVar("_T")
+def table() -> _T: ...
+class Configs:
+    def __init__(self):
+        self.value = {
+            "1": {
+                "a": table(),
+                "b": table(),
+                "c": table(),
+                "d": table(),
+                "e": table(),
+                "f": table(),
+                "g": table(),
+                "h": table(),
+                "i": table(),
+                "j": table(),
+            },
+            "2": {
+                "a": table(),
+                "b": table(),
+                "c": table(),
+                "d": table(),
+                "e": table(),
+                "f": table(),
+                "g": table(),
+                "h": table(),
+                "i": table(),
+            },
+            "3": {},
+        }
+"#,
+);
+
+// Repro for issue #2595: Protocol-vs-Protocol structural subtyping cycle.
+// Without memoization, checking `Impl <: Array1` fans out into 10 member checks,
+// each recursively requiring `Impl <: Array2`, each of those requiring `Impl <: Array3`,
+// etc. This creates O(M^D) work (M=methods, D=protocol chain depth). With the
+// subset_cache, each (class, protocol) pair is checked at most once, collapsing to O(M*D).
+testcase!(
+    test_protocol_cycle_exponential,
+    r#"
+from typing import Protocol
+
+class Array1(Protocol):
+    def op_0(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_1(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_2(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_3(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_4(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_5(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_6(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_7(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_8(self, other: "Array1 | complex", /) -> "Array2": ...
+    def op_9(self, other: "Array1 | complex", /) -> "Array2": ...
+
+class Array2(Protocol):
+    def op_0(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_1(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_2(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_3(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_4(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_5(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_6(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_7(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_8(self, other: "Array2 | complex", /) -> "Array3": ...
+    def op_9(self, other: "Array2 | complex", /) -> "Array3": ...
+
+class Array3(Protocol):
+    def op_0(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_1(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_2(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_3(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_4(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_5(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_6(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_7(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_8(self, other: "Array3 | complex", /) -> "Array1": ...
+    def op_9(self, other: "Array3 | complex", /) -> "Array1": ...
+
+class Impl:
+    def op_0(self, other: object, /) -> "Impl": ...
+    def op_1(self, other: object, /) -> "Impl": ...
+    def op_2(self, other: object, /) -> "Impl": ...
+    def op_3(self, other: object, /) -> "Impl": ...
+    def op_4(self, other: object, /) -> "Impl": ...
+    def op_5(self, other: object, /) -> "Impl": ...
+    def op_6(self, other: object, /) -> "Impl": ...
+    def op_7(self, other: object, /) -> "Impl": ...
+    def op_8(self, other: object, /) -> "Impl": ...
+    def op_9(self, other: object, /) -> "Impl": ...
+
+def f1(x: Array1 | complex) -> Array1: ...
+def f2(x: Array2 | complex) -> Array2: ...
+def f3(x: Array3 | complex) -> Array3: ...
+
+def test() -> None:
+    val = Impl()
+    a1 = f1(val)
+    a2 = f2(val)
+    a3 = f3(val)
+    c1 = f1(a2)
+    c2 = f2(a3)
+    c3 = f3(a1)
+"#,
+);
+
+// Minimal test for cross-protocol structural subtyping.
+testcase!(
+    test_protocol_cross_check_minimal,
+    r#"
+from typing import Protocol
+
+class P1(Protocol):
+    def foo(self, other: "P1 | complex", /) -> "P2": ...
+
+class P2(Protocol):
+    def foo(self, other: "P2 | complex", /) -> "P1": ...
+
+def make_p2() -> P2: ...
+def f(x: P1) -> None: ...
+
+def test() -> None:
+    p = make_p2()
+    f(p)
+"#,
+);
+
+// Soundness test for coinductive cache invalidation in subset_cache.
+//
+// Without rollback-on-failure, a naive persistent cache produces a false
+// positive here. The scenario:
+//   1. Check `A <: P1 | P2` — union handler tries `A <: P1` first.
+//   2. `A <: P1` inserts InProgress. Method `foo` return type requires `A <: P2`.
+//   3. `A <: P2` inserts InProgress. Method `foo` return type requires `A <: P1`.
+//   4. `A <: P1` is InProgress → coinductive Ok. `A <: P2` succeeds, cached as Ok.
+//   5. Back in `A <: P1`: method `bar` fails (A lacks `bar`). `A <: P1` fails.
+//   6. Union handler tries `A <: P2` — stale cached Ok → false positive!
+//
+// The rollback mechanism rolls back the cached Ok for `A <: P2` (step 4) when
+// `A <: P1` fails (step 5), because `A <: P2` was computed during `A <: P1`'s
+// computation and may have depended on the coinductive assumption that `A <: P1`
+// holds. Re-checking `A <: P2` then correctly fails.
+testcase!(
+    test_protocol_coinductive_cache_soundness,
+    r#"
+from typing import Protocol
+
+class P1(Protocol):
+    def foo(self) -> "P2": ...
+    def bar(self) -> int: ...
+
+class P2(Protocol):
+    def foo(self) -> "P1": ...
+
+class A:
+    def foo(self) -> "A": ...
+
+def f(x: P1 | P2) -> None: ...
+
+def test() -> None:
+    f(A())  # E: Argument `A` is not assignable to parameter `x` with type `P1 | P2`
+"#,
+);
+
+// A protocol-member guard can be entered outside a `Subset` while checking for unsafe overlap.
+// The nested protocol result must not be cached because it depends on that guard.
+testcase!(
+    test_getattr_coinductive_protocol_cache_soundness,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    @property
+    def x(self) -> str: ...
+
+class C:
+    def __getattr__(self: P, name: str) -> int:
+        return 0
+
+def check(x: C) -> None:
+    isinstance(x, P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `C`
+
+def use(x: P) -> None: ...
+use(C())  # E: Argument `C` is not assignable to parameter `x` with type `P` in function `use`
+"#,
+);
+
+// SCC restarts must not retain protocol results computed from recursive Answer fallbacks.
+testcase!(
+    test_protocol_cache_ignores_answers_scc,
+    r#"
+from __future__ import annotations
+
+from typing import Any, Generic, Protocol, Self, TypeVar
+
+P = TypeVar("P", bound="ProtoWithFactory")
+
+class ProtoWithFactory(Protocol):
+    @property
+    def factory(self) -> Factory[Self]: ...
+    @factory.setter
+    def factory(self, value: Any) -> None: ...
+
+class Factory(Generic[P]): ...
+
+class Base:
+    factory: Factory[Base]
+
+class Child(Base):
+    factory: Factory[Child]  # type: ignore
+
+class ChildFactory(Factory[Child]): ...
+"#,
+);
+
+// Soundness test for typed_dict_cache with coinductive assumptions.
+//
+// Similar to test_protocol_coinductive_cache_soundness, but the stale cache
+// entry lives in the persistent typed_dict_cache rather than the per-query
+// subset_cache. The fields are ReadOnly so comparisons are covariant
+// (one-direction is_subset_eq), avoiding the invariant is_consistent check
+// that would independently catch the failure.
+//
+// The scenario:
+//   1. Check `A <: P1 | P2` — union tries `A <: P1`.
+//   2. `A <: P1` inserts InProgress(A, P1). Method `foo` return type: `ATD <: TD1`.
+//   3. TypedDict ReadOnly field: `A <: P2`. Inserts InProgress(A, P2).
+//   4. Method `foo` return type: `ATD <: TD2`. ReadOnly field: `A <: P1`.
+//   5. `A <: P1` is InProgress → coinductive Ok. `ATD <: TD2` succeeds,
+//      stored in typed_dict_cache.
+//   6. `A <: P2` succeeds. `ATD <: TD1` succeeds, also cached.
+//   7. Back in `A <: P1`: method `bar` fails (A lacks `bar`). `A <: P1` fails.
+//   8. subset_cache rolls back, but typed_dict_cache retains `ATD <: TD2 → Ok`.
+//   9. Union tries `A <: P2`. Method `foo`: `ATD <: TD2` — hits stale cache → Ok.
+//  10. `A <: P2` incorrectly succeeds — false positive!
+//
+// The fix: track coinductive_assumptions_used in is_subset_typed_dict and skip
+// caching when coinductive assumptions were involved.
+testcase!(
+    test_typed_dict_coinductive_cache_soundness,
+    r#"
+from typing import Protocol, TypedDict, ReadOnly
+
+class P1(Protocol):
+    def foo(self) -> "TD1": ...
+    def bar(self) -> int: ...
+
+class P2(Protocol):
+    def foo(self) -> "TD2": ...
+
+class TD1(TypedDict):
+    field: ReadOnly[P2]
+
+class TD2(TypedDict):
+    field: ReadOnly[P1]
+
+class ATD(TypedDict):
+    field: ReadOnly["A"]
+
+class A:
+    def foo(self) -> ATD: ...
+
+def f(x: P1 | P2) -> None: ...
+
+def test() -> None:
+    f(A())  # E: Argument `A` is not assignable to parameter `x` with type `P1 | P2`
+"#,
+);
+
+// A long operator chain nests one expression per operand while the parser's own
+// recursion stays flat, so nothing bounds the depth of the tree it produces.
+// Analyzing it used to overflow the stack and abort the process.
+#[test]
+fn test_deeply_nested_expression_is_rejected() {
+    let code = format!("x = {}\n", vec!["1"; 5000].join("+"));
+    let (state, handle) = TestEnv::one("main", &code).to_state();
+    let errors = state
+        .transaction()
+        .get_errors([&handle("main")])
+        .collect_errors()
+        .ordinary;
+    assert_eq!(errors.len(), 1, "got: {errors:#?}");
+    assert!(
+        errors[0].msg().contains("too deeply nested"),
+        "got: {:?}",
+        errors[0].msg()
+    );
+}
+
+// Deferred attribute proofs must remain bounded even when the diagnostic is disabled.
+#[test]
+fn test_attribute_initialization_branch_growth() {
+    let mut source = String::from("def proceed() -> None: ...\nclass C:\n");
+    for method in ["__init__", "helper"] {
+        source.push_str(&format!("    def {method}(self, flag: bool) -> None:\n"));
+        for attribute in 0..16 {
+            source.push_str(&format!(
+                "        if flag:\n            self.{method}_value_{attribute} = 1\n        else:\n            proceed()\n",
+            ));
+        }
+        for _ in 0..64 {
+            source.push_str(
+                "        if flag:\n            proceed()\n        else:\n            proceed()\n",
+            );
+        }
+    }
+    for enabled in [false, true] {
+        let env = TestEnv::one("main", &source);
+        let env = if enabled {
+            env.enable_possibly_uninitialized_attribute_error()
+        } else {
+            env
+        };
+        let (state, handle) = env.to_state();
+        let errors = state
+            .transaction()
+            .get_errors([&handle("main")])
+            .collect_errors()
+            .ordinary;
+        assert_eq!(errors.len(), if enabled { 16 } else { 0 }, "{errors:#?}");
+    }
+}

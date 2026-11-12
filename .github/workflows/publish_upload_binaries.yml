@@ -1,0 +1,129 @@
+name: "Publish: Upload binaries"
+
+# Attaches the binaries to a GitHub release. They are taken out of the release
+# wheels, so the GitHub release and PyPI ship identical executables.
+#
+# publish_to_pypi.yml calls this workflow after publishing, with the wheels it
+# built in the same run. A manual run builds the wheels at the tag first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to upload assets to (e.g., 0.51.0)'
+        required: true
+        type: string
+      build:
+        description: 'Build the wheels at the tag'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Tag name to upload assets to (e.g., 0.51.0)'
+        required: true
+        type: string
+      build:
+        description: 'Build the wheels at the tag instead of using the `dist` artifact of the calling run'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  TAG_NAME: ${{ inputs.tag_name }}
+
+jobs:
+  build:
+    name: Build wheels
+    if: ${{ inputs.build }}
+    uses: ./.github/workflows/publish_build_packages.yml
+    with:
+      ref: ${{ inputs.tag_name }}
+
+  upload:
+    name: Upload binaries
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      # The workflow's own revision, rather than the tag, so that
+      # scripts/wheel_binaries.py exists even for a tag that predates it.
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download wheels
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Package binaries
+        run: python3 scripts/wheel_binaries.py archive dist archives
+
+      - name: Upload to release
+        run: |
+          # --clobber lets a retry replace assets that a failed attempt uploaded.
+          for attempt in 1 2 3; do
+            if gh release upload "$TAG_NAME" archives/* --clobber; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((30 * attempt))
+            fi
+          done
+          exit 1
+
+  wasm:
+    name: Build pyrefly-wasm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: pyrefly-release-wasm
+
+      - name: Set up WASI SDK
+        uses: ./.github/actions/setup-wasi-sdk
+      - name: Install wasm-opt
+        run: cargo install --locked wasm-opt --version 0.116.1
+
+      - name: Build wasm
+        run: chmod +x pyrefly_wasm/build.sh && pyrefly_wasm/build.sh
+
+      - name: Package wasm
+        run: |
+          mkdir -p staging
+          cp pyrefly_wasm/target/pyrefly_wasm.js staging/
+          # build.sh writes the optimized binary to *.wasm.opt; ship it under the
+          # name the JS glue imports so the tarball loads as-is.
+          cp pyrefly_wasm/target/pyrefly_wasm_bg.wasm.opt staging/pyrefly_wasm_bg.wasm
+          cd staging
+          tar -czvf ../pyrefly-wasm.tar.gz pyrefly_wasm.js pyrefly_wasm_bg.wasm
+
+      - name: Generate checksum
+        run: sha256sum pyrefly-wasm.tar.gz > pyrefly-wasm.tar.gz.sha256
+
+      - name: Upload to release
+        run: |
+          gh release upload ${{ env.TAG_NAME }} \
+            pyrefly-wasm.tar.gz \
+            pyrefly-wasm.tar.gz.sha256 \
+            --clobber
